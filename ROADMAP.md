@@ -134,8 +134,9 @@ Bigger architectural moves.
 | 1.3.1 | History UI polish | ✅ shipped |
 | 1.4.0 | Voice commands & smart text | ✅ shipped |
 | 1.5.0 | Modes & hotkey flexibility | ✅ shipped |
-| **1.6.0** | **Audio control** | ✅ shipped |
-| 1.7 | AI post-processing | 🚧 next |
+| 1.6.0 | Audio control | ✅ shipped |
+| **1.7.0** | **AI post-processing** | ✅ shipped |
+| 1.8 | Integration & automation | 🚧 next |
 | 1.7 | AI post-processing | planned |
 | 1.8 | Integration & automation | planned |
 | 1.9 | Privacy & data management | planned |

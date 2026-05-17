@@ -2,6 +2,62 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] — 2026-05-17
+
+**Phase 5 of the roadmap — AI post-processing.** The headline feature: optionally route your transcripts through a local (or remote) OpenAI-compatible LLM to clean them up, rewrite as bullets/email/Slack, or summarize. Built for local-first stacks (LM Studio, Ollama, llama.cpp server, vLLM) so your audio AND your text both stay on your machine.
+
+### Built-in prompts
+
+Toggleable from **Settings → AI post-processing → Default prompt**:
+
+- **Clean up (remove filler words)** — light cleanup, preserves voice and meaning. Filler words like "um", "uh", "like", "you know" get dropped; dictation errors get fixed.
+- **Make it a clean paragraph** — collapses run-on speech into one well-punctuated paragraph.
+- **Make it formal** — rewrites in professional written English (email/report tone).
+- **Convert to bullet points** — restructures content as a markdown bulleted list.
+- **Convert to email** — formats as an email body in a polite professional tone.
+- **Convert to Slack message** — makes it conversational and concise.
+- **Summarize** — produces a 2–4-sentence summary capturing key points.
+
+All prompts are tuned to output ONLY the result with no preamble, commentary, or quote wrapping.
+
+### Two ways to apply
+
+1. **Hotkey: Ctrl+Win+L** — applies the configured default prompt to your most recent transcript and pastes the result into the focused window. The original raw transcript is kept; the LLM result is added as a new history entry. The overlay shows the blue "thinking" pulse while the LLM works.
+2. **Auto-apply checkbox** — when enabled, every transcript gets routed through the default prompt before paste. The history entry stores both: `raw` keeps Whisper's original output, `text` becomes the LLM-cleaned version.
+
+### Endpoint configuration
+
+- **Endpoint URL** — defaults to `http://localhost:1234/v1` (LM Studio's default). Override for Ollama (`http://localhost:11434/v1`), llama.cpp server, vLLM, or any OpenAI-compatible service.
+- **Model** — free-text model name as your endpoint exposes it. LM Studio often accepts empty here; Ollama wants the model name (e.g. `llama3.1`).
+- **API key** — masked password field, optional. Local endpoints almost always leave this blank.
+- **Test connection** button — pings `/models` then issues a tiny chat completion so 401s, missing-model errors, and unreachable endpoints all surface clearly before you start dictating.
+
+### Under the hood
+
+- New `LLMClient` class implements OpenAI-compatible chat completions over `urllib.request` (stdlib only — no new dependencies). Synchronous, but all callers wrap in worker threads so the Qt event loop never blocks on a slow LLM.
+- New `BUILTIN_LLM_PROMPTS` registry and `llm_prompt_by_id()` helper.
+- New `HotkeyWatcher.llm_apply_requested` signal driven by the global `ctrl+win+l` hook.
+- New settings fields: `llm_enabled`, `llm_base_url`, `llm_model`, `llm_api_key`, `llm_default_prompt`, `llm_auto_apply`.
+- Both the auto-apply path and the Ctrl+Win+L hotkey reuse the same client instantiation, so endpoint changes apply immediately to both flows.
+
+### Privacy guarantee
+
+If your endpoint URL is `localhost` (the default), nothing leaves your machine — audio is transcribed locally by Whisper, then the text is sent to your local LLM, then the result is pasted. The Tellur tradition of "no network calls during normal use" is preserved.
+
+### Hotkey rebind: Ctrl+Win+V → Ctrl+Win+B
+
+- Re-paste-last has moved to **Ctrl+Win+B** ("B" for "bring back"). Windows 11 reserves Ctrl+Win+V for its audio-output device picker, which was hijacking Tellur's binding. README, in-app hotkey table, and footer all updated.
+
+### Settings & main-window UI polish
+
+- **Settings tab is now scrollable** — wrapped in a `QScrollArea` so a long settings list no longer forces the entire window taller than your screen. Vertical scrollbar only, never horizontal.
+- **Sections redesigned** — bold headers with a thin underline, consistent 10px in-section spacing, 20px between sections. No more text clumping or controls touching.
+- **Form-row alignment** — every label/control pair (Microphone, Endpoint, Model, API key, Default prompt, Input gain, Meter sensitivity) uses a fixed-width label so all controls align in a tidy column.
+- **Wheel-event hijack fixed** — scrolling through Settings no longer accidentally changes combo selections or slider values when the cursor passes over them. `_NoWheelComboBox` and `_NoWheelSlider` subclasses `ignore()` the wheel so it bubbles up to the scroll area.
+- **Window opens centered** — first open per session positions the panel horizontally centered, ~8% above vertical center (eye-level rather than dead-center). Drag-to-relocate persists within the session. Height is capped to the work-area so the bottom never clips behind the taskbar.
+
+---
+
 ## [1.6.0] — 2026-05-17
 
 **Phase 4 of the roadmap — audio control.** You can now pick a specific microphone, see your input level live, and boost a quiet mic with software gain. Before this release Tellur always followed the Windows default input device and ran every sample at unit gain.
@@ -51,7 +107,7 @@ All notable changes to Tellur are documented here. This project follows [Semanti
 
 ### Re-paste last transcript
 
-- **Ctrl+Win+V → paste the most recent transcript into whatever window is focused right now.** Identical to right-click tray → "Copy last transcription" + Ctrl+V, but as a single global hotkey.
+- **Ctrl+Win+B → paste the most recent transcript into whatever window is focused right now.** Identical to right-click tray → "Copy last transcription" + Ctrl+V, but as a single global hotkey.
 - Made for the "Tellur auto-pasted into the wrong window" recovery flow and "I want to say that same thing again in a different app" use case.
 
 ### Hotkey reference in Settings
@@ -62,7 +118,7 @@ Settings tab now includes a clear table of every global hotkey Tellur listens fo
 |---|---|
 | **Ctrl+Win** | Push-to-talk (hold or toggle, per setting) |
 | **Esc** | Cancel current recording |
-| **Ctrl+Win+V** | Re-paste last transcription |
+| **Ctrl+Win+B** | Re-paste last transcription |
 | **Ctrl+Win+Q** | Quit Tellur |
 
 ### Under the hood

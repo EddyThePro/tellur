@@ -38,10 +38,15 @@ First launch downloads the Python dependencies (~2.5 GB) and the Whisper model (
 |---|---|
 | **Ctrl+Win** | Push-to-talk dictation — hold to talk, or use toggle mode (tap on / tap off) |
 | **Esc** | Cancel the current recording without transcribing |
-| **Ctrl+Win+V** | Re-paste the most recent transcription into the focused window |
+| **Ctrl+Win+B** | Re-paste the most recent transcription into the focused window ("B" for "bring back" — Ctrl+Win+V is reserved by Windows 11) |
+| **Ctrl+Win+L** | Apply the default AI prompt to the last transcript and paste the result |
 | **Ctrl+Win+Q** | Quit Tellur |
 
 Push-to-talk style is configurable in **Settings → Push-to-talk mode** — pick **Hold** (classic) or **Toggle** (tap to start, tap to stop) per your taste.
+
+## AI post-processing (optional, local)
+
+Point Tellur at any OpenAI-compatible endpoint (LM Studio, Ollama, llama.cpp server, vLLM) and pick a default prompt from the list — **Clean up filler words**, **Make it a clean paragraph**, **Make it formal**, **Convert to bullet points**, **Convert to email**, **Convert to Slack message**, **Summarize**. Press **Ctrl+Win+L** to apply it to your last transcript, or enable **Auto-apply** to run it on every transcript before paste. Stays 100% local if your endpoint is local. Configure in **Settings → AI post-processing**.
 
 ## What you'll see
 

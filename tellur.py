@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 APP_NAME = "Tellur"
 
 
@@ -99,8 +99,8 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
-    QProgressBar, QPushButton, QSlider, QSystemTrayIcon, QTabWidget,
-    QTextEdit, QToolButton, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider,
+    QSystemTrayIcon, QTabWidget, QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
 
@@ -776,6 +776,13 @@ class Settings(QObject):
         # - input_gain: linear multiplier (1.0 = no boost). Clamped 0.1..10.0.
         self.input_device_name: str | None = None
         self.input_gain: float = 1.0
+        # LLM post-processing (v1.7) — opt-in; defaults aimed at LM Studio.
+        self.llm_enabled: bool = False
+        self.llm_base_url: str = "http://localhost:1234/v1"
+        self.llm_model: str = ""
+        self.llm_api_key: str = ""
+        self.llm_default_prompt: str = "cleanup"
+        self.llm_auto_apply: bool = False  # if True, every transcript runs through the LLM
         self._load()
 
     def _load(self) -> None:
@@ -797,6 +804,12 @@ class Settings(QObject):
                     except (TypeError, ValueError):
                         self.input_gain = 1.0
                     self.input_gain = max(0.1, min(10.0, self.input_gain))
+                    self.llm_enabled = bool(data.get("llm_enabled", self.llm_enabled))
+                    self.llm_base_url = str(data.get("llm_base_url", self.llm_base_url))
+                    self.llm_model = str(data.get("llm_model", self.llm_model))
+                    self.llm_api_key = str(data.get("llm_api_key", self.llm_api_key))
+                    self.llm_default_prompt = str(data.get("llm_default_prompt", self.llm_default_prompt))
+                    self.llm_auto_apply = bool(data.get("llm_auto_apply", self.llm_auto_apply))
                     requested = str(data.get("model_name", self.model_name))
                     valid_names = {m["name"] for m in KNOWN_MODELS}
                     if requested not in valid_names:
@@ -825,6 +838,12 @@ class Settings(QObject):
             "hotkey_mode": self.hotkey_mode,
             "input_device_name": self.input_device_name,
             "input_gain": self.input_gain,
+            "llm_enabled": self.llm_enabled,
+            "llm_base_url": self.llm_base_url,
+            "llm_model": self.llm_model,
+            "llm_api_key": self.llm_api_key,
+            "llm_default_prompt": self.llm_default_prompt,
+            "llm_auto_apply": self.llm_auto_apply,
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1270,6 +1289,161 @@ class WhisperEngine:
 
 
 # ===========================================================================
+# LLM post-processing (v1.7) — talks to OpenAI-compatible local endpoints
+# (LM Studio, Ollama, llama.cpp server, vLLM, …). Cloud-providers also work
+# but the project's default story is local-first / offline-first.
+# ===========================================================================
+
+# Built-in prompt presets. Each preset has an id, label, and system prompt
+# string. The user prompt is always just the transcript text. We default to
+# the cleanup preset because it's the lowest-impact "always wins" option.
+BUILTIN_LLM_PROMPTS: list[dict] = [
+    {
+        "id": "cleanup",
+        "label": "Clean up (remove filler words)",
+        "system": (
+            "You receive a raw speech-to-text transcription. Lightly clean it up: "
+            "remove filler words (um, uh, like, you know, sort of, kind of, I mean), "
+            "fix obvious dictation errors, and produce natural punctuation and "
+            "capitalization. PRESERVE the speaker's voice and meaning exactly. "
+            "Do not add information that wasn't said. Do not rephrase unless the "
+            "transcript is grammatically broken. Output ONLY the cleaned text — "
+            "no preamble, no commentary, no quotes around the result."
+        ),
+    },
+    {
+        "id": "paragraph",
+        "label": "Make it a clean paragraph",
+        "system": (
+            "You receive a raw speech-to-text transcription. Rewrite it as ONE clean, "
+            "well-punctuated paragraph in the speaker's voice. Remove filler words, "
+            "fix run-ons, and combine fragments. Preserve meaning and tone exactly. "
+            "Output ONLY the paragraph — no preamble, no quotes."
+        ),
+    },
+    {
+        "id": "formal",
+        "label": "Make it formal",
+        "system": (
+            "You receive a raw speech-to-text transcription. Rewrite it in formal, "
+            "professional written English suitable for a business email or report. "
+            "Preserve meaning exactly; only adjust tone and structure. "
+            "Output ONLY the rewritten text — no preamble, no quotes."
+        ),
+    },
+    {
+        "id": "bullets",
+        "label": "Convert to bullet points",
+        "system": (
+            "You receive a raw speech-to-text transcription. Restructure its content "
+            "as a concise bulleted list using '- ' markdown bullets. Group related "
+            "points; drop filler. Preserve meaning. Output ONLY the bullets — no "
+            "preamble, no headings unless the speaker explicitly stated them."
+        ),
+    },
+    {
+        "id": "email",
+        "label": "Convert to email",
+        "system": (
+            "You receive a raw speech-to-text transcription that the speaker wants "
+            "as an email. Format it as a clean email body (no Subject line unless the "
+            "speaker stated one). Use a polite professional tone in the speaker's "
+            "voice. Output ONLY the email body."
+        ),
+    },
+    {
+        "id": "slack",
+        "label": "Convert to Slack message",
+        "system": (
+            "You receive a raw speech-to-text transcription that the speaker wants "
+            "to send as a Slack message. Make it conversational and concise (Slack "
+            "norms: shorter sentences, friendly, optional emoji only if speaker "
+            "implied tone). Output ONLY the message text."
+        ),
+    },
+    {
+        "id": "summarize",
+        "label": "Summarize",
+        "system": (
+            "You receive a raw speech-to-text transcription. Produce a tight summary "
+            "(2–4 sentences) that captures the speaker's key points. Output ONLY the "
+            "summary — no preamble, no headings."
+        ),
+    },
+]
+
+
+def llm_prompt_by_id(prompt_id: str) -> dict | None:
+    for p in BUILTIN_LLM_PROMPTS:
+        if p["id"] == prompt_id:
+            return p
+    return None
+
+
+class LLMClient:
+    """OpenAI-compatible chat completions client using only urllib (stdlib).
+
+    Designed for local-first endpoints: LM Studio, Ollama (`/v1/`), llama.cpp
+    server, vLLM, etc. The same code also works against cloud endpoints if
+    the user wants — we don't gate on URL.
+
+    Synchronous. Caller is expected to invoke from a worker thread so we
+    never block the Qt event loop."""
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:1234/v1",
+        model: str = "",
+        api_key: str = "",
+        timeout: float = 30.0,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def chat(self, system: str, user: str) -> str:
+        """Single-turn chat. Returns the assistant's reply as a string.
+        Raises an exception on transport or server errors."""
+        url = f"{self.base_url}/chat/completions"
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.3,
+            "stream": False,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        # OpenAI-compatible shape: choices[0].message.content
+        try:
+            return (data["choices"][0]["message"]["content"] or "").strip()
+        except (KeyError, IndexError, TypeError) as e:
+            raise RuntimeError(f"unexpected LLM response shape: {e!r} — body={raw[:300]}")
+
+    def ping(self) -> bool:
+        """Cheap reachability check — list models. Returns True on 2xx."""
+        url = f"{self.base_url}/models"
+        headers: dict = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                return 200 <= resp.status < 300
+        except Exception:
+            return False
+
+
+# ===========================================================================
 # text injection (clipboard + simulated Ctrl+V, race-safe restore)
 # ===========================================================================
 class TextInjector:
@@ -1356,7 +1530,8 @@ class HotkeyWatcher(QObject):
     released = pyqtSignal()
     quit_requested = pyqtSignal()
     cancel_requested = pyqtSignal()       # Esc during recording → abandon
-    repaste_requested = pyqtSignal()      # Ctrl+Win+V → re-paste last transcript
+    repaste_requested = pyqtSignal()      # Ctrl+Win+B → re-paste last transcript
+    llm_apply_requested = pyqtSignal()    # Ctrl+Win+L → run default LLM prompt on last
 
     def __init__(self, poll_ms: int = HOTKEY_POLL_MS):
         super().__init__()
@@ -1374,11 +1549,18 @@ class HotkeyWatcher(QObject):
             log_hotkey.info("registered quit hotkey: ctrl+win+q")
         except Exception:
             log_hotkey.exception("failed to register quit hotkey")
+        # Note: Ctrl+Win+V is reserved by Windows 11 (audio output device
+        # picker flyout), so we use Ctrl+Win+B for re-paste-last instead.
         try:
-            keyboard.add_hotkey("ctrl+windows+v", self.repaste_requested.emit)
-            log_hotkey.info("registered re-paste-last hotkey: ctrl+win+v")
+            keyboard.add_hotkey("ctrl+windows+b", self.repaste_requested.emit)
+            log_hotkey.info("registered re-paste-last hotkey: ctrl+win+b")
         except Exception:
             log_hotkey.exception("failed to register re-paste hotkey")
+        try:
+            keyboard.add_hotkey("ctrl+windows+l", self.llm_apply_requested.emit)
+            log_hotkey.info("registered LLM-apply hotkey: ctrl+win+l")
+        except Exception:
+            log_hotkey.exception("failed to register LLM-apply hotkey")
         try:
             # Esc fires globally even when no other modifier is held; we'll
             # filter in the slot so it only cancels when actively recording.
@@ -2389,6 +2571,22 @@ class HistoryList(QListWidget):
             widget.setFixedWidth(w)
 
 
+class _NoWheelComboBox(QComboBox):
+    """QComboBox that doesn't consume mouse wheel events. Wheel events get
+    ignore()'d so the parent scroll area handles them — otherwise scrolling
+    through a settings page can silently change combo selections when the
+    cursor passes over them."""
+    def wheelEvent(self, event) -> None:  # noqa: N802 — Qt signature
+        event.ignore()
+
+
+class _NoWheelSlider(QSlider):
+    """QSlider that doesn't consume mouse wheel events (same rationale as
+    _NoWheelComboBox)."""
+    def wheelEvent(self, event) -> None:  # noqa: N802 — Qt signature
+        event.ignore()
+
+
 class MainPanel(QWidget):
     """The 'open from the tray' window. Two tabs: History and Settings."""
 
@@ -2413,7 +2611,9 @@ class MainPanel(QWidget):
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.setStyleSheet(PANEL_QSS)
-        self.resize(620, 520)
+        # Fixed default size — tabs are independently sized; Settings scrolls
+        # internally so it never forces the window taller.
+        self.resize(640, 560)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
@@ -2421,7 +2621,11 @@ class MainPanel(QWidget):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_history_tab(), "History")
+        # Settings tab is wrapped in a QScrollArea (built inside the helper)
+        # so the window doesn't have to grow to fit every section.
         tabs.addTab(self._build_settings_tab(), "Settings")
+        # Default to History tab on open — it's the more common use case.
+        tabs.setCurrentIndex(0)
         root.addWidget(tabs)
 
         # subscribe to log changes
@@ -2729,42 +2933,94 @@ class MainPanel(QWidget):
 
     # --- settings tab ---------------------------------------------------
 
+    # Common label width for left-hand labels in form rows. Picked so the
+    # longest label ("Microphone", "Endpoint", "Default prompt", "Input gain")
+    # all align without truncation at the default font size.
+    _FORM_LABEL_WIDTH = 110
+
+    def _section_header(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            "font-weight: 600; color: #d8dbe2; font-size: 10.5pt; "
+            "padding-top: 4px; padding-bottom: 2px; "
+            "border-bottom: 1px solid #2b2e36;"
+        )
+        return lbl
+
+    def _section_hint(self, text: str, *, rich: bool = False) -> QLabel:
+        lbl = QLabel(text)
+        if rich:
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet("color: #6a6e78; font-size: 9pt;")
+        return lbl
+
+    def _form_row(self, label_text: str, control: QWidget) -> QHBoxLayout:
+        """Build a label-control row with consistent label width so every
+        section's left edge of controls aligns."""
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel(label_text)
+        lbl.setFixedWidth(self._FORM_LABEL_WIDTH)
+        lbl.setStyleSheet("color: #c0c4cc;")
+        lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(lbl)
+        # Let the control expand horizontally inside the row.
+        try:
+            control.setSizePolicy(QSizePolicy.Policy.Expanding, control.sizePolicy().verticalPolicy())
+        except Exception:
+            pass
+        row.addWidget(control, stretch=1)
+        return row
+
+    def _make_device_combo(self) -> QComboBox:
+        """Create the input-device combo (used during settings build)."""
+        self._device_combo = _NoWheelComboBox()
+        self._populate_device_combo()
+        self._device_combo.currentIndexChanged.connect(self._on_device_changed)
+        return self._device_combo
+
     def _build_settings_tab(self) -> QWidget:
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(0, 20, 0, 0)
-        layout.setSpacing(22)
+        # Inner content widget — all sections go here, then we wrap it in a
+        # QScrollArea so a long Settings tab doesn't force the window taller.
+        content = QWidget()
+        content.setObjectName("settingsContent")
+        layout = QVBoxLayout(content)
+        # Left padding kept generous so checkbox indicators and button edges
+        # don't get clipped by the scroll-area viewport. Right padding is a
+        # bit larger to leave room for the vertical scrollbar.
+        layout.setContentsMargins(14, 16, 18, 14)
+        layout.setSpacing(20)
+
+        # --- general toggles section ---
+        gen_box = QVBoxLayout()
+        gen_box.setSpacing(10)
+        gen_box.addWidget(self._section_header("General"))
 
         self._auto_paste_cb = QCheckBox("Auto-paste transcription into focused window")
         self._auto_paste_cb.setChecked(self._settings.auto_paste)
         self._auto_paste_cb.toggled.connect(self._on_auto_paste_toggled)
-        layout.addWidget(self._auto_paste_cb)
+        gen_box.addWidget(self._auto_paste_cb)
 
         # Voice commands & smart formatting (the v1.4 feature, single toggle)
-        vc_box = QVBoxLayout()
-        vc_box.setSpacing(2)
         self._voice_commands_cb = QCheckBox("Voice commands & punctuation dictation")
         self._voice_commands_cb.setChecked(self._settings.voice_commands)
         self._voice_commands_cb.toggled.connect(self._on_voice_commands_toggled)
-        vc_box.addWidget(self._voice_commands_cb)
-        vc_hint = QLabel(
+        gen_box.addWidget(self._voice_commands_cb)
+        gen_box.addWidget(self._section_hint(
             "When on, dictated words like \"comma\", \"period\", \"new line\", \"open quote\", "
             "\"close quote\" become actual punctuation. \"Scratch that\" / \"delete that\" "
             "drops the previous sentence. First letter of each sentence is auto-capitalized."
-        )
-        vc_hint.setWordWrap(True)
-        vc_hint.setStyleSheet("color: #6a6e78; font-size: 9pt;")
-        vc_box.addWidget(vc_hint)
-        layout.addLayout(vc_box)
+        ))
+        layout.addLayout(gen_box)
 
         # --- hotkey mode section ---
         hk_box = QVBoxLayout()
-        hk_box.setSpacing(6)
-        hk_header = QLabel("Push-to-talk mode")
-        hk_header.setStyleSheet("font-weight: 600; color: #d8dbe2;")
-        hk_box.addWidget(hk_header)
+        hk_box.setSpacing(10)
+        hk_box.addWidget(self._section_header("Push-to-talk mode"))
 
-        self._hk_mode_combo = QComboBox()
+        self._hk_mode_combo = _NoWheelComboBox()
         self._hk_mode_combo.addItem("Hold — speak while Ctrl+Win is held", userData="hold")
         self._hk_mode_combo.addItem("Toggle — tap Ctrl+Win to start, tap again to stop", userData="toggle")
         cur_idx = 0 if self._settings.hotkey_mode == "hold" else 1
@@ -2772,28 +3028,24 @@ class MainPanel(QWidget):
         self._hk_mode_combo.currentIndexChanged.connect(self._on_hk_mode_changed)
         hk_box.addWidget(self._hk_mode_combo)
 
-        hk_hint = QLabel(
+        hk_box.addWidget(self._section_hint(
             "Hold is the classic press-to-talk feel. Toggle is great for longer dictations "
             "so you don't have to keep the keys pressed. In toggle mode, press Esc to abandon "
             "the current recording without transcribing."
-        )
-        hk_hint.setWordWrap(True)
-        hk_hint.setStyleSheet("color: #6a6e78; font-size: 9pt;")
-        hk_box.addWidget(hk_hint)
+        ))
         layout.addLayout(hk_box)
 
         # --- hotkey reference (read-only) ---
         ref_box = QVBoxLayout()
-        ref_box.setSpacing(6)
-        ref_header = QLabel("Hotkeys")
-        ref_header.setStyleSheet("font-weight: 600; color: #d8dbe2;")
-        ref_box.addWidget(ref_header)
+        ref_box.setSpacing(10)
+        ref_box.addWidget(self._section_header("Hotkeys"))
         ref_text = QLabel(
-            "<table cellpadding='2' style='color:#9a9da6;'>"
-            "<tr><td><b>Ctrl + Win</b></td><td>&nbsp;&nbsp;Push-to-talk dictation (hold or toggle)</td></tr>"
-            "<tr><td><b>Esc</b></td><td>&nbsp;&nbsp;Cancel current recording (no transcribe)</td></tr>"
-            "<tr><td><b>Ctrl + Win + V</b></td><td>&nbsp;&nbsp;Re-paste last transcription</td></tr>"
-            "<tr><td><b>Ctrl + Win + Q</b></td><td>&nbsp;&nbsp;Quit Tellur</td></tr>"
+            "<table cellpadding='3' style='color:#9a9da6;'>"
+            "<tr><td><b>Ctrl + Win</b></td><td>&nbsp;&nbsp;&nbsp;Push-to-talk dictation (hold or toggle)</td></tr>"
+            "<tr><td><b>Esc</b></td><td>&nbsp;&nbsp;&nbsp;Cancel current recording (no transcribe)</td></tr>"
+            "<tr><td><b>Ctrl + Win + B</b></td><td>&nbsp;&nbsp;&nbsp;Re-paste last transcription (B = &quot;bring back&quot;)</td></tr>"
+            "<tr><td><b>Ctrl + Win + L</b></td><td>&nbsp;&nbsp;&nbsp;Apply default AI prompt to last transcript</td></tr>"
+            "<tr><td><b>Ctrl + Win + Q</b></td><td>&nbsp;&nbsp;&nbsp;Quit Tellur</td></tr>"
             "</table>"
         )
         ref_text.setTextFormat(Qt.TextFormat.RichText)
@@ -2802,86 +3054,76 @@ class MainPanel(QWidget):
 
         # --- audio input section (v1.6) ---
         audio_box = QVBoxLayout()
-        audio_box.setSpacing(6)
-        audio_header = QLabel("Audio input")
-        audio_header.setStyleSheet("font-weight: 600; color: #d8dbe2;")
-        audio_box.addWidget(audio_header)
+        audio_box.setSpacing(10)
+        audio_box.addWidget(self._section_header("Audio input"))
 
         # Device picker.
-        audio_box.addWidget(QLabel("Microphone device"))
-        self._device_combo = QComboBox()
-        self._populate_device_combo()
-        self._device_combo.currentIndexChanged.connect(self._on_device_changed)
-        audio_box.addWidget(self._device_combo)
+        audio_box.addLayout(self._form_row("Microphone", self._make_device_combo()))
 
         # Live input level meter — only animates while Settings is visible
         # and the recorder isn't currently capturing for a transcription.
-        meter_row = QHBoxLayout()
-        meter_row.addWidget(QLabel("Level"))
         self._level_meter = QProgressBar()
         self._level_meter.setRange(0, 1000)
         self._level_meter.setTextVisible(False)
         self._level_meter.setFixedHeight(10)
         self._level_meter.setValue(0)
-        meter_row.addWidget(self._level_meter, stretch=1)
-        audio_box.addLayout(meter_row)
+        audio_box.addLayout(self._form_row("Level", self._level_meter))
 
-        # Gain slider.
-        gain_row = QHBoxLayout()
-        gain_row.addWidget(QLabel("Input gain"))
-        self._gain_slider = QSlider(Qt.Orientation.Horizontal)
-        # 10..400 → 0.1x..4.0x (we cap UI at 4.0; engine allows up to 10.0)
+        # Gain slider + value label, packed in a sub-row.
+        self._gain_slider = _NoWheelSlider(Qt.Orientation.Horizontal)
         self._gain_slider.setRange(10, 400)
         self._gain_slider.setValue(int(self._settings.input_gain * 100))
         self._gain_slider.valueChanged.connect(self._on_gain_changed)
-        gain_row.addWidget(self._gain_slider, stretch=1)
         self._gain_label = QLabel(f"{self._settings.input_gain:.2f}x")
         self._gain_label.setFixedWidth(56)
         self._gain_label.setStyleSheet("color: #9a9da6;")
-        gain_row.addWidget(self._gain_label)
-        audio_box.addLayout(gain_row)
+        gain_widget = QWidget()
+        gain_inner = QHBoxLayout(gain_widget)
+        gain_inner.setContentsMargins(0, 0, 0, 0)
+        gain_inner.setSpacing(8)
+        gain_inner.addWidget(self._gain_slider, stretch=1)
+        gain_inner.addWidget(self._gain_label)
+        audio_box.addLayout(self._form_row("Input gain", gain_widget))
 
-        gain_hint = QLabel(
+        audio_box.addWidget(self._section_hint(
             "Boost quiet mics with gain. If Whisper struggles on soft speech, push gain up. "
             "If your audio clips or distorts on loud bursts, push it down."
-        )
-        gain_hint.setWordWrap(True)
-        gain_hint.setStyleSheet("color: #6a6e78; font-size: 9pt;")
-        audio_box.addWidget(gain_hint)
+        ))
         layout.addLayout(audio_box)
 
-        # sensitivity
+        # --- overlay (visual-only) ---
         sens_box = QVBoxLayout()
-        sens_box.setSpacing(6)
-        sens_box.addWidget(QLabel("Overlay mic-meter sensitivity (visual only, doesn't affect transcription)"))
-        row = QHBoxLayout()
-        self._sens_slider = QSlider(Qt.Orientation.Horizontal)
+        sens_box.setSpacing(10)
+        sens_box.addWidget(self._section_header("Overlay"))
+        self._sens_slider = _NoWheelSlider(Qt.Orientation.Horizontal)
         self._sens_slider.setRange(20, 400)
         self._sens_slider.setValue(int(self._settings.sensitivity))
         self._sens_slider.valueChanged.connect(self._on_sens_changed)
-        row.addWidget(self._sens_slider)
         self._sens_label = QLabel(str(int(self._settings.sensitivity)))
         self._sens_label.setFixedWidth(40)
         self._sens_label.setStyleSheet("color: #9a9da6;")
-        row.addWidget(self._sens_label)
-        sens_box.addLayout(row)
+        sens_widget = QWidget()
+        sens_inner = QHBoxLayout(sens_widget)
+        sens_inner.setContentsMargins(0, 0, 0, 0)
+        sens_inner.setSpacing(8)
+        sens_inner.addWidget(self._sens_slider, stretch=1)
+        sens_inner.addWidget(self._sens_label)
+        sens_box.addLayout(self._form_row("Meter sensitivity", sens_widget))
+        sens_box.addWidget(self._section_hint(
+            "Mic-meter sensitivity on the on-screen overlay only — does not affect transcription."
+        ))
         layout.addLayout(sens_box)
 
         # --- transcription model section ---
         model_box = QVBoxLayout()
-        model_box.setSpacing(6)
-        model_header = QLabel("Transcription model")
-        model_header.setStyleSheet("font-weight: 600; color: #d8dbe2;")
-        model_box.addWidget(model_header)
-        model_hint = QLabel(
+        model_box.setSpacing(10)
+        model_box.addWidget(self._section_header("Transcription model"))
+        model_box.addWidget(self._section_hint(
             "Switching downloads the model on first use. The download is cached, "
             "so future switches between models you've already used are instant."
-        )
-        model_hint.setWordWrap(True)
-        model_hint.setStyleSheet("color: #6a6e78; font-size: 9pt;")
-        model_box.addWidget(model_hint)
+        ))
 
-        self._model_combo = QComboBox()
+        self._model_combo = _NoWheelComboBox()
         self._populate_model_combo()
         self._model_combo.currentIndexChanged.connect(self._on_model_combo_changed)
         model_box.addWidget(self._model_combo)
@@ -2901,13 +3143,77 @@ class MainPanel(QWidget):
 
         layout.addLayout(model_box)
 
+        # --- AI post-processing section (v1.7) ---
+        llm_box = QVBoxLayout()
+        llm_box.setSpacing(10)
+        llm_box.addWidget(self._section_header("AI post-processing (optional)"))
+        llm_box.addWidget(self._section_hint(
+            "Send transcripts to a local (or remote) OpenAI-compatible LLM to clean them up, "
+            "rewrite as bullets/email/Slack, or summarize. Works with LM Studio, Ollama, "
+            "llama.cpp server, vLLM, etc. Stays 100% local if your endpoint is local."
+        ))
+
+        self._llm_enabled_cb = QCheckBox("Enable AI post-processing")
+        self._llm_enabled_cb.setChecked(self._settings.llm_enabled)
+        self._llm_enabled_cb.toggled.connect(self._on_llm_enabled_toggled)
+        llm_box.addWidget(self._llm_enabled_cb)
+
+        self._llm_url_edit = QLineEdit(self._settings.llm_base_url)
+        self._llm_url_edit.setPlaceholderText("http://localhost:1234/v1")
+        self._llm_url_edit.editingFinished.connect(self._on_llm_url_changed)
+        llm_box.addLayout(self._form_row("Endpoint", self._llm_url_edit))
+
+        self._llm_model_edit = QLineEdit(self._settings.llm_model)
+        self._llm_model_edit.setPlaceholderText("often optional for LM Studio; required for Ollama")
+        self._llm_model_edit.editingFinished.connect(self._on_llm_model_changed)
+        llm_box.addLayout(self._form_row("Model", self._llm_model_edit))
+
+        self._llm_key_edit = QLineEdit(self._settings.llm_api_key)
+        self._llm_key_edit.setPlaceholderText("leave blank for local endpoints")
+        self._llm_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._llm_key_edit.editingFinished.connect(self._on_llm_key_changed)
+        llm_box.addLayout(self._form_row("API key", self._llm_key_edit))
+
+        self._llm_prompt_combo = _NoWheelComboBox()
+        for p in BUILTIN_LLM_PROMPTS:
+            self._llm_prompt_combo.addItem(p["label"], userData=p["id"])
+        try:
+            cur_idx = next(i for i, p in enumerate(BUILTIN_LLM_PROMPTS)
+                           if p["id"] == self._settings.llm_default_prompt)
+        except StopIteration:
+            cur_idx = 0
+        self._llm_prompt_combo.setCurrentIndex(cur_idx)
+        self._llm_prompt_combo.currentIndexChanged.connect(self._on_llm_prompt_changed)
+        llm_box.addLayout(self._form_row("Default prompt", self._llm_prompt_combo))
+
+        self._llm_auto_cb = QCheckBox("Auto-apply default prompt to every transcript")
+        self._llm_auto_cb.setChecked(self._settings.llm_auto_apply)
+        self._llm_auto_cb.toggled.connect(self._on_llm_auto_toggled)
+        llm_box.addWidget(self._llm_auto_cb)
+
+        # Test connection button + status.
+        test_row = QHBoxLayout()
+        test_row.setSpacing(10)
+        self._llm_test_btn = QPushButton("Test connection")
+        self._llm_test_btn.clicked.connect(self._on_llm_test_clicked)
+        test_row.addWidget(self._llm_test_btn)
+        self._llm_test_status = QLabel("")
+        self._llm_test_status.setStyleSheet("color: #9a9da6;")
+        test_row.addWidget(self._llm_test_status, stretch=1)
+        llm_box.addLayout(test_row)
+
+        llm_box.addWidget(self._section_hint(
+            "Press <b>Ctrl+Win+L</b> to apply the default prompt to your most recent transcript.",
+            rich=True,
+        ))
+
+        layout.addLayout(llm_box)
+
         # --- software updates section ---
         if self._updater is not None:
             update_box = QVBoxLayout()
-            update_box.setSpacing(6)
-            update_header = QLabel("Software updates")
-            update_header.setStyleSheet("font-weight: 600; color: #d8dbe2;")
-            update_box.addWidget(update_header)
+            update_box.setSpacing(10)
+            update_box.addWidget(self._section_header("Software updates"))
 
             row = QHBoxLayout()
             row.setSpacing(10)
@@ -2929,13 +3235,24 @@ class MainPanel(QWidget):
         layout.addStretch()
 
         footer = QLabel(
-            f"{APP_NAME} {__version__}  ·  Ctrl+Win to talk  ·  Esc to cancel  ·  "
-            f"Ctrl+Win+V re-paste  ·  Ctrl+Win+Q to quit"
+            f"{APP_NAME} {__version__}  ·  Ctrl+Win to talk  ·  Esc cancel  ·  "
+            f"Ctrl+Win+B re-paste  ·  Ctrl+Win+L AI prompt  ·  Ctrl+Win+Q quit"
         )
         footer.setStyleSheet("color: #6a6e78; font-size: 9pt;")
+        footer.setWordWrap(True)
         layout.addWidget(footer)
 
-        return w
+        # Wrap content in a scroll area so a tall settings list doesn't force
+        # the whole window taller. The scroll area is what the tab actually
+        # displays; `content` is the inner widget that holds every section.
+        scroll = QScrollArea()
+        scroll.setObjectName("settingsScroll")
+        scroll.setWidget(content)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        return scroll
 
     def _on_auto_paste_toggled(self, checked: bool) -> None:
         self._settings.auto_paste = bool(checked)
@@ -2953,6 +3270,87 @@ class MainPanel(QWidget):
         self._settings.hotkey_mode = mode
         self._settings.save()  # emits `changed` for live-apply
         log_app.info("hotkey mode -> %s", mode)
+
+    # --- LLM post-processing handlers ----------------------------------
+
+    def _on_llm_enabled_toggled(self, checked: bool) -> None:
+        self._settings.llm_enabled = bool(checked)
+        self._settings.save()
+        log_app.info("LLM post-processing %s", "enabled" if checked else "disabled")
+
+    def _on_llm_url_changed(self) -> None:
+        new_url = self._llm_url_edit.text().strip() or "http://localhost:1234/v1"
+        if new_url == self._settings.llm_base_url:
+            return
+        self._settings.llm_base_url = new_url
+        self._settings.save()
+
+    def _on_llm_model_changed(self) -> None:
+        new_model = self._llm_model_edit.text().strip()
+        if new_model == self._settings.llm_model:
+            return
+        self._settings.llm_model = new_model
+        self._settings.save()
+
+    def _on_llm_key_changed(self) -> None:
+        new_key = self._llm_key_edit.text()
+        if new_key == self._settings.llm_api_key:
+            return
+        self._settings.llm_api_key = new_key
+        self._settings.save()
+
+    def _on_llm_prompt_changed(self, _idx: int) -> None:
+        pid = self._llm_prompt_combo.currentData() or "cleanup"
+        if pid == self._settings.llm_default_prompt:
+            return
+        self._settings.llm_default_prompt = pid
+        self._settings.save()
+
+    def _on_llm_auto_toggled(self, checked: bool) -> None:
+        self._settings.llm_auto_apply = bool(checked)
+        self._settings.save()
+        log_app.info("LLM auto-apply %s", "on" if checked else "off")
+
+    def _on_llm_test_clicked(self) -> None:
+        self._llm_test_btn.setEnabled(False)
+        self._llm_test_status.setText("Testing…")
+        self._llm_test_status.setStyleSheet("color: #9a9da6;")
+
+        # Run in a worker thread so the UI doesn't freeze on slow endpoints.
+        def worker():
+            client = LLMClient(
+                base_url=self._settings.llm_base_url,
+                model=self._settings.llm_model,
+                api_key=self._settings.llm_api_key,
+            )
+            try:
+                ok = client.ping()
+                if not ok:
+                    QTimer.singleShot(0, lambda: self._set_llm_test_result(
+                        False, "Endpoint reachable but returned non-2xx"))
+                    return
+                # Also try a tiny chat to surface model-not-found / 401 etc.
+                _ = client.chat(
+                    "You are a test responder. Reply with the single word OK.",
+                    "ping",
+                )
+                QTimer.singleShot(0, lambda: self._set_llm_test_result(True, "Connected ✓"))
+            except urllib.error.URLError as e:
+                QTimer.singleShot(0, lambda: self._set_llm_test_result(
+                    False, f"Can't reach endpoint: {e.reason}"))
+            except Exception as e:
+                QTimer.singleShot(0, lambda: self._set_llm_test_result(
+                    False, f"Failed: {e}"))
+
+        threading.Thread(target=worker, daemon=True, name="llm-test").start()
+
+    def _set_llm_test_result(self, ok: bool, message: str) -> None:
+        self._llm_test_btn.setEnabled(True)
+        self._llm_test_status.setText(message)
+        if ok:
+            self._llm_test_status.setStyleSheet("color: #6bd47b;")
+        else:
+            self._llm_test_status.setStyleSheet("color: #e07c7c;")
 
     # --- audio input handlers ------------------------------------------
 
@@ -3226,6 +3624,7 @@ class App(QObject):
         self.hotkey.quit_requested.connect(self.quit)
         self.hotkey.cancel_requested.connect(self.on_cancel)
         self.hotkey.repaste_requested.connect(self.on_repaste_last)
+        self.hotkey.llm_apply_requested.connect(self.on_llm_apply_last)
         # Apply hotkey mode from settings and react to live changes.
         self.hotkey.set_mode(self.settings.hotkey_mode)
         self.settings.changed.connect(
@@ -3278,6 +3677,31 @@ class App(QObject):
         QApplication.instance().quit()
 
     def _show_panel(self) -> None:
+        # Position once per session: horizontally centered on the primary
+        # screen, vertically a bit above the midline (so the window feels
+        # eye-level rather than sinking toward the taskbar). Once placed,
+        # we leave it alone — if the user drags it, that position sticks
+        # across subsequent hides/shows.
+        if not getattr(self, "_panel_positioned", False):
+            screen = QGuiApplication.primaryScreen()
+            if screen is not None:
+                geo = screen.availableGeometry()  # excludes the taskbar
+                target_w = self.panel.width() or 640
+                target_h = self.panel.height() or 560
+                # Cap height to the available work-area so the bottom never
+                # ends up under the taskbar on small screens.
+                if target_h > geo.height() - 32:
+                    target_h = geo.height() - 32
+                    self.panel.resize(target_w, target_h)
+                x = geo.center().x() - target_w // 2
+                # Nudge ~8% of the work-area height above center so the
+                # window feels like a mid-screen popup, not a bottom drawer.
+                y = geo.center().y() - target_h // 2 - int(geo.height() * 0.08)
+                # Clamp so we never start partially off-screen.
+                x = max(geo.left() + 8, min(x, geo.right() - target_w - 8))
+                y = max(geo.top() + 8, min(y, geo.bottom() - target_h - 8))
+                self.panel.move(x, y)
+            self._panel_positioned = True
         self.panel.show()
         self.panel.raise_()
         self.panel.activateWindow()
@@ -3541,6 +3965,67 @@ class App(QObject):
         log_app.info("repaste-last (%d chars)", len(text))
         self.injector.paste(text)
 
+    def on_llm_apply_last(self) -> None:
+        """Ctrl+Win+L: run the configured default LLM prompt on the most
+        recent transcript and paste the result. Does NOT replace the
+        history entry — appends a new entry tagged with the prompt id so
+        the original raw dictation stays available for reference."""
+        if not self.settings.llm_enabled:
+            log_app.info("llm-apply: LLM post-processing is disabled in Settings")
+            self.ui_state.emit("error")
+            self._schedule_reset(self._bump_gen())
+            return
+        last = self.log.last()
+        if not last:
+            log_app.info("llm-apply: no transcript yet")
+            return
+        text = (last.get("text") or "").strip()
+        if not text:
+            return
+        prompt = llm_prompt_by_id(self.settings.llm_default_prompt) \
+                 or BUILTIN_LLM_PROMPTS[0]
+        log_app.info("llm-apply: prompt=%s on %d chars", prompt["id"], len(text))
+        self.ui_state.emit("transcribing")  # reuse the blue pulse for "thinking"
+        threading.Thread(
+            target=self._llm_apply_worker,
+            args=(text, prompt, True),  # paste=True, add_to_history=True
+            daemon=True,
+            name="llm-apply",
+        ).start()
+
+    def _llm_apply_worker(self, text: str, prompt: dict, paste: bool) -> None:
+        gen = self._bump_gen()
+        client = LLMClient(
+            base_url=self.settings.llm_base_url,
+            model=self.settings.llm_model,
+            api_key=self.settings.llm_api_key,
+        )
+        try:
+            result = client.chat(prompt["system"], text)
+        except Exception as e:
+            log_app.exception("LLM call failed: %s", e)
+            if self._is_latest(gen):
+                self.ui_state.emit("error")
+                self._schedule_reset(gen)
+            return
+        result = (result or "").strip()
+        if not result:
+            log_app.warning("LLM returned empty result — leaving original transcript alone")
+            if self._is_latest(gen):
+                self.ui_state.emit("idle")
+            return
+        log_app.info("LLM apply: %d -> %d chars (prompt=%s)",
+                     len(text), len(result), prompt["id"])
+        if paste:
+            self.injector.paste(result)
+        # Append as a new history entry tagged with the source prompt so the
+        # user can see what was done and retrieve the LLM-cleaned version
+        # later from the History tab.
+        self.log.add(result, raw=text)
+        if self._is_latest(gen):
+            self.ui_state.emit("done")
+            self._schedule_reset(gen)
+
     def _tick_level(self) -> None:
         self.ui_level.emit(self.recorder.level)
 
@@ -3579,6 +4064,29 @@ class App(QObject):
         text = apply_smart_defaults(text)
         if text != raw:
             log_app.info("rewrite %r -> %r", raw, text)
+
+        # Auto-apply LLM post-processing: replaces the transcript before paste
+        # and replaces the history entry's text (raw still captures Whisper's
+        # original output for forensic purposes).
+        if (self.settings.llm_enabled and self.settings.llm_auto_apply
+                and self._is_latest(gen)):
+            prompt = llm_prompt_by_id(self.settings.llm_default_prompt) \
+                     or BUILTIN_LLM_PROMPTS[0]
+            client = LLMClient(
+                base_url=self.settings.llm_base_url,
+                model=self.settings.llm_model,
+                api_key=self.settings.llm_api_key,
+            )
+            try:
+                llm_result = client.chat(prompt["system"], text)
+                llm_result = (llm_result or "").strip()
+                if llm_result:
+                    log_app.info("auto-LLM: %r -> %r (prompt=%s)",
+                                 text, llm_result, prompt["id"])
+                    text = llm_result
+            except Exception:
+                log_app.exception("auto-LLM failed — falling back to raw transcript")
+
         if self.settings.auto_paste:
             self.injector.paste(text)
         self.log.add(text, raw=raw)
