@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 APP_NAME = "Tellur"
 
 
@@ -24,9 +24,15 @@ import logging.handlers
 import os
 import queue
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
+import zipfile
 from collections import deque
 from math import sin
 from pathlib import Path
@@ -122,6 +128,12 @@ PROMPT_MAX_CHARS = 900
 BEAM_SIZE = 5
 NO_REPEAT_NGRAM_SIZE = 3
 REPETITION_PENALTY = 1.05
+
+# auto-update — checks GitHub releases on startup, offers one-click install.
+UPDATE_REPO = "EddyThePro/tellur"
+UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_TIMEOUT_SEC = 6
+UPDATE_HELPER_PARENT_WAIT_SEC = 30
 
 # persistence — defaults to per-user app data; override with TELLUR_HOME env var.
 def _default_data_dir() -> Path:
@@ -800,6 +812,343 @@ class Overlay(QWidget):
 
 
 # ===========================================================================
+# auto-update — one-click in-app upgrade from GitHub Releases
+# ===========================================================================
+log_update = logging.getLogger("update")
+
+
+def _version_tuple(v: str) -> tuple:
+    """Parse a SemVer-ish version string to a comparable tuple. Non-numeric
+    parts are treated as -1 so pre-release suffixes sort below releases."""
+    parts: list[int] = []
+    for chunk in (v or "").lstrip("v").split("."):
+        try:
+            parts.append(int(chunk))
+        except ValueError:
+            # strip non-digits, fall back to 0
+            digits = "".join(c for c in chunk if c.isdigit())
+            parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True iff a process with the given PID is currently running.
+    Used by the update helper to know when the old app has fully exited."""
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return False
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    h = ctypes.windll.kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+    )
+    if not h:
+        return False
+    try:
+        code = wintypes.DWORD()
+        ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+        return code.value == STILL_ACTIVE
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h)
+
+
+def check_for_update() -> dict | None:
+    """Query the GitHub releases API for the latest tagged release. Returns
+    an info dict if a newer-than-current version is available, else None.
+
+    Network failures, parse errors, and rate limits all map to None — silent
+    so the app keeps running normally.
+    """
+    headers = {
+        "User-Agent": f"{APP_NAME}/{__version__}",
+        "Accept": "application/vnd.github+json",
+    }
+    req = urllib.request.Request(UPDATE_API_URL, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT_SEC) as resp:
+            data = json.load(resp)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        log_update.info("update check failed: %s", e)
+        return None
+    except Exception:
+        log_update.exception("update check unexpectedly raised")
+        return None
+
+    tag = (data.get("tag_name") or "").strip()
+    if not tag:
+        return None
+    remote_v = _version_tuple(tag)
+    local_v = _version_tuple(__version__)
+    if remote_v <= local_v:
+        log_update.info("on latest version (%s)", __version__)
+        return None
+
+    # find the first .zip asset
+    zip_url = None
+    zip_size = 0
+    for asset in data.get("assets", []) or []:
+        name = asset.get("name") or ""
+        if name.lower().endswith(".zip"):
+            zip_url = asset.get("browser_download_url")
+            zip_size = asset.get("size") or 0
+            break
+    if not zip_url:
+        log_update.info("release %s has no zip asset; skipping", tag)
+        return None
+
+    body = data.get("body") or ""
+    log_update.info("update available: %s (%d bytes)", tag, zip_size)
+    return {
+        "tag": tag,
+        "version": tag.lstrip("v"),
+        "zip_url": zip_url,
+        "zip_size": zip_size,
+        "notes": body[:1500],
+        "html_url": data.get("html_url") or "",
+    }
+
+
+def _spawn_update_helper(zip_path: Path, install_dir: Path) -> None:
+    """Launch a detached helper process that will replace install files
+    after this process exits and then start the new version."""
+    args = [
+        sys.executable,
+        str(install_dir / "tellur.py"),
+        "--update-helper",
+        "--zip", str(zip_path),
+        "--install-dir", str(install_dir),
+        "--parent-pid", str(os.getpid()),
+    ]
+    creationflags = 0
+    if sys.platform == "win32":
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        creationflags = 0x00000008 | 0x00000200 | 0x08000000
+    subprocess.Popen(
+        args,
+        creationflags=creationflags,
+        close_fds=True,
+        cwd=str(install_dir),
+    )
+    log_update.info("spawned update helper for %s", zip_path)
+
+
+# Files in the install dir we should NOT overwrite during update because the
+# user may have customized them. Their data (settings.json / history.json /
+# logs) lives in TELLUR_HOME, not the install dir, so they're not at risk.
+_PRESERVE_FILES = frozenset({"replacements.json"})
+
+
+def _update_helper_main(args) -> int:
+    """Standalone entry point used when tellur.py is invoked with
+    --update-helper. Lives in this file so it ships with every version going
+    forward. Does the post-exit file replacement and relaunches the app.
+
+    Logs to a side-channel file in %TEMP% so issues are debuggable even when
+    the main log isn't writable yet.
+    """
+    log_dir = Path(tempfile.gettempdir())
+    helper_log = log_dir / "tellur_update.log"
+
+    def w(msg: str) -> None:
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
+        try:
+            with helper_log.open("a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            pass
+
+    w(f"helper start: pid={os.getpid()} parent={args.parent_pid} zip={args.zip}")
+
+    zip_path = Path(args.zip)
+    install_dir = Path(args.install_dir)
+
+    # 1) wait for parent to exit so its file handles release.
+    deadline = time.monotonic() + UPDATE_HELPER_PARENT_WAIT_SEC
+    while time.monotonic() < deadline and _pid_alive(args.parent_pid):
+        time.sleep(0.2)
+    if _pid_alive(args.parent_pid):
+        w(f"parent {args.parent_pid} still alive after timeout — aborting")
+        return 1
+    w("parent exited; extracting")
+
+    # 2) verify zip integrity, then extract to a staging dir.
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            bad = zf.testzip()
+            if bad is not None:
+                w(f"zip integrity check failed on member: {bad}")
+                return 2
+    except (zipfile.BadZipFile, OSError) as e:
+        w(f"zip open failed: {e}")
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="tellur_upd_") as staging:
+        staging_dir = Path(staging)
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(staging_dir)
+        except (zipfile.BadZipFile, OSError) as e:
+            w(f"extract failed: {e}")
+            return 3
+
+        # 3) copy files over the install dir, skipping preserved user files.
+        copied = 0
+        skipped = 0
+        for src in staging_dir.rglob("*"):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(staging_dir)
+            dst = install_dir / rel
+            if rel.name in _PRESERVE_FILES and dst.exists():
+                w(f"preserved: {rel}")
+                skipped += 1
+                continue
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                copied += 1
+            except OSError as e:
+                w(f"copy failed for {rel}: {e}")
+                return 4
+        w(f"install complete: copied={copied} skipped={skipped}")
+
+    # 4) launch the new version via run.bat.
+    run_bat = install_dir / "run.bat"
+    if run_bat.exists():
+        flags = 0
+        if sys.platform == "win32":
+            flags = 0x00000008 | 0x00000200  # DETACHED | NEW_GROUP
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", str(run_bat)],
+                cwd=str(install_dir),
+                creationflags=flags,
+                close_fds=True,
+            )
+            w(f"relaunched via {run_bat}")
+        except OSError as e:
+            w(f"relaunch failed: {e}")
+            return 5
+    else:
+        w(f"run.bat missing at {run_bat}; not relaunched")
+
+    # 5) best-effort cleanup of the downloaded zip + its temp dir.
+    try:
+        zip_path.unlink(missing_ok=True)
+        parent = zip_path.parent
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError:
+        pass
+
+    w("helper exit ok")
+    return 0
+
+
+class Updater(QObject):
+    """Background update checker + one-click installer."""
+
+    state_changed = pyqtSignal(str)        # human-readable status for UI
+    update_found = pyqtSignal(dict)        # info dict from check_for_update
+    install_started = pyqtSignal()
+    install_failed = pyqtSignal(str)
+
+    def __init__(self, install_dir: Path):
+        super().__init__()
+        self.install_dir = install_dir
+        self._info: dict | None = None
+        self._busy = False
+        self._lock = threading.Lock()
+
+    @property
+    def latest_info(self) -> dict | None:
+        return self._info
+
+    def check_async(self) -> None:
+        with self._lock:
+            if self._busy:
+                return
+            self._busy = True
+        self.state_changed.emit("Checking for updates…")
+        threading.Thread(target=self._check_worker, daemon=True, name="update-check").start()
+
+    def _check_worker(self) -> None:
+        try:
+            info = check_for_update()
+        finally:
+            with self._lock:
+                self._busy = False
+        if info is None:
+            self._info = None
+            self.state_changed.emit(f"Tellur {__version__} — up to date")
+        else:
+            self._info = info
+            self.state_changed.emit(f"Update available: v{info['version']}")
+            self.update_found.emit(info)
+
+    def install_async(self) -> None:
+        info = self._info
+        if not info:
+            self.install_failed.emit("No update info — run a check first.")
+            return
+        with self._lock:
+            if self._busy:
+                return
+            self._busy = True
+        self.install_started.emit()
+        threading.Thread(
+            target=self._install_worker, args=(info,),
+            daemon=False, name="update-install",
+        ).start()
+
+    def _install_worker(self, info: dict) -> None:
+        try:
+            self.state_changed.emit(f"Downloading v{info['version']}…")
+            tmpdir = Path(tempfile.mkdtemp(prefix="tellur_dl_"))
+            zip_path = tmpdir / f"Tellur-{info['version']}.zip"
+            try:
+                urllib.request.urlretrieve(info["zip_url"], zip_path)
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                log_update.exception("download failed")
+                self.install_failed.emit(f"Download failed: {e}")
+                return
+
+            # quick integrity check
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    bad = zf.testzip()
+                    if bad is not None:
+                        self.install_failed.emit(f"Downloaded archive is corrupt ({bad})")
+                        return
+            except zipfile.BadZipFile:
+                self.install_failed.emit("Downloaded file is not a valid zip")
+                return
+
+            self.state_changed.emit("Installing…")
+            try:
+                _spawn_update_helper(zip_path, self.install_dir)
+            except OSError as e:
+                log_update.exception("helper spawn failed")
+                self.install_failed.emit(f"Could not start updater: {e}")
+                return
+
+            self.state_changed.emit("Restarting Tellur…")
+            # Give the helper a beat to start polling our PID, then quit.
+            QTimer.singleShot(400, QApplication.instance().quit)
+        finally:
+            with self._lock:
+                self._busy = False
+
+
+# ===========================================================================
 # system tray icon
 # ===========================================================================
 class TrayIcon(QSystemTrayIcon):
@@ -809,10 +1158,12 @@ class TrayIcon(QSystemTrayIcon):
     show_panel = pyqtSignal()
     copy_last = pyqtSignal()
     quit_requested = pyqtSignal()
+    install_update = pyqtSignal()
 
-    def __init__(self, parent: QObject | None = None):
+    def __init__(self, updater: "Updater | None" = None, parent: QObject | None = None):
         super().__init__(self._make_icon(), parent)
         self.setToolTip(f"{APP_NAME} {__version__}")
+        self._updater = updater
 
         menu = QMenu()
         open_act = QAction(f"Open {APP_NAME}", self)
@@ -824,6 +1175,13 @@ class TrayIcon(QSystemTrayIcon):
         copy_act.triggered.connect(self.copy_last)
         menu.addAction(copy_act)
 
+        # Update entry — hidden until an update is found, then becomes visible.
+        self._update_act = QAction("Install update", self)
+        fu = self._update_act.font(); fu.setBold(True); self._update_act.setFont(fu)
+        self._update_act.setVisible(False)
+        self._update_act.triggered.connect(self.install_update)
+        menu.addAction(self._update_act)
+
         menu.addSeparator()
 
         quit_act = QAction("Quit  (Ctrl+Win+Q)", self)
@@ -832,6 +1190,12 @@ class TrayIcon(QSystemTrayIcon):
 
         self.setContextMenu(menu)
         self.activated.connect(self._on_activated)
+
+    def set_update_available(self, info: dict) -> None:
+        """Reveal an 'Install update vX.Y.Z' entry in the tray menu."""
+        self._update_act.setText(f"Install update — v{info.get('version','?')}")
+        self._update_act.setVisible(True)
+        self.setToolTip(f"{APP_NAME} {__version__}  ·  v{info.get('version','?')} available")
 
     def _on_activated(self, reason) -> None:
         if reason in (
@@ -928,10 +1292,17 @@ QWidget#mainPanel QSlider::handle:horizontal:hover { background: #7a98ff; }
 class MainPanel(QWidget):
     """The 'open from the tray' window. Two tabs: History and Settings."""
 
-    def __init__(self, log: TranscriptLog, settings: Settings, parent: QObject | None = None):
+    def __init__(
+        self,
+        log: TranscriptLog,
+        settings: Settings,
+        updater: "Updater | None" = None,
+        parent: QObject | None = None,
+    ):
         super().__init__()
         self._log = log
         self._settings = settings
+        self._updater = updater
 
         self.setObjectName("mainPanel")
         self.setWindowTitle(APP_NAME)
@@ -1096,6 +1467,31 @@ class MainPanel(QWidget):
         sens_box.addLayout(row)
         layout.addLayout(sens_box)
 
+        # --- software updates section ---
+        if self._updater is not None:
+            update_box = QVBoxLayout()
+            update_box.setSpacing(6)
+            update_header = QLabel("Software updates")
+            update_header.setStyleSheet("font-weight: 600; color: #d8dbe2;")
+            update_box.addWidget(update_header)
+
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            self._update_status = QLabel(f"Tellur {__version__} — checking for updates…")
+            self._update_status.setStyleSheet("color: #9a9da6;")
+            self._update_status.setWordWrap(True)
+            row.addWidget(self._update_status, stretch=1)
+
+            self._update_btn = QPushButton("Check for updates")
+            self._update_btn.clicked.connect(self._on_update_button)
+            row.addWidget(self._update_btn)
+            update_box.addLayout(row)
+            layout.addLayout(update_box)
+
+            self._updater.state_changed.connect(self._on_update_state_changed)
+            self._updater.update_found.connect(self._on_update_found)
+            self._updater.install_failed.connect(self._on_update_failed)
+
         layout.addStretch()
 
         footer = QLabel(
@@ -1122,6 +1518,47 @@ class MainPanel(QWidget):
         # apply live regardless of save timing
         self._settings.changed.emit()
 
+    # --- update UI handlers --------------------------------------------
+
+    def _on_update_button(self) -> None:
+        if self._updater is None:
+            return
+        info = self._updater.latest_info
+        if info:
+            # update is known — install it
+            self._update_btn.setEnabled(False)
+            self._update_btn.setText("Installing…")
+            self._updater.install_async()
+        else:
+            # re-check
+            self._update_btn.setEnabled(False)
+            self._update_btn.setText("Checking…")
+            self._updater.check_async()
+
+    def _on_update_state_changed(self, msg: str) -> None:
+        if hasattr(self, "_update_status"):
+            self._update_status.setText(msg)
+        # Re-enable the button if we landed in a stable resting state.
+        if hasattr(self, "_update_btn"):
+            if msg.startswith("Checking") or msg.startswith("Downloading") or \
+               msg.startswith("Installing") or msg.startswith("Restarting"):
+                self._update_btn.setEnabled(False)
+            else:
+                self._update_btn.setEnabled(True)
+                # text is set by the more specific handlers below
+
+    def _on_update_found(self, info: dict) -> None:
+        if hasattr(self, "_update_btn"):
+            self._update_btn.setText(f"Install v{info.get('version','?')}")
+            self._update_btn.setEnabled(True)
+
+    def _on_update_failed(self, reason: str) -> None:
+        if hasattr(self, "_update_status"):
+            self._update_status.setText(f"Update failed: {reason}")
+        if hasattr(self, "_update_btn"):
+            self._update_btn.setEnabled(True)
+            self._update_btn.setText("Try again")
+
     # --- window behavior -----------------------------------------------
 
     def closeEvent(self, event) -> None:
@@ -1146,11 +1583,13 @@ class App(QObject):
         self.injector = TextInjector()
 
         here = Path(__file__).resolve().parent
+        self.install_dir = here
         self.replacements = Replacements(here / REPLACEMENTS_FILE)
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.log = TranscriptLog(HISTORY_FILE)
         self.settings = Settings(SETTINGS_FILE)
+        self.updater = Updater(self.install_dir)
 
         # Apply persisted settings to the overlay; react to live changes.
         self.overlay.set_scale(self.settings.sensitivity)
@@ -1159,13 +1598,15 @@ class App(QObject):
         )
 
         # Tray + panel — panel is hidden by default; opened from the tray.
-        self.panel = MainPanel(self.log, self.settings)
-        self.tray = TrayIcon(self)
+        self.panel = MainPanel(self.log, self.settings, self.updater)
+        self.tray = TrayIcon(self.updater, self)
         if not QSystemTrayIcon.isSystemTrayAvailable():
             log_app.warning("system tray not available — tray icon will be inactive")
         self.tray.show_panel.connect(self._show_panel)
         self.tray.copy_last.connect(self._copy_last_to_clipboard)
         self.tray.quit_requested.connect(self.quit)
+        self.tray.install_update.connect(self.updater.install_async)
+        self.updater.update_found.connect(self.tray.set_update_available)
 
         self.hotkey.pressed.connect(self.on_press)
         self.hotkey.released.connect(self.on_release)
@@ -1182,6 +1623,10 @@ class App(QObject):
         self._latest_gen = 0
 
         threading.Thread(target=self._warm_up, daemon=True, name="model-warmup").start()
+
+        # Kick off a one-shot update check ~3s after startup so it doesn't
+        # compete with model loading for network/CPU.
+        QTimer.singleShot(3000, self.updater.check_async)
 
     def start(self) -> None:
         self.overlay.show()
@@ -1314,6 +1759,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="verbose console logging (DEBUG level)")
     parser.add_argument("--version", action="version",
                         version=f"{APP_NAME} {__version__}")
+    # Internal: spawn-as-updater. Not user-facing.
+    parser.add_argument("--update-helper", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--zip", help=argparse.SUPPRESS)
+    parser.add_argument("--install-dir", help=argparse.SUPPRESS)
+    parser.add_argument("--parent-pid", type=int, help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -1328,6 +1778,14 @@ def show_fatal(message: str) -> None:
 
 def main() -> int:
     args = parse_args()
+
+    # Update helper code path: runs as a detached process spawned by an older
+    # Tellur instance. No Qt, no audio, no model — just file replacement.
+    if args.update_helper:
+        if not (args.zip and args.install_dir and args.parent_pid):
+            return 64
+        return _update_helper_main(args)
+
     listener = setup_logging(args.debug)
     startup = logging.getLogger("startup")
     startup.info("%s %s on python %s", APP_NAME, __version__, sys.version.split()[0])

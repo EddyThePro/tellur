@@ -2,6 +2,18 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-05-17
+
+### Added
+
+- **In-app auto-update.** Tellur now checks GitHub on startup and surfaces new versions both in the **Settings → Software updates** section and in the system-tray right-click menu. Click **Install** and Tellur downloads the new release, swaps the files cleanly, and restarts itself — no manual download, no website visit. Your `replacements.json` and all data in `%LOCALAPPDATA%\Tellur\` are preserved across upgrades.
+
+### Notes for upgrading from 1.0.x
+
+The auto-updater lives inside `tellur.py`, so the **first time** you move from 1.0.x to 1.1.0+ you still have to download the zip manually (because the old version doesn't know how to update itself). From 1.1.0 onward, every future upgrade is one click.
+
+---
+
 ## [1.0.1] — 2026-05-17
 
 ### Fixed
