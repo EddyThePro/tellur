@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 APP_NAME = "Tellur"
 
 
@@ -3013,8 +3013,11 @@ class MainPanel(QWidget):
             lambda: self._apply_theme(self._settings.theme)
         )
         # Fixed default size — tabs are independently sized; Settings scrolls
-        # internally so it never forces the window taller.
-        self.resize(640, 560)
+        # internally so it never forces the window taller. Width gives the
+        # Settings content enough breathing room that no horizontal
+        # scrollbar appears (which would otherwise trigger when Qt
+        # auto-scrolls a freshly-focused button into view).
+        self.resize(680, 580)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
@@ -3850,7 +3853,12 @@ class MainPanel(QWidget):
         scroll.setWidget(content)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Horizontal bar is AsNeeded (not AlwaysOff). At the default window
+        # size all content fits, so the bar stays hidden. If the user
+        # shrinks the window below the content's natural width, the bar
+        # appears so cut-off controls can still be reached by scrolling —
+        # instead of silently shifting on click via Qt's focus-follow.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         return scroll
 
@@ -4538,8 +4546,8 @@ class App(QObject):
             screen = QGuiApplication.primaryScreen()
             if screen is not None:
                 geo = screen.availableGeometry()  # excludes the taskbar
-                target_w = self.panel.width() or 640
-                target_h = self.panel.height() or 560
+                target_w = self.panel.width() or 680
+                target_h = self.panel.height() or 580
                 # Cap height to the available work-area so the bottom never
                 # ends up under the taskbar on small screens.
                 if target_h > geo.height() - 32:

@@ -2,6 +2,23 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [2.0.1] — 2026-05-17
+
+UI fix: clicking **Check for updates** (or any button in the lower Settings sections) no longer shifts the entire panel to the right with no way to scroll back.
+
+### What happened
+
+Qt's `QScrollArea` auto-scrolls a freshly-focused widget into view. With the horizontal scrollbar policy set to `ScrollBarAlwaysOff`, the panel would silently scroll horizontally to fit the button — but the scrollbar that would have let you scroll back was suppressed. Net effect: clicking the button cut off the left edge of every form row.
+
+### Fix
+
+- **Horizontal scrollbar policy: `AlwaysOff` → `AsNeeded`.** Now hidden when content fits the viewport (the normal case) and visible when the user shrinks the window below the content's natural width. Either way, no more silent shifting with no way back.
+- **Default window size bumped from 640×560 → 680×580.** Gives the Settings content enough breathing room that the focus-follow can't push anything off the edge at default size. The new dimensions are also applied to the first-open positioning fallback in `_show_panel` so re-centering uses the same numbers.
+
+No feature changes. Patched on top of v2.0.0.
+
+---
+
 ## [2.0.0] — 2026-05-17
 
 **Phase 8 — the v2.0 finale.** Two quality-of-life features close out the roadmap: a light/dark theme toggle, and per-app vocabulary overlays.
