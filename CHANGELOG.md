@@ -2,6 +2,50 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] — 2026-05-17
+
+**Phase 2 of the roadmap.** Two changes to how transcripts get post-processed: a tiny always-on polish pass that everyone benefits from, plus an opt-in "voice commands" mode for users who want to dictate punctuation explicitly.
+
+### Always-on smart defaults
+
+Runs on every transcription regardless of any setting:
+
+- **Capitalize the first letter** of the transcript.
+- **Strip trailing weak punctuation** — an orphan trailing comma / semicolon / colon (which Whisper sometimes leaves on incomplete thoughts) gets dropped.
+- **Ensure terminal punctuation** — if the transcript doesn't end in `.` / `!` / `?`, a period is appended.
+
+Whisper-v3 already handles tonality- and pause-based punctuation in the base transcription (commas at natural pauses, periods at sentence ends, question marks for interrogative intonation). This is just the polish layer on top.
+
+### Voice commands (opt-in)
+
+- **Settings → Voice commands & punctuation dictation** checkbox (default **off**, opt-in). When enabled, Whisper's output runs through a new `VoiceCommandProcessor` *after* the user dictionary. Capabilities:
+
+  **Spoken punctuation** — dictated words become actual punctuation marks:
+  - `comma` → `,` · `period` / `full stop` → `.`
+  - `question mark` → `?` · `exclamation point` / `exclamation mark` → `!`
+  - `colon` → `:` · `semicolon` → `;` · `ellipsis` → `…`
+  - `open quote` / `close quote` → `"` (directional — attach correctly to neighbouring word)
+  - `open parenthesis` / `close parenthesis` (and `paren`, `bracket`, `brace` variants)
+  - `dash` / `hyphen` → `-` (attached) · `em dash` → `—` (kept with spaces)
+
+  **Structural commands** — produce real whitespace:
+  - `new line` → newline · `new paragraph` → double-newline · `tab` → tab
+
+  **Editing commands** — modify the current transcription:
+  - `scratch that` / `delete that` / `scratch it` — drops everything from the most recent sentence boundary back through the trigger phrase
+
+  **Auto-capitalization** — the first letter of each sentence is uppercased automatically (start of utterance + any letter following `.` / `!` / `?` + whitespace).
+
+  Direction-aware whitespace handling: "trailing" punctuation (comma, period, close-paren, …) eats the space before it so it attaches cleanly to the previous word; "leading" punctuation (open-paren, open-quote, …) eats the space after it.
+
+  **Plays nicely with Whisper's own auto-punctuation.** Whisper-v3 already adds commas and periods based on speech tonality — saying "test one comma two period" might come out of Whisper as `Test 1, 2, period.` (Whisper adds its commas + transcribes "period" literally) — so the processor post-processes to dedupe adjacent punctuation (`,..` → `.` — strongest wins) and strips orphan commas at the start of new lines. End result: `Test 1, 2.` instead of `Test 1, 2,..`.
+
+### Default OFF
+
+Existing users get auto-updated to v1.4.0 with voice commands disabled — toggle on via Settings if you want them. Saying "comma" in normal speech with the toggle off still produces the literal word.
+
+---
+
 ## [1.3.1] — 2026-05-17
 
 UI overhaul for the v1.3 history panel — both visual fixes and a simplification of the per-row actions.

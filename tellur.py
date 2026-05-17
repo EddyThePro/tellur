@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 APP_NAME = "Tellur"
 
 
@@ -401,6 +401,196 @@ class Replacements:
         return out
 
 
+def apply_smart_defaults(text: str) -> str:
+    """Safe always-on normalization for every transcription, regardless of
+    whether voice commands are enabled:
+
+    - Trim leading/trailing whitespace
+    - Capitalize the first letter
+    - Strip trailing 'weak' punctuation (orphan comma/semicolon/colon that
+      Whisper sometimes leaves on incomplete thoughts)
+    - Ensure the transcript ends with terminal punctuation (. ! ?)
+
+    Whisper already does most of the heavy lifting based on speech tonality
+    and pauses; this is just the small polish pass on top.
+    """
+    if not text:
+        return text
+    text = text.strip()
+    if not text:
+        return text
+    # Capitalize first alpha character (don't touch numbers/symbols leading).
+    if text[0].isalpha():
+        text = text[0].upper() + text[1:]
+    # Strip trailing weak punctuation & whitespace.
+    text = re.sub(r"[,;:\s]+$", "", text)
+    # Ensure terminal punctuation.
+    if text and text[-1] not in ".!?":
+        text = text + "."
+    return text
+
+
+class VoiceCommandProcessor:
+    """Post-processes Whisper output to apply spoken punctuation, structural
+    commands ('new line', 'new paragraph'), editing commands ('scratch that'),
+    and auto-capitalization of sentence starts. All gated by a single setting
+    so users can opt out and get raw transcripts.
+
+    Pipeline order is significant — it runs AFTER the user dictionary
+    (Replacements), so dictionary rewrites happen on raw Whisper text first,
+    and then voice commands turn dictated punctuation into real punctuation.
+    """
+
+    # (phrase, replacement, direction)
+    # direction controls how surrounding whitespace is consumed:
+    #   "before" — eat preceding whitespace (e.g. comma attaches to prior word)
+    #   "after"  — eat trailing whitespace (e.g. open paren attaches to next)
+    #   "both"   — eat both (structural separators, newlines)
+    #   "none"   — leave whitespace alone (e.g. em dash with spaces)
+    PUNCTUATION: list[tuple[str, str, str]] = [
+        # Multi-word phrases first so they win against single-word fallbacks.
+        ("exclamation point", "!", "before"),
+        ("exclamation mark",  "!", "before"),
+        ("question mark",     "?", "before"),
+        ("full stop",         ".", "before"),
+        # Brackets / quotes — directional
+        ("open parenthesis",  "(", "after"),
+        ("close parenthesis", ")", "before"),
+        ("open paren",        "(", "after"),
+        ("close paren",       ")", "before"),
+        ("open quotation",    "\"", "after"),
+        ("close quotation",   "\"", "before"),
+        ("open quote",        "\"", "after"),
+        ("close quote",       "\"", "before"),
+        ("open bracket",      "[", "after"),
+        ("close bracket",     "]", "before"),
+        ("open brace",        "{", "after"),
+        ("close brace",       "}", "before"),
+        # Em dash typically reads with spaces around it.
+        ("em dash",           "—", "none"),
+        # Single-word punctuation
+        ("ellipsis",          "…", "before"),
+        ("semicolon",         ";", "before"),
+        ("period",            ".", "before"),
+        ("comma",             ",", "before"),
+        ("colon",             ":", "before"),
+        ("dash",              "-", "both"),
+        ("hyphen",            "-", "both"),
+    ]
+
+    STRUCTURAL: list[tuple[str, str, str]] = [
+        ("new paragraph", "\n\n", "both"),
+        ("new line",      "\n",   "both"),
+        ("tab",           "\t",   "both"),
+    ]
+
+    # "scratch that" deletes everything from the most recent sentence
+    # boundary (or start of utterance) up through the trigger phrase.
+    SCRATCH_TRIGGERS: list[str] = [
+        "scratch that",
+        "delete that",
+        "scratch it",
+    ]
+
+    # Priority for picking the survivor when multiple punctuation marks end
+    # up adjacent (after we add ours on top of Whisper's auto-punctuation).
+    # Higher = stronger.
+    _PUNCT_PRIORITY: dict[str, int] = {
+        ",": 1, ";": 2, ":": 3, ".": 4, "?": 5, "!": 5,
+    }
+
+    def process(self, text: str) -> str:
+        if not text:
+            return text
+        text = self._apply_scratch(text)
+        text = self._apply_replacements(text, self.STRUCTURAL)
+        text = self._apply_replacements(text, self.PUNCTUATION)
+        # Whisper does its own punctuation; combined with ours we end up with
+        # runs like ",.." or ".,". Dedupe to the strongest single mark.
+        text = self._collapse_adjacent_punctuation(text)
+        # Orphan commas at the start of a new line (Whisper inserted one
+        # right before a word we converted to "\n") look like noise.
+        text = self._strip_leading_punct_after_newline(text)
+        text = self._capitalize_sentences(text)
+        text = self._normalize_whitespace(text)
+        return text.strip()
+
+    @classmethod
+    def _collapse_adjacent_punctuation(cls, text: str) -> str:
+        """Collapse runs of adjacent .,?!;: (with optional horizontal
+        whitespace between) into the strongest single mark. Doesn't cross
+        newlines, so paragraph structure is preserved."""
+        priority = cls._PUNCT_PRIORITY
+
+        def pick(m: "re.Match") -> str:
+            chars = [c for c in m.group(0) if c in priority]
+            if not chars:
+                return m.group(0)
+            return max(chars, key=lambda c: priority[c])
+
+        # At least one punct + at least one more punct, separated only by
+        # horizontal whitespace (no \n in between).
+        return re.sub(r"[.,?!;:](?:[ \t]*[.,?!;:])+", pick, text)
+
+    @staticmethod
+    def _strip_leading_punct_after_newline(text: str) -> str:
+        """Remove a leftover comma/semicolon/colon that ends up at the very
+        start of a new line — typically Whisper's auto-punctuation that got
+        stranded when an adjacent word was converted to '\\n'."""
+        return re.sub(r"\n[ \t]*[,;:]+[ \t]*", "\n", text)
+
+    @staticmethod
+    def _phrase_pattern(phrase: str, direction: str) -> "re.Pattern":
+        # Allow flexible internal whitespace ("new  line" → newline too).
+        parts = phrase.split()
+        body = r"\s+".join(re.escape(p) for p in parts)
+        if direction == "before":
+            return re.compile(r"\s*\b" + body + r"\b", re.IGNORECASE)
+        if direction == "after":
+            return re.compile(r"\b" + body + r"\b\s*", re.IGNORECASE)
+        if direction == "both":
+            return re.compile(r"\s*\b" + body + r"\b\s*", re.IGNORECASE)
+        return re.compile(r"\b" + body + r"\b", re.IGNORECASE)
+
+    def _apply_replacements(self, text: str, pairs: list[tuple[str, str, str]]) -> str:
+        for phrase, replacement, direction in pairs:
+            pat = self._phrase_pattern(phrase, direction)
+            text = pat.sub(replacement, text)
+        return text
+
+    def _apply_scratch(self, text: str) -> str:
+        for trigger in self.SCRATCH_TRIGGERS:
+            pat = self._phrase_pattern(trigger, "after")
+            while True:
+                m = pat.search(text)
+                if not m:
+                    break
+                prefix = text[:m.start()]
+                # Find the most recent sentence boundary in the prefix.
+                last_punct = max(prefix.rfind("."), prefix.rfind("!"), prefix.rfind("?"))
+                cut_start = last_punct + 1 if last_punct >= 0 else 0
+                # Skip whitespace immediately after the boundary.
+                while cut_start < len(prefix) and prefix[cut_start] in " \t\n":
+                    cut_start += 1
+                text = text[:cut_start] + text[m.end():]
+        return text
+
+    @staticmethod
+    def _capitalize_sentences(text: str) -> str:
+        # Uppercase the first letter of the utterance and any letter that
+        # follows sentence-ending punctuation + whitespace.
+        def _upper(m: "re.Match") -> str:
+            return m.group(1) + m.group(2).upper()
+        return re.sub(r"(^|[.!?]\s+)([a-z])", _upper, text)
+
+    @staticmethod
+    def _normalize_whitespace(text: str) -> str:
+        # Collapse runs of horizontal whitespace but preserve newlines.
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r" *\n *", "\n", text)
+        return text
+
+
 class TranscriptLog(QObject):
     """Persistent record of every transcription. Backs the History tab and
     the tray's 'Copy last' action; also provides Whisper-context for prompts.
@@ -578,6 +768,7 @@ class Settings(QObject):
         self.auto_paste = PASTE_AFTER_TRANSCRIBE
         self.sensitivity = BAR_LEVEL_SCALE
         self.model_name = DEFAULT_MODEL
+        self.voice_commands = False   # opt-in: changes transcript output
         self._load()
 
     def _load(self) -> None:
@@ -587,6 +778,7 @@ class Settings(QObject):
                 if isinstance(data, dict):
                     self.auto_paste = bool(data.get("auto_paste", self.auto_paste))
                     self.sensitivity = float(data.get("sensitivity", self.sensitivity))
+                    self.voice_commands = bool(data.get("voice_commands", self.voice_commands))
                     requested = str(data.get("model_name", self.model_name))
                     valid_names = {m["name"] for m in KNOWN_MODELS}
                     if requested not in valid_names:
@@ -598,8 +790,10 @@ class Settings(QObject):
                         requested = DEFAULT_MODEL
                     self.model_name = requested
                     log_app.info(
-                        "loaded settings: auto_paste=%s sensitivity=%.1f model=%s",
+                        "loaded settings: auto_paste=%s sensitivity=%.1f "
+                        "model=%s voice_commands=%s",
                         self.auto_paste, self.sensitivity, self.model_name,
+                        self.voice_commands,
                     )
         except Exception:
             log_app.exception("failed to load settings")
@@ -609,6 +803,7 @@ class Settings(QObject):
             "auto_paste": self.auto_paste,
             "sensitivity": self.sensitivity,
             "model_name": self.model_name,
+            "voice_commands": self.voice_commands,
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -2322,6 +2517,23 @@ class MainPanel(QWidget):
         self._auto_paste_cb.toggled.connect(self._on_auto_paste_toggled)
         layout.addWidget(self._auto_paste_cb)
 
+        # Voice commands & smart formatting (the v1.4 feature, single toggle)
+        vc_box = QVBoxLayout()
+        vc_box.setSpacing(2)
+        self._voice_commands_cb = QCheckBox("Voice commands & punctuation dictation")
+        self._voice_commands_cb.setChecked(self._settings.voice_commands)
+        self._voice_commands_cb.toggled.connect(self._on_voice_commands_toggled)
+        vc_box.addWidget(self._voice_commands_cb)
+        vc_hint = QLabel(
+            "When on, dictated words like \"comma\", \"period\", \"new line\", \"open quote\", "
+            "\"close quote\" become actual punctuation. \"Scratch that\" / \"delete that\" "
+            "drops the previous sentence. First letter of each sentence is auto-capitalized."
+        )
+        vc_hint.setWordWrap(True)
+        vc_hint.setStyleSheet("color: #6a6e78; font-size: 9pt;")
+        vc_box.addWidget(vc_hint)
+        layout.addLayout(vc_box)
+
         # sensitivity
         sens_box = QVBoxLayout()
         sens_box.setSpacing(6)
@@ -2411,6 +2623,11 @@ class MainPanel(QWidget):
     def _on_auto_paste_toggled(self, checked: bool) -> None:
         self._settings.auto_paste = bool(checked)
         self._settings.save()
+
+    def _on_voice_commands_toggled(self, checked: bool) -> None:
+        self._settings.voice_commands = bool(checked)
+        self._settings.save()
+        log_app.info("voice commands %s", "enabled" if checked else "disabled")
 
     def _on_sens_changed(self, value: int) -> None:
         self._settings.sensitivity = float(value)
@@ -2575,6 +2792,7 @@ class App(QObject):
         self.settings = Settings(SETTINGS_FILE)
         self.log = TranscriptLog(HISTORY_FILE)
         self.replacements = Replacements(here / REPLACEMENTS_FILE)
+        self.voice_commands = VoiceCommandProcessor()
         self.updater = Updater(self.install_dir)
 
         self.recorder = AudioRecorder()
@@ -2890,6 +3108,16 @@ class App(QObject):
             return
 
         text = self.replacements.apply(raw)
+        if self.settings.voice_commands:
+            before_vc = text
+            text = self.voice_commands.process(text)
+            if text != before_vc:
+                log_app.info("voice commands: %r -> %r", before_vc, text)
+        # Always-on smart polish: capitalize first letter, ensure terminal
+        # punctuation, strip orphan trailing commas. Whisper handles tonality
+        # and pause-based punctuation in the base transcription; this is just
+        # the cleanup layer.
+        text = apply_smart_defaults(text)
         if text != raw:
             log_app.info("rewrite %r -> %r", raw, text)
         if self.settings.auto_paste:
