@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 APP_NAME = "Tellur"
 
 
@@ -446,20 +446,20 @@ class Settings(QObject):
         self.changed.emit()
 
 
-def build_initial_prompt(log: TranscriptLog, repls: Replacements) -> str | None:
+def build_initial_prompt(log: TranscriptLog) -> str | None:
+    """Construct Whisper's initial_prompt from recent transcript context only.
+
+    Dictionary vocabulary is NOT injected here — that's what `hotwords` is for.
+    Stuffing a comma-separated vocab list into initial_prompt makes Whisper
+    hallucinate from those tokens (e.g. "HTML1, HTML2, HTML3...") or return
+    empty results on real audio.
+    """
     ctx = log.context_for_prompt().strip()
-    vocab = repls.vocab
-    parts: list[str] = []
-    if ctx:
-        parts.append(ctx)
-    if vocab:
-        parts.append("Vocabulary: " + ", ".join(vocab) + ".")
-    if not parts:
+    if not ctx:
         return None
-    prompt = " ".join(parts)
-    if len(prompt) > PROMPT_MAX_CHARS:
-        prompt = prompt[-PROMPT_MAX_CHARS:]
-    return prompt
+    if len(ctx) > PROMPT_MAX_CHARS:
+        ctx = ctx[-PROMPT_MAX_CHARS:]
+    return ctx
 
 
 def humanize_time(ts: float) -> str:
@@ -1263,7 +1263,7 @@ class App(QObject):
         self.ui_level.emit(self.recorder.level)
 
     def _process_audio(self, audio: np.ndarray, gen: int) -> None:
-        prompt = build_initial_prompt(self.log, self.replacements)
+        prompt = build_initial_prompt(self.log)
         hotwords = ", ".join(self.replacements.vocab) or None
         with self._engine_lock:
             try:
