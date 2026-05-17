@@ -2,6 +2,33 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] — 2026-05-17
+
+UI overhaul for the v1.3 history panel — both visual fixes and a simplification of the per-row actions.
+
+### Changed
+
+- **Per-row actions: just a copy button now.** The pin and delete icons are gone. Pinning added clutter for marginal value, and per-row delete is a misclick hazard.
+- **"Delete selected" moved to the top-left toolbar**, next to the search box. Only enabled when a row is selected. Always confirms with a Yes/No dialog before deleting — same path used by the Delete key and the right-click → Delete… menu entry. The Yes/No dialog includes a preview of the transcript so you know what you're about to lose.
+- **History sort is just newest-first now.** Pinning machinery removed (the `pinned` field is silently ignored on load, so v1.3.0 history files keep working).
+- **The copy button is inset 14 px from the right edge**, not flush against it.
+
+### Fixed
+
+- **Long transcript text no longer hard-clips** under the meta column. Added an `ElidedLabel` (QLabel subclass) that re-ellipsizes via `QFontMetrics.elidedText()` on every resize.
+- **The copy icon now renders reliably.** The previous emoji-based icon (📋) depended on the system emoji font and was effectively invisible on Windows's default text font. Replaced with a custom `IconButton` (`QToolButton` + `autoRaise=True`) that paints its own clipboard glyph via `QPainter`.
+- **Row widgets now fit the QListWidget viewport.** Added a `HistoryList` subclass that re-fits every row to viewport width on `resizeEvent` and `refit_rows()` after every refresh. Without this, custom row widgets rendered at their natural sizeHint (huge for long transcripts), pushing the meta column and buttons past the right edge — invisible behind a horizontal scrollbar.
+- **Single row separator** between transcripts. The previous double-line was a leftover item-level border plus a new row-level border; cleaned up to one row-level border-bottom rendered through `WA_StyledBackground`.
+- **Selection highlight fills the row.** The leftover item-level padding from v1.3.0 was creating dead space above and below the highlight; removed.
+- **Vertical centering** — explicit `AlignVCenter` on text + meta labels so they line up with the fixed-size copy button.
+
+### Removed
+
+- `TranscriptLog.toggle_pin` and the `pin_toggled` signal on `HistoryRow` — no consumers after the UI simplification.
+- `Ctrl+P` keyboard shortcut for pin (since pinning is gone).
+
+---
+
 ## [1.3.0] — 2026-05-17
 
 History panel overhaul. Every row now has inline actions; the "select then click the bottom button" friction is gone.

@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 APP_NAME = "Tellur"
 
 
@@ -92,13 +92,15 @@ import pyperclip
 import keyboard
 from faster_whisper import WhisperModel
 
-from PyQt6.QtCore import Qt, QTimer, QObject, QRectF, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QGuiApplication, QIcon, QPainter, QPixmap
+from PyQt6.QtCore import Qt, QSize, QTimer, QObject, QRectF, pyqtSignal
+from PyQt6.QtGui import (
+    QAction, QColor, QGuiApplication, QIcon, QPainter, QPainterPath, QPixmap,
+)
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
     QProgressBar, QPushButton, QSlider, QSystemTrayIcon, QTabWidget,
-    QTextEdit, QVBoxLayout, QWidget,
+    QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
 
@@ -507,32 +509,33 @@ class TranscriptLog(QObject):
         self.cleared.emit()
         log_app.info("history cleared")
 
-    def toggle_pin(self, entry: dict) -> bool:
-        """Flip pinned state of a specific entry (matched by reference).
-        Returns the new pinned state, or False if entry isn't found."""
-        new_state = False
-        found = False
-        with self._lock:
-            for e in self._entries:
-                if e is entry:
-                    e["pinned"] = not bool(e.get("pinned"))
-                    new_state = e["pinned"]
-                    found = True
-                    break
-        if found:
-            self._save_async()
-            self.entry_changed.emit(entry)
-        return new_state
-
     def delete_entry(self, entry: dict) -> bool:
-        """Remove a specific entry by reference. Returns True on success."""
+        """Remove a specific entry. First tries identity match (fast, exact);
+        falls back to matching on (ts, text) if identity fails for any reason
+        (defensive — shouldn't happen, but keeps the user's click from
+        silently doing nothing). Returns True on success."""
         removed = False
+        matched_by = None
         with self._lock:
             for i, e in enumerate(self._entries):
                 if e is entry:
                     self._entries.pop(i)
                     removed = True
+                    matched_by = "is"
                     break
+            if not removed:
+                target_ts = entry.get("ts")
+                target_text = entry.get("text")
+                for i, e in enumerate(self._entries):
+                    if e.get("ts") == target_ts and e.get("text") == target_text:
+                        self._entries.pop(i)
+                        removed = True
+                        matched_by = "ts+text"
+                        break
+        log_app.info(
+            "delete_entry: removed=%s matched_by=%s text=%r",
+            removed, matched_by, (entry.get("text") or "")[:40],
+        )
         if removed:
             self._save_async()
             self.entry_removed.emit(entry)
@@ -1616,8 +1619,11 @@ QWidget#mainPanel QListWidget {
     outline: 0;
 }
 QWidget#mainPanel QListWidget::item {
-    padding: 8px 10px;
-    border-bottom: 1px solid #22232a;
+    /* No padding or border at the item level — HistoryRow widget owns the
+       row's visuals. The item only contributes hover and selection
+       backgrounds, which paint through the transparent row. */
+    padding: 0;
+    border: none;
 }
 QWidget#mainPanel QListWidget::item:hover { background-color: #20212a; }
 QWidget#mainPanel QListWidget::item:selected {
@@ -1704,94 +1710,225 @@ QWidget#mainPanel QLineEdit {
     selection-background-color: #2c3a55;
 }
 QWidget#mainPanel QLineEdit:focus { border: 1px solid #6080ff; }
+QWidget#historyRow {
+    background-color: transparent;
+    border-bottom: 1px solid #22232a;
+}
 QWidget#historyRow QLabel#historyRowText {
     color: #e6e8ee;
     font-size: 10pt;
+    background: transparent;
 }
 QWidget#historyRow QLabel#historyRowMeta {
     color: #6a6e78;
     font-size: 9pt;
-}
-QWidget#historyRow QPushButton#historyRowAction {
     background: transparent;
-    color: #9a9da6;
+}
+QPushButton#iconButton {
+    background: transparent;
     border: none;
     border-radius: 4px;
     padding: 0;
     margin: 0;
-    font-size: 12pt;
 }
-QWidget#historyRow QPushButton#historyRowAction:hover {
+QPushButton#iconButton:hover {
     background-color: #2c2d34;
-    color: #e6e8ee;
 }
 """
 
 
+class ElidedLabel(QLabel):
+    """QLabel that ellipsizes on the right when its rendered width is less
+    than the full text's width. Qt's default QLabel hard-clips with no
+    indicator, which made the history rows ugly under tight space."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self._full_text = text
+        self.setWordWrap(False)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.setMinimumWidth(40)
+        self._render()
+
+    def setText(self, text: str) -> None:
+        self._full_text = text
+        self._render()
+
+    def fullText(self) -> str:
+        return self._full_text
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._render()
+
+    def _render(self) -> None:
+        fm = self.fontMetrics()
+        avail = max(self.width() - 4, 0)
+        elided = fm.elidedText(self._full_text, Qt.TextElideMode.ElideRight, avail)
+        super().setText(elided)
+
+
+class IconButton(QToolButton):
+    """Compact flat icon button with a custom-painted glyph. QToolButton +
+    autoRaise gives true zero-chrome rendering until hover, unlike
+    QPushButton.setFlat which still draws a frame on some Windows styles."""
+
+    PIN_OFF = "pin_off"
+    PIN_ON = "pin_on"
+    COPY = "copy"
+    DELETE = "delete"
+
+    SIZE = 22
+
+    def __init__(self, icon_type: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._icon_type = icon_type
+        self.setAutoRaise(True)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setObjectName("iconButton")
+        # Force background transparency regardless of platform style.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setStyleSheet("border: none; background: transparent;")
+
+    def set_icon_type(self, icon_type: str) -> None:
+        self._icon_type = icon_type
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        hovered = self.underMouse()
+        if self._icon_type == IconButton.PIN_ON:
+            base = QColor(244, 197, 66)  # gold for an active pin
+        elif hovered:
+            base = QColor(232, 234, 240)
+        else:
+            base = QColor(150, 155, 165)
+
+        r = self.rect()
+        cx, cy = r.center().x(), r.center().y()
+        if self._icon_type in (IconButton.PIN_OFF, IconButton.PIN_ON):
+            self._paint_star(p, cx, cy, base, filled=(self._icon_type == IconButton.PIN_ON))
+        elif self._icon_type == IconButton.COPY:
+            self._paint_copy(p, cx, cy, base)
+        elif self._icon_type == IconButton.DELETE:
+            self._paint_delete(p, cx, cy, base)
+        p.end()
+
+    @staticmethod
+    def _paint_star(p: QPainter, cx: int, cy: int, color: QColor, filled: bool) -> None:
+        from math import cos, sin, pi
+        from PyQt6.QtGui import QPen
+        outer = 6.0
+        inner = 2.6
+        points = []
+        for i in range(10):
+            angle = -pi / 2 + i * pi / 5
+            r = outer if i % 2 == 0 else inner
+            points.append((cx + r * cos(angle), cy + r * sin(angle)))
+        path = QPainterPath()
+        path.moveTo(*points[0])
+        for x, y in points[1:]:
+            path.lineTo(x, y)
+        path.closeSubpath()
+        if filled:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(color)
+            p.drawPath(path)
+        else:
+            pen = QPen(color, 1.3)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(path)
+
+    @staticmethod
+    def _paint_copy(p: QPainter, cx: int, cy: int, color: QColor) -> None:
+        from PyQt6.QtGui import QPen
+        pen = QPen(color, 1.3)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        # Back doc: up-left
+        p.drawRoundedRect(QRectF(cx - 5, cy - 6, 7, 9), 1.3, 1.3)
+        # Front doc: down-right, painted opaque to hide the overlap.
+        # Use the panel background colour for fill so the back doc's
+        # corner peeks out from behind, giving the "two stacked" feel.
+        p.setBrush(QColor(26, 27, 31))
+        p.drawRoundedRect(QRectF(cx - 2, cy - 3, 7, 9), 1.3, 1.3)
+        # Restroke the front doc outline since the fill overdrew the stroke.
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(cx - 2, cy - 3, 7, 9), 1.3, 1.3)
+
+    @staticmethod
+    def _paint_delete(p: QPainter, cx: int, cy: int, color: QColor) -> None:
+        from PyQt6.QtGui import QPen
+        pen = QPen(color, 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        s = 4.5
+        p.drawLine(int(cx - s), int(cy - s), int(cx + s), int(cy + s))
+        p.drawLine(int(cx + s), int(cy - s), int(cx - s), int(cy + s))
+
+
 class HistoryRow(QWidget):
-    """Custom row widget for the History list. Shows text + time-ago + word
-    count, with always-visible Pin / Copy / Delete buttons at the right edge.
-    Emits signals on action; supports double-click-to-edit on the text label."""
+    """Custom row widget for the History list. Shows ellipsized text +
+    meta line + a single Copy icon button on the right.
+
+    Pinning and per-row delete were intentionally removed: pinning added
+    visual clutter for marginal value, and per-row delete buttons are
+    a misclick hazard. Delete now lives in the History tab's top toolbar
+    and confirms before destroying anything.
+
+    Double-click on the text starts inline edit.
+    """
 
     copy_requested = pyqtSignal(dict)
-    pin_toggled = pyqtSignal(dict)
-    delete_requested = pyqtSignal(dict)
     edit_started = pyqtSignal(dict)
 
     def __init__(self, entry: dict):
         super().__init__()
         self.entry = entry
         self.setObjectName("historyRow")
+        # Plain QWidget ignores QSS background/border by default; enable so
+        # the row separator and any future row-level styling actually paint.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # Fix row height so text + meta + button share the same vertical
+        # center.
+        self.setFixedHeight(34)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 6, 4, 6)
-        layout.setSpacing(8)
+        layout.setContentsMargins(12, 0, 14, 0)   # 14px right inset, not at the edge
+        layout.setSpacing(10)
 
-        # Left: text preview (single line, ellipsized via Qt's wordwrap=False)
-        self.text_label = QLabel(self._preview_text())
+        # Left: ellipsized text preview, vertically centered.
+        self.text_label = ElidedLabel(self._full_text())
         self.text_label.setObjectName("historyRowText")
-        self.text_label.setWordWrap(False)
-        self.text_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.text_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+        )
         layout.addWidget(self.text_label, stretch=1)
 
-        # Middle: word count + time
-        meta = QLabel(self._meta_text())
-        meta.setObjectName("historyRowMeta")
-        meta.setStyleSheet("color: #6a6e78; font-size: 9pt;")
-        layout.addWidget(meta)
-        self._meta_label = meta
+        # Meta column: fixed minimum width, right-aligned + vertically
+        # centered, so the copy button lines up across rows regardless of
+        # meta text length.
+        self._meta_label = QLabel(self._meta_text())
+        self._meta_label.setObjectName("historyRowMeta")
+        self._meta_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        self._meta_label.setMinimumWidth(110)
+        layout.addWidget(self._meta_label)
 
-        # Right: action buttons (pin / copy / delete)
-        self._pin_btn = QPushButton(self._pin_glyph())
-        self._pin_btn.setObjectName("historyRowAction")
-        self._pin_btn.setToolTip("Pin / unpin")
-        self._pin_btn.setFlat(True)
-        self._pin_btn.setFixedSize(24, 24)
-        self._pin_btn.clicked.connect(lambda: self.pin_toggled.emit(self.entry))
-        layout.addWidget(self._pin_btn)
-
-        copy_btn = QPushButton("📋")
-        copy_btn.setObjectName("historyRowAction")
+        # Single copy button on the right.
+        copy_btn = IconButton(IconButton.COPY)
         copy_btn.setToolTip("Copy this transcription")
-        copy_btn.setFlat(True)
-        copy_btn.setFixedSize(24, 24)
         copy_btn.clicked.connect(lambda: self.copy_requested.emit(self.entry))
         layout.addWidget(copy_btn)
 
-        delete_btn = QPushButton("✕")
-        delete_btn.setObjectName("historyRowAction")
-        delete_btn.setToolTip("Delete this transcription")
-        delete_btn.setFlat(True)
-        delete_btn.setFixedSize(24, 24)
-        delete_btn.clicked.connect(lambda: self.delete_requested.emit(self.entry))
-        layout.addWidget(delete_btn)
-
-    def _preview_text(self) -> str:
-        text = (self.entry.get("text") or "").replace("\n", " ")
-        # Truncate visually; Qt ellipsization on QLabel with fixed-width parent
-        # is finicky, so we just hard-truncate for predictability.
-        if len(text) > 80:
-            text = text[:80] + "…"
-        return text
+    def _full_text(self) -> str:
+        # Newlines flattened to spaces; ElidedLabel handles truncation.
+        return (self.entry.get("text") or "").replace("\n", " ")
 
     def _meta_text(self) -> str:
         text = self.entry.get("text") or ""
@@ -1800,14 +1937,10 @@ class HistoryRow(QWidget):
         edited = "  ·  edited" if self.entry.get("edited") else ""
         return f"{word_count} word{'' if word_count == 1 else 's'}  ·  {when}{edited}"
 
-    def _pin_glyph(self) -> str:
-        return "★" if self.entry.get("pinned") else "☆"
-
     def refresh(self) -> None:
-        """Re-render based on possibly-mutated entry dict."""
-        self.text_label.setText(self._preview_text())
+        """Re-render based on possibly-mutated entry dict (e.g. after inline edit)."""
+        self.text_label.setText(self._full_text())
         self._meta_label.setText(self._meta_text())
-        self._pin_btn.setText(self._pin_glyph())
 
     def mouseDoubleClickEvent(self, event) -> None:
         # Forward to text-label area only: double-click on body starts edit.
@@ -1815,6 +1948,36 @@ class HistoryRow(QWidget):
             self.edit_started.emit(self.entry)
             return
         super().mouseDoubleClickEvent(event)
+
+
+class HistoryList(QListWidget):
+    """QListWidget subclass that constrains every row widget to the
+    viewport's width.
+
+    Without this, items installed via `setItemWidget` render at their
+    `sizeHint().width()`, which for a long-text row is much larger than
+    the panel. Result: the meta column and action buttons get pushed
+    past the right edge and become invisible (you'd see a horizontal
+    scrollbar). Re-fitting on every resize keeps everything visible and
+    forces the text label to ellipsize correctly.
+    """
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.refit_rows()
+
+    def refit_rows(self) -> None:
+        w = self.viewport().width()
+        if w <= 0:
+            return
+        for i in range(self.count()):
+            item = self.item(i)
+            widget = self.itemWidget(item)
+            if widget is None:
+                continue
+            h = widget.height() if widget.height() > 0 else 34
+            item.setSizeHint(QSize(w, h))
+            widget.setFixedWidth(w)
 
 
 class MainPanel(QWidget):
@@ -1871,20 +2034,31 @@ class MainPanel(QWidget):
         layout.setContentsMargins(0, 14, 0, 0)
         layout.setSpacing(8)
 
-        # Search bar — instant filter as user types
+        # Top toolbar: [ Delete selected ]  [ Search ............... ]
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(8)
+        self._delete_selected_btn = QPushButton("Delete selected")
+        self._delete_selected_btn.setToolTip("Delete the currently selected transcription (confirms first)")
+        self._delete_selected_btn.setEnabled(False)
+        self._delete_selected_btn.clicked.connect(self._delete_selected_confirm)
+        top_bar.addWidget(self._delete_selected_btn)
+
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search transcripts…  (Ctrl+F)")
         self._search.textChanged.connect(lambda _s: self._refresh_list())
         self._search.setClearButtonEnabled(True)
-        layout.addWidget(self._search)
+        top_bar.addWidget(self._search, stretch=1)
+        layout.addLayout(top_bar)
 
         # The list itself. Items each get a HistoryRow widget installed via
-        # setItemWidget. Selection still works on the underlying QListWidgetItem.
-        self._list = QListWidget()
+        # setItemWidget. Custom HistoryList resizes row widgets to viewport.
+        self._list = HistoryList()
         self._list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._on_context_menu)
         self._list.itemSelectionChanged.connect(self._on_selection)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list.setUniformItemSizes(True)
         self._list.installEventFilter(self)
         layout.addWidget(self._list, stretch=2)
 
@@ -1913,28 +2087,27 @@ class MainPanel(QWidget):
     # --- list construction & refresh -----------------------------------
 
     def _sorted_filtered_entries(self) -> list[dict]:
-        """Apply search filter and pinned-first sort. Pinned items show at
-        the top in newest-first order; unpinned follow, also newest-first."""
+        """Apply search filter and sort newest-first."""
         query = self._search.text().strip().lower() if hasattr(self, "_search") else ""
         all_entries = self._log.entries()
         if query:
             all_entries = [e for e in all_entries if query in (e.get("text") or "").lower()]
-        # Each list is already in append order (oldest → newest). Reverse to
-        # show newest at top, then split into pinned and unpinned.
-        all_entries = list(reversed(all_entries))
-        pinned = [e for e in all_entries if e.get("pinned")]
-        unpinned = [e for e in all_entries if not e.get("pinned")]
-        return pinned + unpinned
+        # _entries is in append order (oldest → newest); reverse for display.
+        return list(reversed(all_entries))
 
     def _install_row(self, item: "QListWidgetItem", entry: dict) -> None:
-        """Build a HistoryRow widget for an entry and install it on the list item."""
+        """Build a HistoryRow widget for an entry and install it on the list item.
+        Row width is set to viewport width here AND on every list resize so the
+        meta column and action button stay visible at the right edge."""
         row = HistoryRow(entry)
         row.copy_requested.connect(self._on_row_copy)
-        row.pin_toggled.connect(self._on_row_pin)
-        row.delete_requested.connect(self._on_row_delete)
         row.edit_started.connect(self._on_row_edit_start)
-        item.setSizeHint(row.sizeHint())
         item.setData(Qt.ItemDataRole.UserRole, entry)
+        # Use the current viewport width if known; HistoryList.resizeEvent
+        # will re-fit on every resize anyway.
+        w = self._list.viewport().width() if self._list.viewport().width() > 0 else 580
+        item.setSizeHint(QSize(w, 34))
+        row.setFixedWidth(w)
         self._list.setItemWidget(item, row)
 
     def _refresh_list(self) -> None:
@@ -1943,6 +2116,9 @@ class MainPanel(QWidget):
             item = QListWidgetItem()
             self._list.addItem(item)
             self._install_row(item, entry)
+        # Refit immediately after population so initial render uses the
+        # actual viewport width (which may be larger than our 580 default).
+        self._list.refit_rows()
         if self._list.count():
             self._list.setCurrentRow(0)
         else:
@@ -1976,20 +2152,25 @@ class MainPanel(QWidget):
             self._list.setCurrentItem(item)
 
     def _on_entry_removed(self, entry: dict) -> None:
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) is entry:
-                self._list.takeItem(i)
-                break
+        # Full refresh — same pattern as add/changed handlers. The previous
+        # surgical takeItem path was unreliable when combined with
+        # setItemWidget (the item's data identity check could mismatch on
+        # rebuilt rows). Rebuild is fast enough for our 500-entry cap.
+        log_app.debug("on_entry_removed: rebuilding list")
+        self._refresh_list()
 
     def _on_selection(self) -> None:
         items = self._list.selectedItems()
         if not items:
             self._detail.setPlainText("")
+            if hasattr(self, "_delete_selected_btn"):
+                self._delete_selected_btn.setEnabled(False)
             return
         entry = items[0].data(Qt.ItemDataRole.UserRole)
         if isinstance(entry, dict):
             self._detail.setPlainText(entry.get("text", ""))
+            if hasattr(self, "_delete_selected_btn"):
+                self._delete_selected_btn.setEnabled(True)
 
     def _copy_selected(self) -> None:
         items = self._list.selectedItems()
@@ -2029,12 +2210,28 @@ class MainPanel(QWidget):
     def _on_row_copy(self, entry: dict) -> None:
         self._copy_to_clipboard(entry.get("text", ""), source="row-copy")
 
-    def _on_row_pin(self, entry: dict) -> None:
-        new_state = self._log.toggle_pin(entry)
-        log_app.info("pin %s for %r", "set" if new_state else "cleared", entry.get("text", "")[:40])
+    def _delete_with_confirm(self, entry: dict) -> None:
+        """Confirm with a Yes/No dialog, then delete. Used by the top-bar
+        button, the Delete key, and the right-click menu — every delete path
+        confirms so misclicks can't destroy data."""
+        text = entry.get("text", "")
+        preview = text if len(text) <= 80 else text[:77] + "…"
+        reply = QMessageBox.question(
+            self, "Delete transcription",
+            f"Delete this transcription?\n\n“{preview}”\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._log.delete_entry(entry)
 
-    def _on_row_delete(self, entry: dict) -> None:
-        self._log.delete_entry(entry)
+    def _delete_selected_confirm(self) -> None:
+        items = self._list.selectedItems()
+        if not items:
+            return
+        entry = items[0].data(Qt.ItemDataRole.UserRole)
+        if isinstance(entry, dict):
+            self._delete_with_confirm(entry)
 
     def _on_row_edit_start(self, entry: dict) -> None:
         current = entry.get("text", "")
@@ -2078,26 +2275,21 @@ class MainPanel(QWidget):
 
         menu.addSeparator()
 
-        is_pinned = bool(entry.get("pinned"))
-        pin_act = QAction("Unpin" if is_pinned else "Pin to top", self)
-        pin_act.triggered.connect(lambda: self._log.toggle_pin(entry))
-        menu.addAction(pin_act)
-
         edit_act = QAction("Edit text…", self)
         edit_act.triggered.connect(lambda: self._on_row_edit_start(entry))
         menu.addAction(edit_act)
 
         menu.addSeparator()
 
-        del_act = QAction("Delete", self)
-        del_act.triggered.connect(lambda: self._log.delete_entry(entry))
+        del_act = QAction("Delete…", self)
+        del_act.triggered.connect(lambda: self._delete_with_confirm(entry))
         menu.addAction(del_act)
 
         menu.exec(self._list.mapToGlobal(pos))
 
     def eventFilter(self, obj, event) -> bool:
-        """Handle list-level keyboard shortcuts: Enter=copy, Delete=delete,
-        Ctrl+P=pin, Ctrl+F=focus search."""
+        """List keyboard shortcuts: Enter=copy, Delete=delete-with-confirm,
+        Ctrl+F=focus search."""
         from PyQt6.QtCore import QEvent
         if obj is self._list and event.type() == QEvent.Type.KeyPress:
             key = event.key()
@@ -2109,10 +2301,7 @@ class MainPanel(QWidget):
                     self._copy_to_clipboard(entry.get("text", ""), "key-enter")
                     return True
                 if key == Qt.Key.Key_Delete:
-                    self._log.delete_entry(entry)
-                    return True
-                if key == Qt.Key.Key_P and mods & Qt.KeyboardModifier.ControlModifier:
-                    self._log.toggle_pin(entry)
+                    self._delete_with_confirm(entry)
                     return True
             if key == Qt.Key.Key_F and mods & Qt.KeyboardModifier.ControlModifier:
                 self._search.setFocus()
