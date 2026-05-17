@@ -2,6 +2,38 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] — 2026-05-17
+
+**Phase 6 of the roadmap — integration & automation.** Tellur becomes a hub: every transcript can be persisted to a markdown daybook, POSTed to a webhook, and/or auto-submitted in chat apps. All three are opt-in, all three are best-effort (failures log and move on without disturbing dictation).
+
+### Send & Enter mode
+
+- **Settings → Integration & automation → "Press Enter after paste (chat-app mode)"**. When enabled, Tellur synthesizes an Enter keystroke right after pasting your transcript — perfect for Slack / Discord / Teams / iMessage where messages need a final Enter to actually send.
+- Skip it in code editors and docs where Enter would insert an unwanted newline.
+- Honored by all three paste paths: normal dictation, Ctrl+Win+B re-paste-last, and Ctrl+Win+L AI-apply.
+
+### Daily markdown transcripts
+
+- **Settings → Integration & automation → "Save each transcript to a daily markdown file"**. Each transcript appended to `YYYY-MM-DD.md` under a configurable folder (defaults to `<TELLUR_HOME>\transcripts`). One file per local-time day.
+- Each day's file is created with a `# Tellur transcripts — YYYY-MM-DD` H1; each transcript is recorded as `## HH:MM:SS` followed by the body. Clean enough to read directly, structured enough to grep / parse / sync to Obsidian / Logseq.
+- An **Open** button next to the folder field opens it in Explorer (Windows).
+
+### Webhook target
+
+- **Settings → Integration & automation → "POST every transcript to a webhook URL"**. Tellur POSTs each accepted transcript to your URL using a configurable body template.
+- **Placeholders**: `{text}` (final transcript), `{raw}` (Whisper's raw output), `{ts}` (Unix timestamp). All string placeholders are JSON-escaped before substitution, so quotes/newlines in the transcript don't break a JSON template.
+- **Content-Type auto-detection**: if the rendered body parses as JSON, sent as `application/json`; otherwise as `text/plain`. The default template is JSON.
+- **Best-effort**: failures (network down, 5xx response, etc.) are logged and swallowed. The webhook never blocks dictation, and runs on a worker thread.
+
+### Under the hood
+
+- New `MarkdownDailySink` and `WebhookSink` classes encapsulate the I/O for each destination so each transcript can be fanned out to N sinks without bloating `_process_audio`.
+- New `App._dispatch_integrations()` snapshots the relevant settings up front and runs both sinks on a single worker thread, so a slow webhook doesn't delay the markdown write or hold up the next dictation.
+- `TextInjector.paste()` gained a `press_enter=True` parameter that synthesizes the Enter keystroke after a short delay so single-line chat inputs don't race the paste.
+- Six new settings fields: `send_after_paste`, `markdown_save_enabled`, `markdown_folder`, `webhook_enabled`, `webhook_url`, `webhook_template`.
+
+---
+
 ## [1.7.0] — 2026-05-17
 
 **Phase 5 of the roadmap — AI post-processing.** The headline feature: optionally route your transcripts through a local (or remote) OpenAI-compatible LLM to clean them up, rewrite as bullets/email/Slack, or summarize. Built for local-first stacks (LM Studio, Ollama, llama.cpp server, vLLM) so your audio AND your text both stay on your machine.

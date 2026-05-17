@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 APP_NAME = "Tellur"
 
 
@@ -215,6 +215,7 @@ def _default_data_dir() -> Path:
 DATA_DIR = _default_data_dir()
 HISTORY_FILE = DATA_DIR / "history.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
+DEFAULT_MARKDOWN_DIR = DATA_DIR / "transcripts"   # one .md per day
 MAX_HISTORY_ENTRIES = 500
 
 # logging
@@ -783,6 +784,16 @@ class Settings(QObject):
         self.llm_api_key: str = ""
         self.llm_default_prompt: str = "cleanup"
         self.llm_auto_apply: bool = False  # if True, every transcript runs through the LLM
+        # Integration & automation (v1.8):
+        # - send_after_paste: auto-press Enter after each paste (chat-app mode)
+        # - markdown_save_enabled / markdown_folder: write each transcript to a daily .md file
+        # - webhook_enabled / webhook_url / webhook_template: POST each transcript
+        self.send_after_paste: bool = False
+        self.markdown_save_enabled: bool = False
+        self.markdown_folder: str = ""        # empty → default under DATA_DIR
+        self.webhook_enabled: bool = False
+        self.webhook_url: str = ""
+        self.webhook_template: str = '{"text": "{text}", "raw": "{raw}", "ts": {ts}}'
         self._load()
 
     def _load(self) -> None:
@@ -810,6 +821,12 @@ class Settings(QObject):
                     self.llm_api_key = str(data.get("llm_api_key", self.llm_api_key))
                     self.llm_default_prompt = str(data.get("llm_default_prompt", self.llm_default_prompt))
                     self.llm_auto_apply = bool(data.get("llm_auto_apply", self.llm_auto_apply))
+                    self.send_after_paste = bool(data.get("send_after_paste", self.send_after_paste))
+                    self.markdown_save_enabled = bool(data.get("markdown_save_enabled", self.markdown_save_enabled))
+                    self.markdown_folder = str(data.get("markdown_folder", self.markdown_folder))
+                    self.webhook_enabled = bool(data.get("webhook_enabled", self.webhook_enabled))
+                    self.webhook_url = str(data.get("webhook_url", self.webhook_url))
+                    self.webhook_template = str(data.get("webhook_template", self.webhook_template))
                     requested = str(data.get("model_name", self.model_name))
                     valid_names = {m["name"] for m in KNOWN_MODELS}
                     if requested not in valid_names:
@@ -844,6 +861,12 @@ class Settings(QObject):
             "llm_api_key": self.llm_api_key,
             "llm_default_prompt": self.llm_default_prompt,
             "llm_auto_apply": self.llm_auto_apply,
+            "send_after_paste": self.send_after_paste,
+            "markdown_save_enabled": self.markdown_save_enabled,
+            "markdown_folder": self.markdown_folder,
+            "webhook_enabled": self.webhook_enabled,
+            "webhook_url": self.webhook_url,
+            "webhook_template": self.webhook_template,
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1444,6 +1467,87 @@ class LLMClient:
 
 
 # ===========================================================================
+# integration sinks (v1.8) — write each transcript to durable / external
+# destinations beyond the in-app history & clipboard. Each sink is one-shot
+# and best-effort: a failure here logs and moves on, it never blocks the
+# main transcript pipeline.
+# ===========================================================================
+class MarkdownDailySink:
+    """Appends every accepted transcript to `YYYY-MM-DD.md` under a configured
+    folder. One file per local-time day. Header is created on first write of
+    a day so existing days don't get re-headed."""
+
+    def __init__(self, folder: Path):
+        self.folder = folder
+
+    def write(self, text: str, *, ts: float, raw: str = "") -> None:
+        if not text.strip():
+            return
+        try:
+            self.folder.mkdir(parents=True, exist_ok=True)
+            day = time.strftime("%Y-%m-%d", time.localtime(ts))
+            path = self.folder / f"{day}.md"
+            is_new = not path.exists()
+            stamp = time.strftime("%H:%M:%S", time.localtime(ts))
+            with path.open("a", encoding="utf-8") as f:
+                if is_new:
+                    f.write(f"# Tellur transcripts — {day}\n\n")
+                f.write(f"## {stamp}\n\n{text.strip()}\n\n")
+            log_app.debug("markdown sink wrote %d chars to %s", len(text), path.name)
+        except Exception:
+            log_app.exception("markdown sink failed")
+
+
+class WebhookSink:
+    """POSTs each transcript to a user-configured URL. The template string
+    supports `{text}`, `{raw}`, and `{ts}` placeholders. If the template
+    parses as JSON, Content-Type is set to application/json; otherwise the
+    template is sent as text/plain. Failures are logged and swallowed."""
+
+    def __init__(self, url: str, template: str, timeout: float = 10.0):
+        self.url = url
+        self.template = template
+        self.timeout = timeout
+
+    @staticmethod
+    def _json_escape(s: str) -> str:
+        # json.dumps(s)[1:-1] gives us the body of a JSON string without quotes,
+        # which is the right thing to substitute into a JSON template.
+        return json.dumps(s)[1:-1]
+
+    def post(self, text: str, *, ts: float, raw: str = "") -> None:
+        if not self.url:
+            return
+        body = (
+            self.template
+            .replace("{text}", self._json_escape(text))
+            .replace("{raw}", self._json_escape(raw))
+            .replace("{ts}", str(int(ts)))
+        )
+        # Decide content type based on whether the rendered body parses as JSON.
+        content_type = "text/plain; charset=utf-8"
+        try:
+            json.loads(body)
+            content_type = "application/json"
+        except Exception:
+            pass
+        try:
+            req = urllib.request.Request(
+                self.url,
+                data=body.encode("utf-8"),
+                headers={"Content-Type": content_type, "User-Agent": f"Tellur/{__version__}"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                if not (200 <= resp.status < 300):
+                    log_app.warning("webhook returned %s", resp.status)
+                else:
+                    log_app.debug("webhook POST OK (%d chars body)", len(body))
+        except Exception:
+            log_app.exception("webhook POST failed")
+
+
+# ===========================================================================
 # text injection (clipboard + simulated Ctrl+V, race-safe restore)
 # ===========================================================================
 class TextInjector:
@@ -1457,7 +1561,7 @@ class TextInjector:
         self._saved: str | None = None
         self._gen = 0
 
-    def paste(self, text: str) -> None:
+    def paste(self, text: str, *, press_enter: bool = False) -> None:
         if not text:
             return
         # Track whether THIS call was the one that populated _saved, so that if
@@ -1495,6 +1599,17 @@ class TextInjector:
             _abort_clear()
             return
         log_paste.debug("pasted %d chars", len(text))
+
+        # Optional "send & enter" mode (v1.8): some chat apps want a press of
+        # Enter to submit the freshly-pasted message. We add a tiny gap so the
+        # paste finishes before the Enter so single-line apps don't race.
+        if press_enter:
+            try:
+                time.sleep(PASTE_KEYSTROKE_DELAY_SEC)
+                keyboard.send("enter")
+                log_paste.debug("send-and-enter: pressed Enter")
+            except Exception:
+                log_paste.exception("send-and-enter keystroke failed")
 
         def _restore():
             time.sleep(CLIPBOARD_RESTORE_DELAY_SEC)
@@ -3209,6 +3324,72 @@ class MainPanel(QWidget):
 
         layout.addLayout(llm_box)
 
+        # --- integration & automation section (v1.8) ---
+        intg_box = QVBoxLayout()
+        intg_box.setSpacing(10)
+        intg_box.addWidget(self._section_header("Integration & automation"))
+
+        self._send_enter_cb = QCheckBox("Press Enter after paste (chat-app mode)")
+        self._send_enter_cb.setToolTip(
+            "Useful for Slack/Discord/Teams where messages need an Enter to send. "
+            "Skip for code editors and docs where Enter would insert a newline you don't want."
+        )
+        self._send_enter_cb.setChecked(self._settings.send_after_paste)
+        self._send_enter_cb.toggled.connect(self._on_send_enter_toggled)
+        intg_box.addWidget(self._send_enter_cb)
+
+        # Markdown daily save.
+        self._md_enabled_cb = QCheckBox("Save each transcript to a daily markdown file")
+        self._md_enabled_cb.setChecked(self._settings.markdown_save_enabled)
+        self._md_enabled_cb.toggled.connect(self._on_md_enabled_toggled)
+        intg_box.addWidget(self._md_enabled_cb)
+
+        md_row = QHBoxLayout()
+        md_row.setSpacing(8)
+        self._md_folder_edit = QLineEdit(self._settings.markdown_folder)
+        self._md_folder_edit.setPlaceholderText(str(DEFAULT_MARKDOWN_DIR))
+        self._md_folder_edit.editingFinished.connect(self._on_md_folder_changed)
+        md_row.addWidget(self._md_folder_edit, stretch=1)
+        md_open_btn = QPushButton("Open")
+        md_open_btn.setToolTip("Open the markdown folder in Explorer")
+        md_open_btn.clicked.connect(self._on_md_open_clicked)
+        md_row.addWidget(md_open_btn)
+        md_row_widget = QWidget()
+        md_row_widget.setLayout(md_row)
+        intg_box.addLayout(self._form_row("Folder", md_row_widget))
+        intg_box.addWidget(self._section_hint(
+            "Leave folder blank to use the default under your Tellur data directory. "
+            "One <code>YYYY-MM-DD.md</code> file per local-time day; each transcript gets "
+            "a <code>##</code> heading with its timestamp.",
+            rich=True,
+        ))
+
+        # Webhook.
+        self._wh_enabled_cb = QCheckBox("POST every transcript to a webhook URL")
+        self._wh_enabled_cb.setChecked(self._settings.webhook_enabled)
+        self._wh_enabled_cb.toggled.connect(self._on_wh_enabled_toggled)
+        intg_box.addWidget(self._wh_enabled_cb)
+
+        self._wh_url_edit = QLineEdit(self._settings.webhook_url)
+        self._wh_url_edit.setPlaceholderText("https://example.com/hook")
+        self._wh_url_edit.editingFinished.connect(self._on_wh_url_changed)
+        intg_box.addLayout(self._form_row("URL", self._wh_url_edit))
+
+        self._wh_tpl_edit = QLineEdit(self._settings.webhook_template)
+        self._wh_tpl_edit.setPlaceholderText('{"text": "{text}", "raw": "{raw}", "ts": {ts}}')
+        self._wh_tpl_edit.editingFinished.connect(self._on_wh_template_changed)
+        intg_box.addLayout(self._form_row("Body template", self._wh_tpl_edit))
+
+        intg_box.addWidget(self._section_hint(
+            "Placeholders: <b>{text}</b> = final transcript, <b>{raw}</b> = Whisper's raw output, "
+            "<b>{ts}</b> = Unix timestamp. If the rendered body parses as JSON it's sent as "
+            "<code>application/json</code>; otherwise as <code>text/plain</code>. "
+            "Failures are logged and swallowed — the webhook never blocks dictation.",
+            rich=True,
+        ))
+
+        layout.addLayout(intg_box)
+
         # --- software updates section ---
         if self._updater is not None:
             update_box = QVBoxLayout()
@@ -3351,6 +3532,52 @@ class MainPanel(QWidget):
             self._llm_test_status.setStyleSheet("color: #6bd47b;")
         else:
             self._llm_test_status.setStyleSheet("color: #e07c7c;")
+
+    # --- integration & automation handlers -----------------------------
+
+    def _on_send_enter_toggled(self, checked: bool) -> None:
+        self._settings.send_after_paste = bool(checked)
+        self._settings.save()
+        log_app.info("send-after-paste %s", "on" if checked else "off")
+
+    def _on_md_enabled_toggled(self, checked: bool) -> None:
+        self._settings.markdown_save_enabled = bool(checked)
+        self._settings.save()
+        log_app.info("markdown daily save %s", "on" if checked else "off")
+
+    def _on_md_folder_changed(self) -> None:
+        new_folder = self._md_folder_edit.text().strip()
+        if new_folder == self._settings.markdown_folder:
+            return
+        self._settings.markdown_folder = new_folder
+        self._settings.save()
+
+    def _on_md_open_clicked(self) -> None:
+        folder = self._settings.markdown_folder.strip() or str(DEFAULT_MARKDOWN_DIR)
+        try:
+            Path(folder).mkdir(parents=True, exist_ok=True)
+            os.startfile(folder)  # noqa: SLF001 — Windows-only API, by design
+        except Exception:
+            log_app.exception("failed to open markdown folder")
+
+    def _on_wh_enabled_toggled(self, checked: bool) -> None:
+        self._settings.webhook_enabled = bool(checked)
+        self._settings.save()
+        log_app.info("webhook %s", "on" if checked else "off")
+
+    def _on_wh_url_changed(self) -> None:
+        new_url = self._wh_url_edit.text().strip()
+        if new_url == self._settings.webhook_url:
+            return
+        self._settings.webhook_url = new_url
+        self._settings.save()
+
+    def _on_wh_template_changed(self) -> None:
+        new_tpl = self._wh_tpl_edit.text()
+        if new_tpl == self._settings.webhook_template:
+            return
+        self._settings.webhook_template = new_tpl
+        self._settings.save()
 
     # --- audio input handlers ------------------------------------------
 
@@ -3963,7 +4190,7 @@ class App(QObject):
         if not text:
             return
         log_app.info("repaste-last (%d chars)", len(text))
-        self.injector.paste(text)
+        self.injector.paste(text, press_enter=self.settings.send_after_paste)
 
     def on_llm_apply_last(self) -> None:
         """Ctrl+Win+L: run the configured default LLM prompt on the most
@@ -4017,14 +4244,47 @@ class App(QObject):
         log_app.info("LLM apply: %d -> %d chars (prompt=%s)",
                      len(text), len(result), prompt["id"])
         if paste:
-            self.injector.paste(result)
+            self.injector.paste(result, press_enter=self.settings.send_after_paste)
         # Append as a new history entry tagged with the source prompt so the
         # user can see what was done and retrieve the LLM-cleaned version
         # later from the History tab.
         self.log.add(result, raw=text)
+        self._dispatch_integrations(result, raw=text)
         if self._is_latest(gen):
             self.ui_state.emit("done")
             self._schedule_reset(gen)
+
+    def _dispatch_integrations(self, text: str, *, raw: str = "") -> None:
+        """Best-effort fan-out to the v1.8 sinks (markdown daily file, webhook).
+        Sinks run on a worker thread so a slow webhook never blocks the
+        transcript pipeline; markdown writes are fast enough to inline but
+        we batch them in the same thread for consistency."""
+        if not text.strip():
+            return
+        if not (self.settings.markdown_save_enabled or self.settings.webhook_enabled):
+            return
+        ts = time.time()
+        # Snapshot settings up-front so a concurrent save() doesn't cause
+        # the worker to see a partial update.
+        md_on = self.settings.markdown_save_enabled
+        md_folder = self.settings.markdown_folder or str(DEFAULT_MARKDOWN_DIR)
+        wh_on = self.settings.webhook_enabled
+        wh_url = self.settings.webhook_url
+        wh_template = self.settings.webhook_template
+
+        def worker():
+            if md_on:
+                try:
+                    MarkdownDailySink(Path(md_folder)).write(text, ts=ts, raw=raw)
+                except Exception:
+                    log_app.exception("markdown sink dispatch failed")
+            if wh_on and wh_url:
+                try:
+                    WebhookSink(wh_url, wh_template).post(text, ts=ts, raw=raw)
+                except Exception:
+                    log_app.exception("webhook sink dispatch failed")
+
+        threading.Thread(target=worker, daemon=True, name="integrations").start()
 
     def _tick_level(self) -> None:
         self.ui_level.emit(self.recorder.level)
@@ -4088,8 +4348,9 @@ class App(QObject):
                 log_app.exception("auto-LLM failed — falling back to raw transcript")
 
         if self.settings.auto_paste:
-            self.injector.paste(text)
+            self.injector.paste(text, press_enter=self.settings.send_after_paste)
         self.log.add(text, raw=raw)
+        self._dispatch_integrations(text, raw=raw)
 
         if self._is_latest(gen):
             self.ui_state.emit("done")
