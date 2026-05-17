@@ -2,6 +2,32 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-05-17
+
+### Added
+
+- **Model picker.** Settings → Transcription model now has a dropdown with five Whisper variants covering the full speed/accuracy/size range:
+  - **Tiny** (75 MB) — fastest, low accuracy. For old or slow PCs.
+  - **Small** (466 MB) — balanced for modest hardware.
+  - **Distil-Large v3** (1.5 GB) — fast, English only.
+  - **Large v3 turbo** (1.6 GB) — default. Recommended for most users.
+  - **Large v3** (3.0 GB) — highest accuracy, slower on weaker GPUs.
+
+  Selecting a model that isn't on disk yet triggers a background download (via faster-whisper / HuggingFace Hub). Your choice persists across restarts.
+
+- **Cache-aware switching.** Tellur checks whether a model is already on disk before claiming to "download" it. Cached models switch instantly with a "Switching to X…" message; only first-time switches show the download status.
+
+- **Live, byte-accurate download progress** with three distinct phases so there's never a silent stretch:
+  1. *Connecting…* — animated indeterminate bar during HF Hub's API + ETag + connection setup.
+  2. *Downloading X… 42 / 75 MB* — determinate bar that updates as bytes arrive (hooks directly into HuggingFace Hub's per-chunk progress; no dir-polling).
+  3. *Loading X into memory…* — animated indeterminate bar during the final VRAM-load step.
+
+  After success the bar hides and the status reads `Active: X`.
+
+- **Dropdown markers.** Each entry in the model dropdown is annotated with `✓ downloaded` if the model is already cached locally, so you can tell at a glance which selections won't require a download.
+
+---
+
 ## [1.1.0] — 2026-05-17
 
 ### Added

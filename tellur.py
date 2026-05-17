@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 APP_NAME = "Tellur"
 
 
@@ -79,9 +79,9 @@ from faster_whisper import WhisperModel
 from PyQt6.QtCore import Qt, QTimer, QObject, QRectF, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QGuiApplication, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMenu, QMessageBox, QPushButton, QSlider, QSystemTrayIcon,
-    QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QListWidget,
+    QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton, QSlider,
+    QSystemTrayIcon, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 
@@ -89,11 +89,26 @@ from PyQt6.QtWidgets import (
 # configuration
 # ===========================================================================
 # whisper
-MODEL_NAME = "large-v3-turbo"
+DEFAULT_MODEL = "large-v3-turbo"
 PREFERRED_DEVICE = "cuda"
 CUDA_COMPUTE_TYPE = "float16"
 CPU_COMPUTE_TYPE = "int8"
 LANGUAGE = "en"
+
+# User-selectable Whisper models, shown in Settings. Models are downloaded on
+# first switch (via faster-whisper / HuggingFace Hub) into the hf-cache dir.
+KNOWN_MODELS: list[dict] = [
+    {"name": "tiny",             "label": "Tiny",            "size_mb": 75,
+     "summary": "fastest, low accuracy — for old/slow PCs"},
+    {"name": "small",            "label": "Small",           "size_mb": 466,
+     "summary": "balanced for modest hardware"},
+    {"name": "distil-large-v3",  "label": "Distil-Large v3", "size_mb": 1500,
+     "summary": "fast, English only"},
+    {"name": "large-v3-turbo",   "label": "Large v3 turbo",  "size_mb": 1620,
+     "summary": "recommended — near-large-v3 quality, ~6× faster"},
+    {"name": "large-v3",         "label": "Large v3",        "size_mb": 3094,
+     "summary": "highest accuracy, slower on weaker GPUs"},
+]
 
 # audio
 SAMPLE_RATE = 16000
@@ -432,6 +447,7 @@ class Settings(QObject):
         # defaults
         self.auto_paste = PASTE_AFTER_TRANSCRIBE
         self.sensitivity = BAR_LEVEL_SCALE
+        self.model_name = DEFAULT_MODEL
         self._load()
 
     def _load(self) -> None:
@@ -441,13 +457,20 @@ class Settings(QObject):
                 if isinstance(data, dict):
                     self.auto_paste = bool(data.get("auto_paste", self.auto_paste))
                     self.sensitivity = float(data.get("sensitivity", self.sensitivity))
-                    log_app.info("loaded settings: auto_paste=%s sensitivity=%.1f",
-                                 self.auto_paste, self.sensitivity)
+                    self.model_name = str(data.get("model_name", self.model_name))
+                    log_app.info(
+                        "loaded settings: auto_paste=%s sensitivity=%.1f model=%s",
+                        self.auto_paste, self.sensitivity, self.model_name,
+                    )
         except Exception:
             log_app.exception("failed to load settings")
 
     def save(self) -> None:
-        data = {"auto_paste": self.auto_paste, "sensitivity": self.sensitivity}
+        data = {
+            "auto_paste": self.auto_paste,
+            "sensitivity": self.sensitivity,
+            "model_name": self.model_name,
+        }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -456,6 +479,93 @@ class Settings(QObject):
         except Exception:
             log_app.exception("failed to save settings")
         self.changed.emit()
+
+
+def _format_size_mb(mb: int) -> str:
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB"
+    return f"{mb} MB"
+
+
+# ---- model cache lookup ---------------------------------------------------
+# Maps Tellur's display name → HuggingFace repo id. Pulled from
+# faster_whisper.utils._MODELS so it matches whatever faster-whisper would
+# actually fetch (notably large-v3-turbo is on mobiuslabsgmbh, not Systran).
+def _build_model_repo_map() -> dict[str, str]:
+    try:
+        from faster_whisper.utils import _MODELS  # type: ignore[attr-defined]
+        return {n: _MODELS[n] for n in (m["name"] for m in KNOWN_MODELS) if n in _MODELS}
+    except Exception:
+        # Hard-coded fallback (correct as of faster-whisper 1.2.x).
+        return {
+            "tiny":            "Systran/faster-whisper-tiny",
+            "small":           "Systran/faster-whisper-small",
+            "distil-large-v3": "Systran/faster-distil-whisper-large-v3",
+            "large-v3-turbo":  "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+            "large-v3":        "Systran/faster-whisper-large-v3",
+        }
+
+
+_MODEL_REPO: dict[str, str] = _build_model_repo_map()
+
+
+def _hf_cache_root() -> Path:
+    # HF_HUB_CACHE wins (most specific); else HF_HOME with /hub; else default.
+    hub = os.environ.get("HF_HUB_CACHE")
+    if hub:
+        return Path(hub)
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        return Path(hf_home) / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _model_cache_dir(name: str) -> Path:
+    repo_id = _MODEL_REPO.get(name, f"Systran/faster-whisper-{name}")
+    return _hf_cache_root() / ("models--" + repo_id.replace("/", "--"))
+
+
+def _dir_size_bytes(p: Path) -> int:
+    total = 0
+    if not p.exists():
+        return 0
+    try:
+        for f in p.rglob("*"):
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return total
+
+
+def is_model_cached(name: str) -> bool:
+    """True iff the HF Hub cache contains both model.bin and config.json for
+    this model — i.e. a previous WhisperModel(...) call has fully downloaded
+    it and a future call will be near-instant."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ImportError:
+        # Fallback heuristic: directory size at least 90% of expected.
+        cache_dir = _model_cache_dir(name)
+        size = _dir_size_bytes(cache_dir)
+        expected = next(
+            (m["size_mb"] for m in KNOWN_MODELS if m["name"] == name), 100,
+        ) * 1024 * 1024
+        return size > expected * 0.9
+    repo_id = _MODEL_REPO.get(name, f"Systran/faster-whisper-{name}")
+    for fname in ("model.bin", "config.json"):
+        result = try_to_load_from_cache(repo_id=repo_id, filename=fname)
+        if not isinstance(result, str):
+            return False
+        try:
+            if not Path(result).exists():
+                return False
+        except OSError:
+            return False
+    return True
 
 
 def build_initial_prompt(log: TranscriptLog) -> str | None:
@@ -548,7 +658,7 @@ class AudioRecorder:
 class WhisperEngine:
     """Wraps faster-whisper. Single-threaded transcribe; callers serialize."""
 
-    def __init__(self, name: str = MODEL_NAME):
+    def __init__(self, name: str = DEFAULT_MODEL):
         self.name = name
         self.device = PREFERRED_DEVICE
         self.compute_type = CUDA_COMPUTE_TYPE
@@ -556,33 +666,58 @@ class WhisperEngine:
         self._lock = threading.Lock()
         self._supports_hotwords = False
 
+    def _build_model(self, name: str) -> tuple["WhisperModel", str, str]:
+        """Build a WhisperModel, trying CUDA first and falling back to CPU.
+        Does NOT mutate engine state — caller is responsible for installing it.
+        May download the model on first use (via faster-whisper / HF Hub)."""
+        try:
+            m = WhisperModel(name, device="cuda", compute_type=CUDA_COMPUTE_TYPE)
+            return m, "cuda", CUDA_COMPUTE_TYPE
+        except Exception:
+            log_engine.exception("CUDA load failed for %s — falling back to CPU", name)
+            m = WhisperModel(name, device="cpu", compute_type=CPU_COMPUTE_TYPE)
+            return m, "cpu", CPU_COMPUTE_TYPE
+
+    def _detect_hotwords_support(self, model: "WhisperModel") -> bool:
+        try:
+            sig = inspect.signature(model.transcribe)
+            return "hotwords" in sig.parameters
+        except (TypeError, ValueError):
+            return False
+
     def load(self) -> WhisperModel:
         with self._lock:
             if self._model is not None:
                 return self._model
             t0 = time.monotonic()
-            try:
-                self._model = WhisperModel(
-                    self.name, device="cuda", compute_type=CUDA_COMPUTE_TYPE,
-                )
-                self.device, self.compute_type = "cuda", CUDA_COMPUTE_TYPE
-            except Exception:
-                log_engine.exception("CUDA load failed — falling back to CPU")
-                self._model = WhisperModel(
-                    self.name, device="cpu", compute_type=CPU_COMPUTE_TYPE,
-                )
-                self.device, self.compute_type = "cpu", CPU_COMPUTE_TYPE
-            try:
-                sig = inspect.signature(self._model.transcribe)
-                self._supports_hotwords = "hotwords" in sig.parameters
-            except (TypeError, ValueError):
-                self._supports_hotwords = False
+            self._model, self.device, self.compute_type = self._build_model(self.name)
+            self._supports_hotwords = self._detect_hotwords_support(self._model)
             log_engine.info(
                 "model loaded name=%s device=%s compute=%s hotwords=%s in %.2fs",
                 self.name, self.device, self.compute_type,
                 self._supports_hotwords, time.monotonic() - t0,
             )
             return self._model
+
+    def switch_to(self, name: str) -> None:
+        """Swap to a different model. Blocks until loaded (and downloaded, if
+        not cached). Raises on failure. The build happens OUTSIDE the lock so
+        in-flight transcribe calls aren't blocked during a multi-minute
+        download; only the brief reference swap holds the lock."""
+        if name == self.name and self._model is not None:
+            return
+        log_engine.info("switching model: %s -> %s", self.name, name)
+        t0 = time.monotonic()
+        new_model, dev, ct = self._build_model(name)
+        supports_hotwords = self._detect_hotwords_support(new_model)
+        with self._lock:
+            self._model = new_model
+            self.name = name
+            self.device = dev
+            self.compute_type = ct
+            self._supports_hotwords = supports_hotwords
+        log_engine.info("model switched to %s (%s/%s) in %.2fs",
+                        name, dev, ct, time.monotonic() - t0)
 
     def transcribe(
         self,
@@ -1286,11 +1421,43 @@ QWidget#mainPanel QSlider::handle:horizontal {
     background: #6080ff; width: 14px; margin: -5px 0; border-radius: 7px;
 }
 QWidget#mainPanel QSlider::handle:horizontal:hover { background: #7a98ff; }
+QWidget#mainPanel QComboBox {
+    background-color: #15161a;
+    color: #e6e8ee;
+    border: 1px solid #2a2b30;
+    border-radius: 4px;
+    padding: 4px 8px;
+    selection-background-color: #2c3a55;
+}
+QWidget#mainPanel QComboBox:hover { border: 1px solid #3a3b42; }
+QWidget#mainPanel QComboBox::drop-down { border: none; width: 22px; }
+QWidget#mainPanel QComboBox QAbstractItemView {
+    background-color: #15161a;
+    color: #e6e8ee;
+    border: 1px solid #2a2b30;
+    selection-background-color: #2c3a55;
+    selection-color: #ffffff;
+    outline: 0;
+}
+QWidget#mainPanel QProgressBar {
+    background-color: #15161a;
+    border: 1px solid #2a2b30;
+    border-radius: 4px;
+    text-align: center;
+    color: #e6e8ee;
+    font-size: 9pt;
+}
+QWidget#mainPanel QProgressBar::chunk {
+    background-color: #6080ff;
+    border-radius: 3px;
+}
 """
 
 
 class MainPanel(QWidget):
     """The 'open from the tray' window. Two tabs: History and Settings."""
+
+    model_switch_requested = pyqtSignal(str)
 
     def __init__(
         self,
@@ -1467,6 +1634,40 @@ class MainPanel(QWidget):
         sens_box.addLayout(row)
         layout.addLayout(sens_box)
 
+        # --- transcription model section ---
+        model_box = QVBoxLayout()
+        model_box.setSpacing(6)
+        model_header = QLabel("Transcription model")
+        model_header.setStyleSheet("font-weight: 600; color: #d8dbe2;")
+        model_box.addWidget(model_header)
+        model_hint = QLabel(
+            "Switching downloads the model on first use. The download is cached, "
+            "so future switches between models you've already used are instant."
+        )
+        model_hint.setWordWrap(True)
+        model_hint.setStyleSheet("color: #6a6e78; font-size: 9pt;")
+        model_box.addWidget(model_hint)
+
+        self._model_combo = QComboBox()
+        self._populate_model_combo()
+        self._model_combo.currentIndexChanged.connect(self._on_model_combo_changed)
+        model_box.addWidget(self._model_combo)
+
+        self._model_status = QLabel(f"Active: {self._settings.model_name}")
+        self._model_status.setStyleSheet("color: #9a9da6;")
+        model_box.addWidget(self._model_status)
+
+        self._model_progress = QProgressBar()
+        self._model_progress.setRange(0, 100)
+        self._model_progress.setValue(0)
+        self._model_progress.setTextVisible(True)
+        self._model_progress.setFormat("%p%")
+        self._model_progress.setVisible(False)
+        self._model_progress.setFixedHeight(14)
+        model_box.addWidget(self._model_progress)
+
+        layout.addLayout(model_box)
+
         # --- software updates section ---
         if self._updater is not None:
             update_box = QVBoxLayout()
@@ -1559,6 +1760,89 @@ class MainPanel(QWidget):
             self._update_btn.setEnabled(True)
             self._update_btn.setText("Try again")
 
+    # --- model picker handlers -----------------------------------------
+
+    def _populate_model_combo(self) -> None:
+        """(Re)build the model dropdown, annotating cached models with ✓."""
+        current = self._model_combo.currentData() if self._model_combo.count() else None
+        target = current or self._settings.model_name
+
+        self._model_combo.blockSignals(True)
+        self._model_combo.clear()
+        for m in KNOWN_MODELS:
+            label = m["label"]
+            if m["name"] == DEFAULT_MODEL:
+                label += " (default)"
+            cached_suffix = "  ·  ✓ downloaded" if is_model_cached(m["name"]) else ""
+            text = (
+                f"{label}  ·  {_format_size_mb(m['size_mb'])}  ·  "
+                f"{m['summary']}{cached_suffix}"
+            )
+            self._model_combo.addItem(text, userData=m["name"])
+        idx = next(
+            (i for i, m in enumerate(KNOWN_MODELS) if m["name"] == target),
+            next(i for i, m in enumerate(KNOWN_MODELS) if m["name"] == DEFAULT_MODEL),
+        )
+        self._model_combo.setCurrentIndex(idx)
+        self._model_combo.blockSignals(False)
+
+    def _on_model_combo_changed(self, idx: int) -> None:
+        name = self._model_combo.itemData(idx)
+        if not name or name == self._settings.model_name:
+            return
+        self.model_switch_requested.emit(name)
+
+    def on_model_switch_state(self, state: str, message: str) -> None:
+        """Called by App when a model-switch worker reports progress."""
+        if not hasattr(self, "_model_status"):
+            return
+        self._model_status.setText(message)
+        if state == "loading":
+            self._model_combo.setEnabled(False)
+        elif state == "ready":
+            self._model_combo.setEnabled(True)
+            # Refresh dropdown so the just-downloaded model gets its ✓ marker.
+            self._populate_model_combo()
+        elif state == "error":
+            # Revert the dropdown to the model that's actually still active.
+            self._model_combo.blockSignals(True)
+            idx = next(
+                (i for i, m in enumerate(KNOWN_MODELS)
+                 if m["name"] == self._settings.model_name),
+                0,
+            )
+            self._model_combo.setCurrentIndex(idx)
+            self._model_combo.blockSignals(False)
+            self._model_combo.setEnabled(True)
+
+    def on_model_download_progress(self, pct: int) -> None:
+        """Show/hide and update the download progress bar.
+
+        Contract for pct:
+          -2  → indeterminate (busy animation, e.g. connecting or loading)
+          -1  → hide
+           0..100 → determinate percentage
+        """
+        if not hasattr(self, "_model_progress"):
+            return
+        bar = self._model_progress
+        if pct == -1:
+            bar.setVisible(False)
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setFormat("%p%")
+        elif pct < 0:
+            # Indeterminate: range (0,0) makes Qt animate a sliding chunk.
+            bar.setRange(0, 0)
+            bar.setFormat("")
+            bar.setVisible(True)
+        else:
+            if bar.maximum() == 0:
+                bar.setRange(0, 100)
+                bar.setFormat("%p%")
+            bar.setValue(pct)
+            bar.setVisible(True)
+
     # --- window behavior -----------------------------------------------
 
     def closeEvent(self, event) -> None:
@@ -1573,23 +1857,26 @@ class MainPanel(QWidget):
 class App(QObject):
     ui_state = pyqtSignal(str)
     ui_level = pyqtSignal(float)
+    model_switch_state = pyqtSignal(str, str)   # (state, message)
+    model_download_progress = pyqtSignal(int)   # 0..100, or -1 to hide bar
 
     def __init__(self):
         super().__init__()
+
+        # Load settings FIRST so we can pick the user's chosen model up-front.
+        here = Path(__file__).resolve().parent
+        self.install_dir = here
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self.settings = Settings(SETTINGS_FILE)
+        self.log = TranscriptLog(HISTORY_FILE)
+        self.replacements = Replacements(here / REPLACEMENTS_FILE)
+        self.updater = Updater(self.install_dir)
+
         self.recorder = AudioRecorder()
-        self.engine = WhisperEngine()
+        self.engine = WhisperEngine(self.settings.model_name)
         self.overlay = Overlay()
         self.hotkey = HotkeyWatcher()
         self.injector = TextInjector()
-
-        here = Path(__file__).resolve().parent
-        self.install_dir = here
-        self.replacements = Replacements(here / REPLACEMENTS_FILE)
-
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self.log = TranscriptLog(HISTORY_FILE)
-        self.settings = Settings(SETTINGS_FILE)
-        self.updater = Updater(self.install_dir)
 
         # Apply persisted settings to the overlay; react to live changes.
         self.overlay.set_scale(self.settings.sensitivity)
@@ -1607,6 +1894,11 @@ class App(QObject):
         self.tray.quit_requested.connect(self.quit)
         self.tray.install_update.connect(self.updater.install_async)
         self.updater.update_found.connect(self.tray.set_update_available)
+
+        # Model-switching: panel asks → App orchestrates → panel renders progress.
+        self.panel.model_switch_requested.connect(self.switch_model_async)
+        self.model_switch_state.connect(self.panel.on_model_switch_state)
+        self.model_download_progress.connect(self.panel.on_model_download_progress)
 
         self.hotkey.pressed.connect(self.on_press)
         self.hotkey.released.connect(self.on_release)
@@ -1664,9 +1956,143 @@ class App(QObject):
     def _warm_up(self) -> None:
         try:
             self.engine.load()
+            # Report the resting state once load is done so the UI can drop
+            # any "Loading…" indicator the settings tab might be showing.
+            self.model_switch_state.emit("ready", f"Active: {self.engine.name}")
         except Exception:
             log_engine.exception("model load failed")
             self.ui_state.emit("error")
+
+    def switch_model_async(self, new_name: str) -> None:
+        if new_name == self.engine.name:
+            return
+        threading.Thread(
+            target=self._switch_model_worker, args=(new_name,),
+            daemon=True, name=f"model-switch-{new_name}",
+        ).start()
+
+    def _switch_model_worker(self, new_name: str) -> None:
+        size_mb = next(
+            (m["size_mb"] for m in KNOWN_MODELS if m["name"] == new_name), 100,
+        )
+        cached = is_model_cached(new_name)
+
+        if cached:
+            log_engine.info("model %s already cached; instant switch", new_name)
+            self.model_switch_state.emit("loading", f"Switching to {new_name}…")
+            self.model_download_progress.emit(-1)
+        else:
+            # Pre-download phase: HF Hub does API + ETag + connection setup
+            # before any bytes flow. Show an indeterminate bar so the user
+            # sees activity rather than a frozen 0%.
+            log_engine.info(
+                "model %s not cached; downloading (~%d MB)", new_name, size_mb,
+            )
+            self.model_switch_state.emit(
+                "loading",
+                f"Connecting to download {new_name} "
+                f"({_format_size_mb(size_mb)})…",
+            )
+            self.model_download_progress.emit(-2)  # indeterminate
+
+            repo_id = _MODEL_REPO.get(
+                new_name, f"Systran/faster-whisper-{new_name}",
+            )
+            try:
+                downloaded = self._download_with_progress(
+                    repo_id, new_name, size_mb,
+                )
+            except Exception as e:
+                log_engine.exception("download failed for %s", new_name)
+                self.model_switch_state.emit(
+                    "error", f"Download failed: {e}",
+                )
+                self.model_download_progress.emit(-1)
+                return
+
+            if not downloaded:
+                # HF API didn't accept our progress hook (older version);
+                # fall back to letting WhisperModel handle the download.
+                # Show indeterminate so it's clear something's happening.
+                self.model_switch_state.emit(
+                    "loading", f"Downloading {new_name}…",
+                )
+                self.model_download_progress.emit(-2)
+
+            # Final: load weights from cache into VRAM (1–3 s for large
+            # models; no per-byte progress available so we stay
+            # indeterminate).
+            self.model_switch_state.emit(
+                "loading", f"Loading {new_name} into memory…",
+            )
+            self.model_download_progress.emit(-2)
+
+        try:
+            self.engine.switch_to(new_name)
+        except Exception as e:
+            log_engine.exception("model switch failed")
+            self.model_switch_state.emit("error", f"Failed to load {new_name}: {e}")
+            self.model_download_progress.emit(-1)
+            return
+
+        self.settings.model_name = new_name
+        self.settings.save()
+        self.model_download_progress.emit(-1)
+        self.model_switch_state.emit("ready", f"Active: {new_name}")
+
+    def _download_with_progress(
+        self, repo_id: str, model_name: str, expected_mb: int,
+    ) -> bool:
+        """Trigger an HF snapshot download with polling-based UI feedback.
+
+        We do NOT hook into tqdm — HF Hub's xet backend bypasses tqdm_class for
+        the actual byte transfer, so we'd never see progress. Polling the
+        model's cache directory works regardless of transport, including xet
+        (which still writes the final blob into the model's blobs/ dir).
+
+        Returns True on success.
+        """
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError:
+            log_engine.warning("huggingface_hub unavailable; cannot pre-download")
+            return False
+
+        cache_dir = _model_cache_dir(model_name)
+        expected_bytes = max(expected_mb * 1024 * 1024, 1)
+        stop_event = threading.Event()
+        app_self = self
+
+        def _poll() -> None:
+            last_pct = -1
+            # 500 KB threshold: gates the transition from the caller's
+            # "Connecting…" indeterminate state to our determinate bar.
+            BYTES_THRESHOLD = 500_000
+            while not stop_event.is_set():
+                current = _dir_size_bytes(cache_dir)
+                if current >= BYTES_THRESHOLD:
+                    pct = min(int((current / expected_bytes) * 100), 99)
+                    if pct != last_pct:
+                        current_mb = current // (1024 * 1024)
+                        app_self.model_switch_state.emit(
+                            "loading",
+                            f"Downloading {model_name}…  "
+                            f"{current_mb} / {expected_mb} MB",
+                        )
+                        app_self.model_download_progress.emit(pct)
+                        last_pct = pct
+                stop_event.wait(0.25)
+
+        threading.Thread(
+            target=_poll, daemon=True, name=f"model-poll-{model_name}",
+        ).start()
+        log_engine.info("downloading %s (repo=%s)", model_name, repo_id)
+        try:
+            snapshot_download(repo_id=repo_id)
+        finally:
+            stop_event.set()
+        log_engine.info("download finished for %s", model_name)
+        return True
 
     def on_press(self) -> None:
         # Bump gen FIRST so any pending reset timer from a prior release becomes
@@ -1785,6 +2211,17 @@ def main() -> int:
         if not (args.zip and args.install_dir and args.parent_pid):
             return 64
         return _update_helper_main(args)
+
+    # Under pythonw.exe, sys.stderr and sys.stdout are None. Libraries that
+    # assume a tty-style writable stream (tqdm via huggingface_hub being the
+    # main one) crash with "NoneType has no attribute 'write'". Give them a
+    # silent sink so progress-bar writes are discarded harmlessly.
+    if sys.stderr is None or sys.stdout is None:
+        import io
+        if sys.stderr is None:
+            sys.stderr = io.StringIO()
+        if sys.stdout is None:
+            sys.stdout = io.StringIO()
 
     listener = setup_logging(args.debug)
     startup = logging.getLogger("startup")
