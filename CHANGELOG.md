@@ -2,6 +2,36 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] — 2026-05-17
+
+**Phase 4 of the roadmap — audio control.** You can now pick a specific microphone, see your input level live, and boost a quiet mic with software gain. Before this release Tellur always followed the Windows default input device and ran every sample at unit gain.
+
+### Microphone device picker
+
+- **Settings → Audio input → Microphone device** dropdown lists every input device PortAudio sees, with the system default tagged. Pick **System default** to keep tracking Windows's choice (the previous behavior), or pin a specific mic so headset-vs-laptop switches don't change Tellur's input.
+- The selection is persisted by **device name**, not index, so plugging/unplugging USB peripherals doesn't shuffle which device Tellur picks next time.
+- If a previously-pinned device is gone at startup, Tellur logs a warning and falls back to the system default rather than refusing to record.
+
+### Live input level meter
+
+- A live RMS bar appears in Settings while the window is open. It runs a passive monitor stream so you can speak into your mic and see the meter respond *before* you start a real dictation — handy for verifying the right device is selected and that gain is set sensibly.
+- The monitor stream auto-stops when Settings is hidden (so we don't keep a mic open in the background) and yields to push-to-talk: starting a recording closes the monitor; releasing the hotkey brings it back if Settings is still open.
+
+### Input gain slider
+
+- **0.10× → 4.00×** software gain, applied to every sample before Whisper sees it (and also to the meter, so the bar shows what Whisper will hear).
+- Quiet mic? Push it up. Clipping on loud bursts? Push it down. Clamping at ±1.0 prevents wraparound distortion at high gain.
+- Live-applies on slider drag; saves debounced at 300ms.
+
+### Under the hood
+
+- `AudioRecorder` learned `set_device()`, `set_gain()`, and a separate `start_monitor()` / `stop_monitor()` lifecycle for the Settings meter. The monitor and the recording use the same configured device + gain so the meter accurately previews what Whisper would receive.
+- New `list_input_devices()` helper wraps `sd.query_devices()` with input-only filtering and default-device tagging, returning a clean list of `{index, name, default, channels}` dicts.
+- `Settings` persists two new fields: `input_device_name` (string or null) and `input_gain` (float, 0.1–10.0, clamped on load).
+- `MainPanel` gained `showEvent` / `hideEvent` overrides to start/stop the monitor stream — no background mic activity once you close Settings.
+
+---
+
 ## [1.5.0] — 2026-05-17
 
 **Phase 3 of the roadmap — modes & hotkey flexibility.** Choose between hold and toggle push-to-talk styles, abandon a recording mid-flight with Esc, and re-paste your last transcript into a fresh window with one keystroke.

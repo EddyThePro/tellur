@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 APP_NAME = "Tellur"
 
 
@@ -770,6 +770,12 @@ class Settings(QObject):
         self.model_name = DEFAULT_MODEL
         self.voice_commands = False   # opt-in: changes transcript output
         self.hotkey_mode = "hold"     # "hold" or "toggle"
+        # Audio input config (v1.6):
+        # - input_device_name: human-readable device name, persisted so the
+        #   choice survives index reshuffles. None = system default.
+        # - input_gain: linear multiplier (1.0 = no boost). Clamped 0.1..10.0.
+        self.input_device_name: str | None = None
+        self.input_gain: float = 1.0
         self._load()
 
     def _load(self) -> None:
@@ -784,6 +790,13 @@ class Settings(QObject):
                     if mode not in ("hold", "toggle"):
                         mode = "hold"
                     self.hotkey_mode = mode
+                    dev = data.get("input_device_name", None)
+                    self.input_device_name = str(dev) if dev else None
+                    try:
+                        self.input_gain = float(data.get("input_gain", self.input_gain))
+                    except (TypeError, ValueError):
+                        self.input_gain = 1.0
+                    self.input_gain = max(0.1, min(10.0, self.input_gain))
                     requested = str(data.get("model_name", self.model_name))
                     valid_names = {m["name"] for m in KNOWN_MODELS}
                     if requested not in valid_names:
@@ -810,6 +823,8 @@ class Settings(QObject):
             "model_name": self.model_name,
             "voice_commands": self.voice_commands,
             "hotkey_mode": self.hotkey_mode,
+            "input_device_name": self.input_device_name,
+            "input_gain": self.input_gain,
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -943,9 +958,40 @@ def humanize_time(ts: float) -> str:
 # ===========================================================================
 # audio capture
 # ===========================================================================
+def list_input_devices() -> list[dict]:
+    """Return a list of input devices as [{'index': int, 'name': str,
+    'default': bool, 'channels': int}]. Falls back to an empty list on
+    PortAudio errors (e.g. no audio service)."""
+    try:
+        devices = sd.query_devices()
+        try:
+            default_in_idx = sd.default.device[0]
+        except Exception:
+            default_in_idx = None
+        out = []
+        for i, d in enumerate(devices):
+            if d.get("max_input_channels", 0) <= 0:
+                continue
+            out.append({
+                "index": i,
+                "name": str(d.get("name", f"Device {i}")),
+                "default": (i == default_in_idx),
+                "channels": int(d.get("max_input_channels", 0)),
+            })
+        return out
+    except Exception:
+        log_audio.exception("failed to enumerate input devices")
+        return []
+
+
 class AudioRecorder:
     """Captures mono float32 audio at SAMPLE_RATE while held. Audio callback is
-    kept lean — no logging or heavy computation — so it doesn't stall."""
+    kept lean — no logging or heavy computation — so it doesn't stall.
+
+    Supports a selectable input device (index or None for system default) and
+    a software gain multiplier applied per-sample. The level reported back to
+    the overlay is the post-gain RMS so the meter reflects what's actually
+    being fed into Whisper."""
 
     def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
@@ -954,9 +1000,37 @@ class AudioRecorder:
         self._max_samples = int(MAX_RECORDING_SECONDS * sample_rate)
         self._stream: sd.InputStream | None = None
         self._level = 0.0
+        # device: PortAudio device index, or None to follow system default.
+        # gain: linear multiplier applied per-sample (1.0 == off).
+        self._device: int | None = None
+        self._gain: float = 1.0
+        # Separate stream used by the Settings tab for the live meter; runs
+        # only while Settings is visible and never feeds the recorder.
+        self._monitor_stream: sd.InputStream | None = None
+        self._monitor_level: float = 0.0
+
+    def set_device(self, idx: int | None) -> None:
+        if idx == self._device:
+            return
+        self._device = idx
+        log_audio.info("input device -> %s", idx if idx is not None else "system default")
+        # If a live monitor is running, restart it on the new device.
+        if self._monitor_stream is not None:
+            self.stop_monitor()
+            self.start_monitor()
+
+    def set_gain(self, gain: float) -> None:
+        g = max(0.1, min(10.0, float(gain)))
+        if abs(g - self._gain) < 1e-6:
+            return
+        self._gain = g
+        log_audio.info("input gain -> %.2fx", g)
 
     def _callback(self, indata, _frames, _time_info, _status) -> None:
         chunk = indata.copy().reshape(-1).astype(np.float32)
+        if self._gain != 1.0:
+            np.multiply(chunk, self._gain, out=chunk)
+            np.clip(chunk, -1.0, 1.0, out=chunk)
         # Hard cap to prevent unbounded RAM growth on a stuck-down hotkey.
         if self._sample_count + chunk.size > self._max_samples:
             return  # silently drop further audio
@@ -968,15 +1042,23 @@ class AudioRecorder:
         self._frames = []
         self._sample_count = 0
         self._level = 0.0
+        # Tear down the monitor stream so the device is exclusively available
+        # for the recording — important for drivers that don't support shared
+        # mode. We remember it was on so stop() can bring it back.
+        self._monitor_was_running = self._monitor_stream is not None
+        if self._monitor_was_running:
+            self.stop_monitor()
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=1,
             dtype="float32",
             callback=self._callback,
             blocksize=0,
+            device=self._device,
         )
         self._stream.start()
-        log_audio.debug("recording started")
+        log_audio.debug("recording started (device=%s gain=%.2f)",
+                        self._device, self._gain)
 
     def stop(self) -> np.ndarray:
         if self._stream is None:
@@ -986,6 +1068,10 @@ class AudioRecorder:
             self._stream.close()
         finally:
             self._stream = None
+        # Bring the monitor back if it was running before this recording.
+        if getattr(self, "_monitor_was_running", False):
+            self._monitor_was_running = False
+            self.start_monitor()
         if not self._frames:
             log_audio.debug("recording stopped — no frames captured")
             return np.zeros(0, dtype=np.float32)
@@ -997,6 +1083,55 @@ class AudioRecorder:
     @property
     def level(self) -> float:
         return self._level
+
+    # --- monitor stream (used by Settings tab live meter) ----------------
+
+    def _monitor_callback(self, indata, _frames, _time_info, _status) -> None:
+        chunk = indata.copy().reshape(-1).astype(np.float32)
+        if self._gain != 1.0:
+            np.multiply(chunk, self._gain, out=chunk)
+            np.clip(chunk, -1.0, 1.0, out=chunk)
+        self._monitor_level = float(np.sqrt(np.mean(chunk * chunk)))
+
+    def start_monitor(self) -> bool:
+        """Start a passive monitor stream for the Settings meter. Returns
+        True on success, False if the stream couldn't be opened (e.g. the
+        recorder is currently active or the device is unavailable)."""
+        if self._stream is not None:
+            return False
+        if self._monitor_stream is not None:
+            return True
+        try:
+            self._monitor_stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="float32",
+                callback=self._monitor_callback,
+                blocksize=0,
+                device=self._device,
+            )
+            self._monitor_stream.start()
+            return True
+        except Exception:
+            log_audio.exception("monitor stream failed to start")
+            self._monitor_stream = None
+            return False
+
+    def stop_monitor(self) -> None:
+        if self._monitor_stream is None:
+            return
+        try:
+            self._monitor_stream.stop()
+            self._monitor_stream.close()
+        except Exception:
+            log_audio.debug("monitor stream stop failed", exc_info=True)
+        finally:
+            self._monitor_stream = None
+            self._monitor_level = 0.0
+
+    @property
+    def monitor_level(self) -> float:
+        return self._monitor_level
 
 
 # ===========================================================================
@@ -2264,12 +2399,14 @@ class MainPanel(QWidget):
         log: TranscriptLog,
         settings: Settings,
         updater: "Updater | None" = None,
+        recorder: "AudioRecorder | None" = None,
         parent: QObject | None = None,
     ):
         super().__init__()
         self._log = log
         self._settings = settings
         self._updater = updater
+        self._recorder = recorder
 
         self.setObjectName("mainPanel")
         self.setWindowTitle(APP_NAME)
@@ -2299,6 +2436,13 @@ class MainPanel(QWidget):
         self._tick.setInterval(30_000)
         self._tick.timeout.connect(self._refresh_visible_timestamps)
         self._tick.start()
+
+        # Live mic meter — only ticks while the panel is visible (showEvent
+        # starts it, hideEvent stops it) so we don't keep an audio stream
+        # open in the background.
+        self._meter_tick = QTimer(self)
+        self._meter_tick.setInterval(int(1000 / LEVEL_PUSH_HZ))
+        self._meter_tick.timeout.connect(self._tick_level_meter)
 
     # --- history tab ----------------------------------------------------
 
@@ -2656,10 +2800,60 @@ class MainPanel(QWidget):
         ref_box.addWidget(ref_text)
         layout.addLayout(ref_box)
 
+        # --- audio input section (v1.6) ---
+        audio_box = QVBoxLayout()
+        audio_box.setSpacing(6)
+        audio_header = QLabel("Audio input")
+        audio_header.setStyleSheet("font-weight: 600; color: #d8dbe2;")
+        audio_box.addWidget(audio_header)
+
+        # Device picker.
+        audio_box.addWidget(QLabel("Microphone device"))
+        self._device_combo = QComboBox()
+        self._populate_device_combo()
+        self._device_combo.currentIndexChanged.connect(self._on_device_changed)
+        audio_box.addWidget(self._device_combo)
+
+        # Live input level meter — only animates while Settings is visible
+        # and the recorder isn't currently capturing for a transcription.
+        meter_row = QHBoxLayout()
+        meter_row.addWidget(QLabel("Level"))
+        self._level_meter = QProgressBar()
+        self._level_meter.setRange(0, 1000)
+        self._level_meter.setTextVisible(False)
+        self._level_meter.setFixedHeight(10)
+        self._level_meter.setValue(0)
+        meter_row.addWidget(self._level_meter, stretch=1)
+        audio_box.addLayout(meter_row)
+
+        # Gain slider.
+        gain_row = QHBoxLayout()
+        gain_row.addWidget(QLabel("Input gain"))
+        self._gain_slider = QSlider(Qt.Orientation.Horizontal)
+        # 10..400 → 0.1x..4.0x (we cap UI at 4.0; engine allows up to 10.0)
+        self._gain_slider.setRange(10, 400)
+        self._gain_slider.setValue(int(self._settings.input_gain * 100))
+        self._gain_slider.valueChanged.connect(self._on_gain_changed)
+        gain_row.addWidget(self._gain_slider, stretch=1)
+        self._gain_label = QLabel(f"{self._settings.input_gain:.2f}x")
+        self._gain_label.setFixedWidth(56)
+        self._gain_label.setStyleSheet("color: #9a9da6;")
+        gain_row.addWidget(self._gain_label)
+        audio_box.addLayout(gain_row)
+
+        gain_hint = QLabel(
+            "Boost quiet mics with gain. If Whisper struggles on soft speech, push gain up. "
+            "If your audio clips or distorts on loud bursts, push it down."
+        )
+        gain_hint.setWordWrap(True)
+        gain_hint.setStyleSheet("color: #6a6e78; font-size: 9pt;")
+        audio_box.addWidget(gain_hint)
+        layout.addLayout(audio_box)
+
         # sensitivity
         sens_box = QVBoxLayout()
         sens_box.setSpacing(6)
-        sens_box.addWidget(QLabel("Mic-meter sensitivity (visual only, doesn't affect transcription)"))
+        sens_box.addWidget(QLabel("Overlay mic-meter sensitivity (visual only, doesn't affect transcription)"))
         row = QHBoxLayout()
         self._sens_slider = QSlider(Qt.Orientation.Horizontal)
         self._sens_slider.setRange(20, 400)
@@ -2759,6 +2953,59 @@ class MainPanel(QWidget):
         self._settings.hotkey_mode = mode
         self._settings.save()  # emits `changed` for live-apply
         log_app.info("hotkey mode -> %s", mode)
+
+    # --- audio input handlers ------------------------------------------
+
+    def _populate_device_combo(self) -> None:
+        """(Re)build the input device dropdown. First entry is always
+        'System default'; rest are real input devices, with the default
+        device tagged."""
+        target = self._settings.input_device_name
+        self._device_combo.blockSignals(True)
+        self._device_combo.clear()
+        self._device_combo.addItem("System default", userData=None)
+        idx_to_select = 0
+        for i, d in enumerate(list_input_devices(), start=1):
+            label = d["name"]
+            if d["default"]:
+                label += "  (system default)"
+            self._device_combo.addItem(label, userData=d["name"])
+            if target and d["name"] == target:
+                idx_to_select = i
+        self._device_combo.setCurrentIndex(idx_to_select)
+        self._device_combo.blockSignals(False)
+
+    def _on_device_changed(self, _idx: int) -> None:
+        name = self._device_combo.currentData()  # str or None
+        if name == self._settings.input_device_name:
+            return
+        self._settings.input_device_name = name
+        self._settings.save()  # emits `changed` → App._apply_audio_settings
+        log_app.info("input device -> %s", name if name else "system default")
+
+    def _on_gain_changed(self, value: int) -> None:
+        gain = max(0.1, min(10.0, value / 100.0))
+        self._gain_label.setText(f"{gain:.2f}x")
+        self._settings.input_gain = gain
+        # debounce saves
+        if not hasattr(self, "_gain_save_timer"):
+            self._gain_save_timer = QTimer(self)
+            self._gain_save_timer.setSingleShot(True)
+            self._gain_save_timer.timeout.connect(self._settings.save)
+        self._gain_save_timer.start(300)
+        # Apply gain live without waiting for the save (settings.changed only
+        # fires from save()), so the live meter reflects the new value now.
+        if self._recorder is not None:
+            self._recorder.set_gain(gain)
+
+    def _tick_level_meter(self) -> None:
+        if self._recorder is None:
+            return
+        # Convert RMS (≈0..1) to the 0..1000 range with sensitivity-scaled
+        # multiplier so the meter responds similarly to the overlay bars.
+        level = self._recorder.monitor_level * float(self._settings.sensitivity) * 10
+        level = max(0, min(1000, int(level)))
+        self._level_meter.setValue(level)
 
     def _on_sens_changed(self, value: int) -> None:
         self._settings.sensitivity = float(value)
@@ -2903,6 +3150,22 @@ class MainPanel(QWidget):
         event.ignore()
         self.hide()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Start the live mic monitor + meter tick when the panel is shown.
+        if self._recorder is not None:
+            if self._recorder.start_monitor():
+                self._meter_tick.start()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        # Stop the live monitor + meter when the panel is hidden.
+        self._meter_tick.stop()
+        if hasattr(self, "_level_meter"):
+            self._level_meter.setValue(0)
+        if self._recorder is not None:
+            self._recorder.stop_monitor()
+
 
 # ===========================================================================
 # orchestrator
@@ -2932,6 +3195,10 @@ class App(QObject):
         self.hotkey = HotkeyWatcher()
         self.injector = TextInjector()
 
+        # Apply persisted audio settings to the recorder.
+        self._apply_audio_settings()
+        self.settings.changed.connect(self._apply_audio_settings)
+
         # Apply persisted settings to the overlay; react to live changes.
         self.overlay.set_scale(self.settings.sensitivity)
         self.settings.changed.connect(
@@ -2939,7 +3206,7 @@ class App(QObject):
         )
 
         # Tray + panel — panel is hidden by default; opened from the tray.
-        self.panel = MainPanel(self.log, self.settings, self.updater)
+        self.panel = MainPanel(self.log, self.settings, self.updater, self.recorder)
         self.tray = TrayIcon(self.updater, self)
         if not QSystemTrayIcon.isSystemTrayAvailable():
             log_app.warning("system tray not available — tray icon will be inactive")
@@ -3014,6 +3281,26 @@ class App(QObject):
         self.panel.show()
         self.panel.raise_()
         self.panel.activateWindow()
+
+    def _apply_audio_settings(self) -> None:
+        """Reconcile recorder state with the latest Settings.input_*.
+        Resolves the persisted device NAME back to a PortAudio index (so the
+        choice survives index reshuffles between sessions / device hotplug)."""
+        # Resolve device name → index. None means "follow system default".
+        target_name = self.settings.input_device_name
+        idx: int | None = None
+        if target_name:
+            for d in list_input_devices():
+                if d["name"] == target_name:
+                    idx = d["index"]
+                    break
+            if idx is None:
+                log_audio.warning(
+                    "configured input device %r not found — using system default",
+                    target_name,
+                )
+        self.recorder.set_device(idx)
+        self.recorder.set_gain(self.settings.input_gain)
 
     def _copy_last_to_clipboard(self) -> None:
         last = self.log.last()
