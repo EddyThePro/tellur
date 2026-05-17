@@ -2,6 +2,50 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.9.0] — 2026-05-17
+
+**Phase 7 of the roadmap — privacy & data management.** A new "Privacy & data" section in Settings gives you full control over what gets written to disk, how long it sticks around, how to get it out, and how to wipe it.
+
+### Don't-save-history toggle
+
+- **Settings → Privacy & data → "Save transcript history"**. When off, transcripts are NOT written to `history.json`. The in-memory list still tracks recent entries during the session so hotkeys like **Ctrl+Win+B** (re-paste last) and **Ctrl+Win+L** (AI apply) keep working — but nothing persists across restarts.
+
+### Auto-delete after N days
+
+- Slider from **forever** through **365 days**. Purge runs at app startup (so a long downtime doesn't leave very old entries hanging around) and after each new transcription. 0 means "keep forever" (the previous behavior).
+- Friendly labels: 1 day, 7 days, 1 month, ~3 months, 1 year, etc.
+
+### Export history (txt / md / json / csv)
+
+- **Export history…** button opens a Save dialog with format picker. Pick:
+  - **Markdown** — H2 timestamp blocks, perfect for Obsidian / Logseq
+  - **Plain text** — `[YYYY-MM-DD HH:MM:SS] transcript text` one per line
+  - **JSON** — exact structure of `history.json`, preserves `raw` and `edited` flags
+  - **CSV** — `timestamp_iso, ts, text, raw, edited` columns, opens cleanly in Excel
+- Filename defaults to `tellur-history-YYYYMMDD-HHMMSS.<ext>`.
+
+### Import dictionary (team-share vocab)
+
+- **Import dictionary…** button picks a `replacements.json` from disk and **merges** it into your local one. Imported entries win on conflict; existing-but-not-imported entries are kept. Useful for sharing project-specific vocabulary between machines or teammates.
+- Reports: "Added N new, overwrote M, total now X" so you can see exactly what changed.
+
+### Clear all data
+
+- **Clear all data…** button wipes `history.json` and `replacements.json` after a Yes/No confirmation. Your `settings.json` is intentionally preserved — your preferences survive the data wipe.
+
+### Open data folder
+
+- **Open data folder** button opens `%TELLUR_HOME%` in Explorer so you can poke around manually (logs, hf-cache, history, etc.).
+
+### Under the hood
+
+- New `TranscriptLog.purge_older_than(seconds)` method drops entries older than the cutoff, emits `cleared` on changes for listener refresh.
+- New module-level `export_history(entries, path, fmt)` helper covers all four output formats.
+- Two new settings fields: `save_history` (bool, default True), `history_retention_days` (int, default 0 = keep forever).
+- LLM apply and normal dictation now both gate `log.add(...)` behind `save_history` so the privacy toggle is honored end-to-end.
+
+---
+
 ## [1.8.0] — 2026-05-17
 
 **Phase 6 of the roadmap — integration & automation.** Tellur becomes a hub: every transcript can be persisted to a markdown daybook, POSTed to a webhook, and/or auto-submitted in chat apps. All three are opt-in, all three are best-effort (failures log and move on without disturbing dictation).

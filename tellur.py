@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 APP_NAME = "Tellur"
 
 
@@ -732,6 +732,25 @@ class TranscriptLog(QObject):
             self.entry_removed.emit(entry)
         return removed
 
+    def purge_older_than(self, max_age_seconds: float) -> int:
+        """Drop entries older than `max_age_seconds` (entry.ts < now - age).
+        Returns the count of removed entries. Emits `cleared` if anything was
+        removed so listeners refresh wholesale."""
+        if max_age_seconds <= 0:
+            return 0
+        cutoff = time.time() - max_age_seconds
+        removed = 0
+        with self._lock:
+            before = len(self._entries)
+            self._entries = [e for e in self._entries if e.get("ts", 0) >= cutoff]
+            removed = before - len(self._entries)
+        if removed:
+            self._save_async()
+            self.cleared.emit()
+            log_app.info("history purge: removed %d entries older than %.1f days",
+                         removed, max_age_seconds / 86400)
+        return removed
+
     def update_text(self, entry: dict, new_text: str) -> bool:
         """Edit a transcript's text in place (used by inline-edit). Returns
         True if the entry was found and updated."""
@@ -755,6 +774,43 @@ class TranscriptLog(QObject):
         with self._lock:
             recent = self._entries[-n:]
         return " ".join(e["text"] for e in recent if e.get("text"))
+
+
+def export_history(entries: list[dict], path: Path, fmt: str) -> int:
+    """Export `entries` to `path` in the requested format. Returns the count
+    of exported entries. Supported formats: txt, md, json, csv."""
+    fmt = fmt.lower().lstrip(".")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if fmt == "json":
+        path.write_text(json.dumps(entries, indent=2, ensure_ascii=False),
+                        encoding="utf-8")
+    elif fmt == "csv":
+        import csv
+        with path.open("w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["timestamp_iso", "ts", "text", "raw", "edited"])
+            for e in entries:
+                ts = e.get("ts", 0)
+                iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts)) if ts else ""
+                w.writerow([iso, ts, e.get("text", ""), e.get("raw", ""),
+                            bool(e.get("edited", False))])
+    elif fmt == "md":
+        with path.open("w", encoding="utf-8") as f:
+            f.write(f"# Tellur transcripts — exported {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            for e in entries:
+                ts = e.get("ts", 0)
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "?"
+                f.write(f"## {stamp}\n\n{e.get('text', '').strip()}\n\n")
+    elif fmt == "txt":
+        with path.open("w", encoding="utf-8") as f:
+            for e in entries:
+                ts = e.get("ts", 0)
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "?"
+                f.write(f"[{stamp}] {e.get('text', '').strip()}\n")
+    else:
+        raise ValueError(f"unsupported export format: {fmt}")
+    return len(entries)
 
 
 class Settings(QObject):
@@ -794,6 +850,11 @@ class Settings(QObject):
         self.webhook_enabled: bool = False
         self.webhook_url: str = ""
         self.webhook_template: str = '{"text": "{text}", "raw": "{raw}", "ts": {ts}}'
+        # Privacy & data management (v1.9):
+        # - save_history: master switch; if False, no transcripts are persisted
+        # - history_retention_days: 0 = keep forever; >0 = auto-purge older entries
+        self.save_history: bool = True
+        self.history_retention_days: int = 0
         self._load()
 
     def _load(self) -> None:
@@ -827,6 +888,13 @@ class Settings(QObject):
                     self.webhook_enabled = bool(data.get("webhook_enabled", self.webhook_enabled))
                     self.webhook_url = str(data.get("webhook_url", self.webhook_url))
                     self.webhook_template = str(data.get("webhook_template", self.webhook_template))
+                    self.save_history = bool(data.get("save_history", self.save_history))
+                    try:
+                        self.history_retention_days = int(data.get("history_retention_days", self.history_retention_days))
+                    except (TypeError, ValueError):
+                        self.history_retention_days = 0
+                    if self.history_retention_days < 0:
+                        self.history_retention_days = 0
                     requested = str(data.get("model_name", self.model_name))
                     valid_names = {m["name"] for m in KNOWN_MODELS}
                     if requested not in valid_names:
@@ -867,6 +935,8 @@ class Settings(QObject):
             "webhook_enabled": self.webhook_enabled,
             "webhook_url": self.webhook_url,
             "webhook_template": self.webhook_template,
+            "save_history": self.save_history,
+            "history_retention_days": self.history_retention_days,
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -3390,6 +3460,76 @@ class MainPanel(QWidget):
 
         layout.addLayout(intg_box)
 
+        # --- privacy & data management section (v1.9) ---
+        priv_box = QVBoxLayout()
+        priv_box.setSpacing(10)
+        priv_box.addWidget(self._section_header("Privacy & data"))
+
+        self._save_history_cb = QCheckBox("Save transcript history")
+        self._save_history_cb.setToolTip(
+            "When off, transcripts are NOT written to history.json. The current "
+            "in-memory list still tracks recent entries for hotkeys like Ctrl+Win+B "
+            "/ Ctrl+Win+L during this session, but nothing is persisted to disk."
+        )
+        self._save_history_cb.setChecked(self._settings.save_history)
+        self._save_history_cb.toggled.connect(self._on_save_history_toggled)
+        priv_box.addWidget(self._save_history_cb)
+
+        # Retention slider/spinner (use a slider for simplicity).
+        retention_widget = QWidget()
+        retention_row = QHBoxLayout(retention_widget)
+        retention_row.setContentsMargins(0, 0, 0, 0)
+        retention_row.setSpacing(8)
+        self._retention_slider = _NoWheelSlider(Qt.Orientation.Horizontal)
+        # 0..365 days. 0 = keep forever.
+        self._retention_slider.setRange(0, 365)
+        self._retention_slider.setValue(int(self._settings.history_retention_days))
+        self._retention_slider.valueChanged.connect(self._on_retention_changed)
+        self._retention_label = QLabel(self._format_retention(self._settings.history_retention_days))
+        self._retention_label.setFixedWidth(110)
+        self._retention_label.setStyleSheet("color: #9a9da6;")
+        retention_row.addWidget(self._retention_slider, stretch=1)
+        retention_row.addWidget(self._retention_label)
+        priv_box.addLayout(self._form_row("Auto-delete after", retention_widget))
+
+        # Export + clear + data folder.
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        self._export_btn = QPushButton("Export history…")
+        self._export_btn.clicked.connect(self._on_export_history_clicked)
+        action_row.addWidget(self._export_btn)
+        self._import_dict_btn = QPushButton("Import dictionary…")
+        self._import_dict_btn.setToolTip(
+            "Merge a replacements.json from another machine / teammate into your own."
+        )
+        self._import_dict_btn.clicked.connect(self._on_import_dict_clicked)
+        action_row.addWidget(self._import_dict_btn)
+        self._open_data_btn = QPushButton("Open data folder")
+        self._open_data_btn.clicked.connect(self._on_open_data_clicked)
+        action_row.addWidget(self._open_data_btn)
+        priv_box.addLayout(action_row)
+
+        clear_row = QHBoxLayout()
+        clear_row.setSpacing(8)
+        self._clear_all_btn = QPushButton("Clear all data…")
+        self._clear_all_btn.setToolTip(
+            "Wipe history.json AND your replacements dictionary. settings.json is kept."
+        )
+        self._clear_all_btn.setStyleSheet("color: #e07c7c;")
+        self._clear_all_btn.clicked.connect(self._on_clear_all_clicked)
+        clear_row.addWidget(self._clear_all_btn)
+        clear_row.addStretch()
+        priv_box.addLayout(clear_row)
+
+        priv_box.addWidget(self._section_hint(
+            "All Tellur data lives locally in your data folder. Set retention to 0 to keep history forever; "
+            "any other value runs a one-shot purge at app startup and after each new transcript. "
+            "Export creates a portable copy in the format you choose; Clear all data only removes "
+            "<code>history.json</code> and <code>replacements.json</code> — your settings survive."
+        , rich=True))
+
+        layout.addLayout(priv_box)
+
         # --- software updates section ---
         if self._updater is not None:
             update_box = QVBoxLayout()
@@ -3532,6 +3672,156 @@ class MainPanel(QWidget):
             self._llm_test_status.setStyleSheet("color: #6bd47b;")
         else:
             self._llm_test_status.setStyleSheet("color: #e07c7c;")
+
+    # --- privacy & data management handlers ----------------------------
+
+    @staticmethod
+    def _format_retention(days: int) -> str:
+        if days <= 0:
+            return "forever"
+        if days == 1:
+            return "1 day"
+        if days < 30:
+            return f"{days} days"
+        if days < 60:
+            return "1 month"
+        if days < 365:
+            return f"~{days // 30} months"
+        return "1 year"
+
+    def _on_save_history_toggled(self, checked: bool) -> None:
+        self._settings.save_history = bool(checked)
+        self._settings.save()
+        log_app.info("save_history %s", "on" if checked else "off")
+
+    def _on_retention_changed(self, value: int) -> None:
+        self._settings.history_retention_days = int(value)
+        self._retention_label.setText(self._format_retention(value))
+        # debounce save
+        if not hasattr(self, "_ret_save_timer"):
+            self._ret_save_timer = QTimer(self)
+            self._ret_save_timer.setSingleShot(True)
+            self._ret_save_timer.timeout.connect(self._settings.save)
+        self._ret_save_timer.start(400)
+
+    def _on_export_history_clicked(self) -> None:
+        from PyQt6.QtWidgets import QFileDialog
+        entries = self._log.entries()
+        if not entries:
+            QMessageBox.information(self, "Export history",
+                                    "No transcripts to export yet.")
+            return
+        default_name = f"tellur-history-{time.strftime('%Y%m%d-%H%M%S')}"
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Export history",
+            str(Path.home() / default_name),
+            "Markdown (*.md);;Plain text (*.txt);;JSON (*.json);;CSV (*.csv)",
+        )
+        if not path:
+            return
+        # Pick format from selected filter (more reliable than user extension).
+        ext_map = {
+            "Markdown (*.md)": "md",
+            "Plain text (*.txt)": "txt",
+            "JSON (*.json)": "json",
+            "CSV (*.csv)": "csv",
+        }
+        fmt = ext_map.get(selected_filter, Path(path).suffix.lstrip(".") or "txt")
+        if not Path(path).suffix:
+            path = path + "." + fmt
+        try:
+            n = export_history(entries, Path(path), fmt)
+            QMessageBox.information(self, "Export complete",
+                                    f"Exported {n} entries to:\n{path}")
+        except Exception as e:
+            log_app.exception("history export failed")
+            QMessageBox.warning(self, "Export failed", f"{type(e).__name__}: {e}")
+
+    def _on_import_dict_clicked(self) -> None:
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import dictionary (replacements.json)",
+            str(Path.home()),
+            "JSON (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+            if not isinstance(data, dict):
+                raise ValueError("file must contain a JSON object of {key: value} mappings")
+        except Exception as e:
+            QMessageBox.warning(self, "Import failed", f"{type(e).__name__}: {e}")
+            return
+        # Merge: imported entries win on conflict.
+        local_path = Path(__file__).resolve().parent / REPLACEMENTS_FILE
+        merged: dict = {}
+        try:
+            if local_path.exists():
+                existing = json.loads(local_path.read_text(encoding="utf-8-sig"))
+                if isinstance(existing, dict):
+                    merged.update(existing)
+        except Exception:
+            log_app.exception("failed to read existing replacements during import")
+        added = 0
+        overwritten = 0
+        for k, v in data.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                continue
+            if k in merged and merged[k] != v:
+                overwritten += 1
+            elif k not in merged:
+                added += 1
+            merged[k] = v
+        try:
+            local_path.write_text(
+                json.dumps(merged, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Import failed", f"Couldn't write: {e}")
+            return
+        log_app.info("dictionary import: +%d new, %d overwritten, %d total",
+                     added, overwritten, len(merged))
+        QMessageBox.information(
+            self, "Import complete",
+            f"Added {added} new rules, overwrote {overwritten} existing.\n"
+            f"Dictionary now contains {len(merged)} entries.\n\n"
+            f"(Reload happens automatically on the next transcription.)",
+        )
+
+    def _on_open_data_clicked(self) -> None:
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(DATA_DIR))  # noqa: SLF001
+        except Exception:
+            log_app.exception("failed to open data folder")
+
+    def _on_clear_all_clicked(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Clear all data?",
+            "This will permanently delete:\n\n"
+            "• Your transcript history (history.json)\n"
+            "• Your custom dictionary (replacements.json)\n\n"
+            "Settings will be kept. This cannot be undone.\n\nProceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        # Clear history through TranscriptLog so listeners refresh.
+        self._log.clear()
+        # Wipe the on-disk replacements file. The in-memory Replacements
+        # object will see it gone on its next reload (per-transcription).
+        try:
+            (Path(__file__).resolve().parent / REPLACEMENTS_FILE).unlink(missing_ok=True)
+        except Exception:
+            log_app.exception("failed to delete replacements.json")
+        QMessageBox.information(
+            self, "Cleared",
+            "History and dictionary cleared. Settings retained.",
+        )
 
     # --- integration & automation handlers -----------------------------
 
@@ -3884,6 +4174,11 @@ class App(QObject):
         self.overlay.show()
         self.tray.show()
         self.hotkey.start()
+        # Apply history retention on startup so a long downtime doesn't leave
+        # very old entries hanging around when the user has set a cap.
+        days = self.settings.history_retention_days
+        if days > 0:
+            self.log.purge_older_than(days * 86400)
         log_app.info("started — tray icon visible")
 
     def quit(self) -> None:
@@ -4248,7 +4543,8 @@ class App(QObject):
         # Append as a new history entry tagged with the source prompt so the
         # user can see what was done and retrieve the LLM-cleaned version
         # later from the History tab.
-        self.log.add(result, raw=text)
+        if self.settings.save_history:
+            self.log.add(result, raw=text)
         self._dispatch_integrations(result, raw=text)
         if self._is_latest(gen):
             self.ui_state.emit("done")
@@ -4349,7 +4645,8 @@ class App(QObject):
 
         if self.settings.auto_paste:
             self.injector.paste(text, press_enter=self.settings.send_after_paste)
-        self.log.add(text, raw=raw)
+        if self.settings.save_history:
+            self.log.add(text, raw=raw)
         self._dispatch_integrations(text, raw=raw)
 
         if self._is_latest(gen):
