@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 APP_NAME = "Tellur"
 
 
@@ -149,6 +149,34 @@ UPDATE_REPO = "EddyThePro/tellur"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_TIMEOUT_SEC = 6
 UPDATE_HELPER_PARENT_WAIT_SEC = 30
+
+# branding — the logo PNG ships next to tellur.py. Used for window icon,
+# taskbar, alt-tab. The tray icon is intentionally a separate, simpler
+# painted-in-code red dot (see TrayIcon._make_icon).
+ICON_PATH = Path(__file__).resolve().parent / "tellur.png"
+
+# Stable AppUserModelID — tells Windows to group our windows under this
+# identity (with our icon) instead of pythonw.exe. Must be set BEFORE any
+# windows are shown.
+APP_USER_MODEL_ID = "Tellur.Dictation.PushToTalk"
+
+
+def apply_app_branding(qapp: "QApplication") -> None:
+    """Install the Tellur icon as the QApplication-wide window icon and
+    register an explicit AppUserModelID on Windows so the taskbar groups
+    the app under our identity (not under pythonw.exe / Python's feather)."""
+    if ICON_PATH.exists():
+        qapp.setWindowIcon(QIcon(str(ICON_PATH)))
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                APP_USER_MODEL_ID,
+            )
+        except Exception:
+            # Non-fatal — taskbar grouping will fall back to pythonw.
+            pass
+
 
 # persistence — defaults to per-user app data; override with TELLUR_HOME env var.
 def _default_data_dir() -> Path:
@@ -1473,6 +1501,8 @@ class MainPanel(QWidget):
 
         self.setObjectName("mainPanel")
         self.setWindowTitle(APP_NAME)
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.setStyleSheet(PANEL_QSS)
         self.resize(620, 520)
 
@@ -2231,6 +2261,10 @@ def main() -> int:
 
     qapp = QApplication(sys.argv)
     qapp.setQuitOnLastWindowClosed(False)
+    qapp.setApplicationName(APP_NAME)
+    qapp.setApplicationDisplayName(APP_NAME)
+    qapp.setApplicationVersion(__version__)
+    apply_app_branding(qapp)
 
     try:
         app = App()

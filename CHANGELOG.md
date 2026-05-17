@@ -2,6 +2,20 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] — 2026-05-17
+
+### Changed
+
+- **Real Tellur branding** everywhere a Python feather used to show up:
+  - Main window title bar
+  - Windows taskbar (using an explicit `AppUserModelID` so Windows groups the app under "Tellur" instead of "pythonw.exe")
+  - Alt+Tab switcher
+  - QMessageBox popups
+
+  The tray icon is intentionally unchanged — the simple painted red-dot fits better at 16×16 in the system tray than a downscaled logo.
+
+---
+
 ## [1.2.0] — 2026-05-17
 
 ### Added
