@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 APP_NAME = "Tellur"
 
 
@@ -769,6 +769,7 @@ class Settings(QObject):
         self.sensitivity = BAR_LEVEL_SCALE
         self.model_name = DEFAULT_MODEL
         self.voice_commands = False   # opt-in: changes transcript output
+        self.hotkey_mode = "hold"     # "hold" or "toggle"
         self._load()
 
     def _load(self) -> None:
@@ -779,6 +780,10 @@ class Settings(QObject):
                     self.auto_paste = bool(data.get("auto_paste", self.auto_paste))
                     self.sensitivity = float(data.get("sensitivity", self.sensitivity))
                     self.voice_commands = bool(data.get("voice_commands", self.voice_commands))
+                    mode = str(data.get("hotkey_mode", self.hotkey_mode)).lower()
+                    if mode not in ("hold", "toggle"):
+                        mode = "hold"
+                    self.hotkey_mode = mode
                     requested = str(data.get("model_name", self.model_name))
                     valid_names = {m["name"] for m in KNOWN_MODELS}
                     if requested not in valid_names:
@@ -804,6 +809,7 @@ class Settings(QObject):
             "sensitivity": self.sensitivity,
             "model_name": self.model_name,
             "voice_commands": self.voice_commands,
+            "hotkey_mode": self.hotkey_mode,
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1202,25 +1208,67 @@ class TextInjector:
 # hotkey watcher — polls Ctrl + Win held; emits press / release transitions
 # ===========================================================================
 class HotkeyWatcher(QObject):
+    """Polls Ctrl+Win as the push-to-talk trigger. Supports two modes:
+    - "hold"   — press emits `pressed`, release emits `released` (default)
+    - "toggle" — first press starts recording (pressed); next press ends
+                 it (released). Ignores release events in between.
+
+    Also registers global hotkeys for quit, cancel-recording, and
+    re-paste-last via the `keyboard` library's low-level Windows hook.
+    """
+
     pressed = pyqtSignal()
     released = pyqtSignal()
     quit_requested = pyqtSignal()
+    cancel_requested = pyqtSignal()       # Esc during recording → abandon
+    repaste_requested = pyqtSignal()      # Ctrl+Win+V → re-paste last transcript
 
     def __init__(self, poll_ms: int = HOTKEY_POLL_MS):
         super().__init__()
-        self._held = False
+        self._held_keys = False    # raw "are both Ctrl+Win held?" state
+        self._recording = False    # logical "are we currently recording?" state
+        self._mode = "hold"        # "hold" or "toggle"; set via set_mode()
         self._timer = QTimer(self)
         self._timer.setInterval(poll_ms)
         self._timer.timeout.connect(self._poll)
+        self._register_global_hotkeys()
+
+    def _register_global_hotkeys(self) -> None:
         try:
             keyboard.add_hotkey("ctrl+windows+q", self.quit_requested.emit)
             log_hotkey.info("registered quit hotkey: ctrl+win+q")
         except Exception:
             log_hotkey.exception("failed to register quit hotkey")
+        try:
+            keyboard.add_hotkey("ctrl+windows+v", self.repaste_requested.emit)
+            log_hotkey.info("registered re-paste-last hotkey: ctrl+win+v")
+        except Exception:
+            log_hotkey.exception("failed to register re-paste hotkey")
+        try:
+            # Esc fires globally even when no other modifier is held; we'll
+            # filter in the slot so it only cancels when actively recording.
+            keyboard.add_hotkey("escape", self.cancel_requested.emit, suppress=False)
+            log_hotkey.info("registered cancel-recording hotkey: esc")
+        except Exception:
+            log_hotkey.exception("failed to register cancel hotkey")
+
+    def set_mode(self, mode: str) -> None:
+        """Switch between 'hold' and 'toggle'. Mid-recording mode changes
+        end any in-flight recording cleanly."""
+        if mode not in ("hold", "toggle"):
+            mode = "hold"
+        if mode == self._mode:
+            return
+        log_hotkey.info("hotkey mode -> %s", mode)
+        # If we were recording, force-release so we don't get stuck.
+        if self._recording:
+            self._recording = False
+            self.released.emit()
+        self._mode = mode
 
     def start(self) -> None:
         self._timer.start()
-        log_hotkey.info("watching ctrl+win as push-to-talk")
+        log_hotkey.info("watching ctrl+win in %s mode", self._mode)
 
     def _all_held(self) -> bool:
         try:
@@ -1231,14 +1279,45 @@ class HotkeyWatcher(QObject):
             log_hotkey.exception("keyboard poll failed")
             return False
 
+    @property
+    def recording(self) -> bool:
+        return self._recording
+
+    def force_release(self) -> None:
+        """External cancel — used by Esc to abandon the current recording.
+        Emits `released` if we were recording so the App can stop the audio
+        stream, but the caller is responsible for ignoring the transcript
+        (e.g. via a 'cancelled' flag)."""
+        if self._recording:
+            self._recording = False
+            self.released.emit()
+
     def _poll(self) -> None:
         held = self._all_held()
-        if held and not self._held:
-            self._held = True
-            self.pressed.emit()
-        elif not held and self._held:
-            self._held = False
-            self.released.emit()
+        # Detect raw key transitions
+        key_press = held and not self._held_keys
+        key_release = not held and self._held_keys
+        self._held_keys = held
+
+        if self._mode == "hold":
+            # Recording follows key state 1:1
+            if key_press:
+                self._recording = True
+                self.pressed.emit()
+            elif key_release:
+                if self._recording:
+                    self._recording = False
+                    self.released.emit()
+        else:  # toggle
+            # Each fresh KEY PRESS flips recording state
+            if key_press:
+                if not self._recording:
+                    self._recording = True
+                    self.pressed.emit()
+                else:
+                    self._recording = False
+                    self.released.emit()
+            # Key releases are ignored in toggle mode
 
 
 # ===========================================================================
@@ -2534,6 +2613,49 @@ class MainPanel(QWidget):
         vc_box.addWidget(vc_hint)
         layout.addLayout(vc_box)
 
+        # --- hotkey mode section ---
+        hk_box = QVBoxLayout()
+        hk_box.setSpacing(6)
+        hk_header = QLabel("Push-to-talk mode")
+        hk_header.setStyleSheet("font-weight: 600; color: #d8dbe2;")
+        hk_box.addWidget(hk_header)
+
+        self._hk_mode_combo = QComboBox()
+        self._hk_mode_combo.addItem("Hold — speak while Ctrl+Win is held", userData="hold")
+        self._hk_mode_combo.addItem("Toggle — tap Ctrl+Win to start, tap again to stop", userData="toggle")
+        cur_idx = 0 if self._settings.hotkey_mode == "hold" else 1
+        self._hk_mode_combo.setCurrentIndex(cur_idx)
+        self._hk_mode_combo.currentIndexChanged.connect(self._on_hk_mode_changed)
+        hk_box.addWidget(self._hk_mode_combo)
+
+        hk_hint = QLabel(
+            "Hold is the classic press-to-talk feel. Toggle is great for longer dictations "
+            "so you don't have to keep the keys pressed. In toggle mode, press Esc to abandon "
+            "the current recording without transcribing."
+        )
+        hk_hint.setWordWrap(True)
+        hk_hint.setStyleSheet("color: #6a6e78; font-size: 9pt;")
+        hk_box.addWidget(hk_hint)
+        layout.addLayout(hk_box)
+
+        # --- hotkey reference (read-only) ---
+        ref_box = QVBoxLayout()
+        ref_box.setSpacing(6)
+        ref_header = QLabel("Hotkeys")
+        ref_header.setStyleSheet("font-weight: 600; color: #d8dbe2;")
+        ref_box.addWidget(ref_header)
+        ref_text = QLabel(
+            "<table cellpadding='2' style='color:#9a9da6;'>"
+            "<tr><td><b>Ctrl + Win</b></td><td>&nbsp;&nbsp;Push-to-talk dictation (hold or toggle)</td></tr>"
+            "<tr><td><b>Esc</b></td><td>&nbsp;&nbsp;Cancel current recording (no transcribe)</td></tr>"
+            "<tr><td><b>Ctrl + Win + V</b></td><td>&nbsp;&nbsp;Re-paste last transcription</td></tr>"
+            "<tr><td><b>Ctrl + Win + Q</b></td><td>&nbsp;&nbsp;Quit Tellur</td></tr>"
+            "</table>"
+        )
+        ref_text.setTextFormat(Qt.TextFormat.RichText)
+        ref_box.addWidget(ref_text)
+        layout.addLayout(ref_box)
+
         # sensitivity
         sens_box = QVBoxLayout()
         sens_box.setSpacing(6)
@@ -2613,7 +2735,8 @@ class MainPanel(QWidget):
         layout.addStretch()
 
         footer = QLabel(
-            f"{APP_NAME} {__version__}  ·  hold Ctrl+Win to talk  ·  Ctrl+Win+Q to quit"
+            f"{APP_NAME} {__version__}  ·  Ctrl+Win to talk  ·  Esc to cancel  ·  "
+            f"Ctrl+Win+V re-paste  ·  Ctrl+Win+Q to quit"
         )
         footer.setStyleSheet("color: #6a6e78; font-size: 9pt;")
         layout.addWidget(footer)
@@ -2628,6 +2751,14 @@ class MainPanel(QWidget):
         self._settings.voice_commands = bool(checked)
         self._settings.save()
         log_app.info("voice commands %s", "enabled" if checked else "disabled")
+
+    def _on_hk_mode_changed(self, _idx: int) -> None:
+        mode = self._hk_mode_combo.currentData() or "hold"
+        if mode == self._settings.hotkey_mode:
+            return
+        self._settings.hotkey_mode = mode
+        self._settings.save()  # emits `changed` for live-apply
+        log_app.info("hotkey mode -> %s", mode)
 
     def _on_sens_changed(self, value: int) -> None:
         self._settings.sensitivity = float(value)
@@ -2826,6 +2957,13 @@ class App(QObject):
         self.hotkey.pressed.connect(self.on_press)
         self.hotkey.released.connect(self.on_release)
         self.hotkey.quit_requested.connect(self.quit)
+        self.hotkey.cancel_requested.connect(self.on_cancel)
+        self.hotkey.repaste_requested.connect(self.on_repaste_last)
+        # Apply hotkey mode from settings and react to live changes.
+        self.hotkey.set_mode(self.settings.hotkey_mode)
+        self.settings.changed.connect(
+            lambda: self.hotkey.set_mode(self.settings.hotkey_mode)
+        )
         self.ui_state.connect(self.overlay.set_state)
         self.ui_level.connect(self.overlay.push_level)
 
@@ -2839,6 +2977,9 @@ class App(QObject):
         # protected by its own lock. Use the helpers _bump_gen / _is_latest.
         self._gen_lock = threading.Lock()
         self._latest_gen = 0
+
+        # Cancel flag — set by on_cancel (Esc) during recording to skip transcribe.
+        self._cancel_current_recording = False
 
         threading.Thread(target=self._warm_up, daemon=True, name="model-warmup").start()
 
@@ -3051,7 +3192,9 @@ class App(QObject):
         # Bump gen FIRST so any pending reset timer from a prior release becomes
         # stale and skips its emit — otherwise it can clobber our "recording".
         gen = self._bump_gen()
-        log_hotkey.debug("press (gen=%d)", gen)
+        # Reset the per-recording cancel flag; Esc during this session will set it.
+        self._cancel_current_recording = False
+        log_hotkey.debug("press (gen=%d, mode=%s)", gen, self.settings.hotkey_mode)
         try:
             self.recorder.start()
         except Exception:
@@ -3069,6 +3212,11 @@ class App(QObject):
             log_audio.exception("mic stop failed")
             self.ui_state.emit("error")
             return
+        if self._cancel_current_recording:
+            log_hotkey.info("release: recording cancelled — skipping transcribe")
+            self._cancel_current_recording = False
+            self.ui_state.emit("idle")
+            return
         if audio.size == 0:
             log_hotkey.debug("release (no audio)")
             self.ui_state.emit("idle")
@@ -3081,6 +3229,30 @@ class App(QObject):
             target=self._process_audio, args=(audio, gen),
             daemon=True, name=f"transcribe-{gen}",
         ).start()
+
+    def on_cancel(self) -> None:
+        """Esc pressed — abandon the current recording without transcribing.
+        Only acts when we're actually recording; otherwise Esc behaves
+        normally for whatever app the user is in."""
+        if not self.hotkey.recording:
+            return
+        log_hotkey.info("Esc: cancel current recording")
+        self._cancel_current_recording = True
+        self.hotkey.force_release()
+
+    def on_repaste_last(self) -> None:
+        """Ctrl+Win+V: take the last transcript and paste it into whatever
+        window has focus right now. Handy when an auto-paste landed in the
+        wrong window or you want to use the same dictation again."""
+        last = self.log.last()
+        if not last:
+            log_app.info("repaste-last: no transcript yet")
+            return
+        text = (last.get("text") or "").strip()
+        if not text:
+            return
+        log_app.info("repaste-last (%d chars)", len(text))
+        self.injector.paste(text)
 
     def _tick_level(self) -> None:
         self.ui_level.emit(self.recorder.level)

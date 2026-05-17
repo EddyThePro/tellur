@@ -130,10 +130,11 @@ Bigger architectural moves.
 | 1.2.0 | Model picker | ✅ shipped |
 | 1.2.1 | Branded windows + taskbar | ✅ shipped |
 | 1.2.2 | Stability audit pass | ✅ shipped |
-| **1.3** | **History UX overhaul** | 🚧 in progress |
-| 1.4 | Voice commands & smart text | planned |
-| 1.5 | Modes & hotkey flexibility | planned |
-| 1.6 | Audio control | planned |
+| 1.3.0 | History UX overhaul | ✅ shipped |
+| 1.3.1 | History UI polish | ✅ shipped |
+| 1.4.0 | Voice commands & smart text | ✅ shipped |
+| **1.5.0** | **Modes & hotkey flexibility** | ✅ shipped |
+| 1.6 | Audio control | 🚧 next |
 | 1.7 | AI post-processing | planned |
 | 1.8 | Integration & automation | planned |
 | 1.9 | Privacy & data management | planned |

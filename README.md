@@ -36,8 +36,12 @@ First launch downloads the Python dependencies (~2.5 GB) and the Whisper model (
 
 | Hotkey | Action |
 |---|---|
-| **Ctrl+Win** (hold) | Push-to-talk dictation — talk while held, paste on release |
+| **Ctrl+Win** | Push-to-talk dictation — hold to talk, or use toggle mode (tap on / tap off) |
+| **Esc** | Cancel the current recording without transcribing |
+| **Ctrl+Win+V** | Re-paste the most recent transcription into the focused window |
 | **Ctrl+Win+Q** | Quit Tellur |
+
+Push-to-talk style is configurable in **Settings → Push-to-talk mode** — pick **Hold** (classic) or **Toggle** (tap to start, tap to stop) per your taste.
 
 ## What you'll see
 

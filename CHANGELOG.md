@@ -2,6 +2,47 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] — 2026-05-17
+
+**Phase 3 of the roadmap — modes & hotkey flexibility.** Choose between hold and toggle push-to-talk styles, abandon a recording mid-flight with Esc, and re-paste your last transcript into a fresh window with one keystroke.
+
+### Push-to-talk mode picker
+
+- **Settings → Push-to-talk mode** dropdown, with two options:
+  - **Hold** (default, unchanged behavior) — speak while Ctrl+Win is held, paste on release.
+  - **Toggle** — tap Ctrl+Win once to start recording, tap again to stop. Lets you dictate longer passages without finger fatigue and frees your hands to keep typing or scrolling between thoughts.
+- The choice is live-applied — switching mode while idle just changes how the next dictation starts; switching mid-recording cleanly ends the in-flight session.
+- Persisted to `settings.json` as `hotkey_mode` (`"hold"` or `"toggle"`).
+
+### Cancel recording mid-flight
+
+- **Esc while recording → abandon the recording without transcribing.** Works in both modes. Mic stops, overlay returns to idle, no clipboard pollution, no history entry. Esc outside of an active recording does nothing Tellur-specific (the key still propagates to your focused app).
+- Useful for: trailed-off sentences, accidental hold-presses, "wait, never mind".
+
+### Re-paste last transcript
+
+- **Ctrl+Win+V → paste the most recent transcript into whatever window is focused right now.** Identical to right-click tray → "Copy last transcription" + Ctrl+V, but as a single global hotkey.
+- Made for the "Tellur auto-pasted into the wrong window" recovery flow and "I want to say that same thing again in a different app" use case.
+
+### Hotkey reference in Settings
+
+Settings tab now includes a clear table of every global hotkey Tellur listens for, so you don't have to remember them or check the README.
+
+| Hotkey | Action |
+|---|---|
+| **Ctrl+Win** | Push-to-talk (hold or toggle, per setting) |
+| **Esc** | Cancel current recording |
+| **Ctrl+Win+V** | Re-paste last transcription |
+| **Ctrl+Win+Q** | Quit Tellur |
+
+### Under the hood
+
+- `HotkeyWatcher` rewritten with explicit mode state and a `force_release()` cancel path. Each press in toggle mode flips a logical `_recording` flag; key releases are ignored. In hold mode, recording follows the key state 1:1 (unchanged).
+- New signals: `cancel_requested`, `repaste_requested`. New global hotkey registrations for `esc` and `ctrl+win+v`.
+- App tracks a per-recording `_cancel_current_recording` flag so the release path can skip the transcribe stage cleanly without racing the audio buffer.
+
+---
+
 ## [1.4.0] — 2026-05-17
 
 **Phase 2 of the roadmap.** Two changes to how transcripts get post-processed: a tiny always-on polish pass that everyone benefits from, plus an opt-in "voice commands" mode for users who want to dictate punctuation explicitly.
