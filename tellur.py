@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.2.2"
+__version__ = "1.3.0"
 APP_NAME = "Tellur"
 
 
@@ -95,9 +95,10 @@ from faster_whisper import WhisperModel
 from PyQt6.QtCore import Qt, QTimer, QObject, QRectF, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QGuiApplication, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton, QSlider,
-    QSystemTrayIcon, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
+    QProgressBar, QPushButton, QSlider, QSystemTrayIcon, QTabWidget,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 
@@ -407,6 +408,8 @@ class TranscriptLog(QObject):
     """
 
     entry_added = pyqtSignal(dict)
+    entry_changed = pyqtSignal(dict)   # mutated in place (pin, edit) — UI re-renders that row
+    entry_removed = pyqtSignal(dict)   # removed — UI drops the row
     cleared = pyqtSignal()
 
     def __init__(self, path: Path, max_entries: int = MAX_HISTORY_ENTRIES):
@@ -503,6 +506,56 @@ class TranscriptLog(QObject):
         self._save_async()
         self.cleared.emit()
         log_app.info("history cleared")
+
+    def toggle_pin(self, entry: dict) -> bool:
+        """Flip pinned state of a specific entry (matched by reference).
+        Returns the new pinned state, or False if entry isn't found."""
+        new_state = False
+        found = False
+        with self._lock:
+            for e in self._entries:
+                if e is entry:
+                    e["pinned"] = not bool(e.get("pinned"))
+                    new_state = e["pinned"]
+                    found = True
+                    break
+        if found:
+            self._save_async()
+            self.entry_changed.emit(entry)
+        return new_state
+
+    def delete_entry(self, entry: dict) -> bool:
+        """Remove a specific entry by reference. Returns True on success."""
+        removed = False
+        with self._lock:
+            for i, e in enumerate(self._entries):
+                if e is entry:
+                    self._entries.pop(i)
+                    removed = True
+                    break
+        if removed:
+            self._save_async()
+            self.entry_removed.emit(entry)
+        return removed
+
+    def update_text(self, entry: dict, new_text: str) -> bool:
+        """Edit a transcript's text in place (used by inline-edit). Returns
+        True if the entry was found and updated."""
+        new_text = (new_text or "").strip()
+        if not new_text:
+            return False
+        found = False
+        with self._lock:
+            for e in self._entries:
+                if e is entry:
+                    e["text"] = new_text
+                    e["edited"] = True
+                    found = True
+                    break
+        if found:
+            self._save_async()
+            self.entry_changed.emit(entry)
+        return found
 
     def context_for_prompt(self, n: int = HISTORY_SIZE) -> str:
         with self._lock:
@@ -1642,7 +1695,126 @@ QWidget#mainPanel QProgressBar::chunk {
     background-color: #6080ff;
     border-radius: 3px;
 }
+QWidget#mainPanel QLineEdit {
+    background-color: #15161a;
+    color: #e6e8ee;
+    border: 1px solid #2a2b30;
+    border-radius: 4px;
+    padding: 6px 10px;
+    selection-background-color: #2c3a55;
+}
+QWidget#mainPanel QLineEdit:focus { border: 1px solid #6080ff; }
+QWidget#historyRow QLabel#historyRowText {
+    color: #e6e8ee;
+    font-size: 10pt;
+}
+QWidget#historyRow QLabel#historyRowMeta {
+    color: #6a6e78;
+    font-size: 9pt;
+}
+QWidget#historyRow QPushButton#historyRowAction {
+    background: transparent;
+    color: #9a9da6;
+    border: none;
+    border-radius: 4px;
+    padding: 0;
+    margin: 0;
+    font-size: 12pt;
+}
+QWidget#historyRow QPushButton#historyRowAction:hover {
+    background-color: #2c2d34;
+    color: #e6e8ee;
+}
 """
+
+
+class HistoryRow(QWidget):
+    """Custom row widget for the History list. Shows text + time-ago + word
+    count, with always-visible Pin / Copy / Delete buttons at the right edge.
+    Emits signals on action; supports double-click-to-edit on the text label."""
+
+    copy_requested = pyqtSignal(dict)
+    pin_toggled = pyqtSignal(dict)
+    delete_requested = pyqtSignal(dict)
+    edit_started = pyqtSignal(dict)
+
+    def __init__(self, entry: dict):
+        super().__init__()
+        self.entry = entry
+        self.setObjectName("historyRow")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 6, 4, 6)
+        layout.setSpacing(8)
+
+        # Left: text preview (single line, ellipsized via Qt's wordwrap=False)
+        self.text_label = QLabel(self._preview_text())
+        self.text_label.setObjectName("historyRowText")
+        self.text_label.setWordWrap(False)
+        self.text_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        layout.addWidget(self.text_label, stretch=1)
+
+        # Middle: word count + time
+        meta = QLabel(self._meta_text())
+        meta.setObjectName("historyRowMeta")
+        meta.setStyleSheet("color: #6a6e78; font-size: 9pt;")
+        layout.addWidget(meta)
+        self._meta_label = meta
+
+        # Right: action buttons (pin / copy / delete)
+        self._pin_btn = QPushButton(self._pin_glyph())
+        self._pin_btn.setObjectName("historyRowAction")
+        self._pin_btn.setToolTip("Pin / unpin")
+        self._pin_btn.setFlat(True)
+        self._pin_btn.setFixedSize(24, 24)
+        self._pin_btn.clicked.connect(lambda: self.pin_toggled.emit(self.entry))
+        layout.addWidget(self._pin_btn)
+
+        copy_btn = QPushButton("📋")
+        copy_btn.setObjectName("historyRowAction")
+        copy_btn.setToolTip("Copy this transcription")
+        copy_btn.setFlat(True)
+        copy_btn.setFixedSize(24, 24)
+        copy_btn.clicked.connect(lambda: self.copy_requested.emit(self.entry))
+        layout.addWidget(copy_btn)
+
+        delete_btn = QPushButton("✕")
+        delete_btn.setObjectName("historyRowAction")
+        delete_btn.setToolTip("Delete this transcription")
+        delete_btn.setFlat(True)
+        delete_btn.setFixedSize(24, 24)
+        delete_btn.clicked.connect(lambda: self.delete_requested.emit(self.entry))
+        layout.addWidget(delete_btn)
+
+    def _preview_text(self) -> str:
+        text = (self.entry.get("text") or "").replace("\n", " ")
+        # Truncate visually; Qt ellipsization on QLabel with fixed-width parent
+        # is finicky, so we just hard-truncate for predictability.
+        if len(text) > 80:
+            text = text[:80] + "…"
+        return text
+
+    def _meta_text(self) -> str:
+        text = self.entry.get("text") or ""
+        word_count = len(text.split())
+        when = humanize_time(self.entry.get("ts", 0))
+        edited = "  ·  edited" if self.entry.get("edited") else ""
+        return f"{word_count} word{'' if word_count == 1 else 's'}  ·  {when}{edited}"
+
+    def _pin_glyph(self) -> str:
+        return "★" if self.entry.get("pinned") else "☆"
+
+    def refresh(self) -> None:
+        """Re-render based on possibly-mutated entry dict."""
+        self.text_label.setText(self._preview_text())
+        self._meta_label.setText(self._meta_text())
+        self._pin_btn.setText(self._pin_glyph())
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        # Forward to text-label area only: double-click on body starts edit.
+        if self.text_label.geometry().contains(event.position().toPoint()):
+            self.edit_started.emit(self.entry)
+            return
+        super().mouseDoubleClickEvent(event)
 
 
 class MainPanel(QWidget):
@@ -1680,6 +1852,8 @@ class MainPanel(QWidget):
 
         # subscribe to log changes
         log.entry_added.connect(self._on_entry_added)
+        log.entry_changed.connect(self._on_entry_changed)
+        log.entry_removed.connect(self._on_entry_removed)
         log.cleared.connect(self._refresh_list)
         self._refresh_list()
 
@@ -1695,11 +1869,23 @@ class MainPanel(QWidget):
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(0, 14, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
+        # Search bar — instant filter as user types
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search transcripts…  (Ctrl+F)")
+        self._search.textChanged.connect(lambda _s: self._refresh_list())
+        self._search.setClearButtonEnabled(True)
+        layout.addWidget(self._search)
+
+        # The list itself. Items each get a HistoryRow widget installed via
+        # setItemWidget. Selection still works on the underlying QListWidgetItem.
         self._list = QListWidget()
+        self._list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._on_context_menu)
         self._list.itemSelectionChanged.connect(self._on_selection)
-        self._list.itemDoubleClicked.connect(lambda _i: self._copy_selected())
+        self._list.installEventFilter(self)
         layout.addWidget(self._list, stretch=2)
 
         layout.addWidget(QLabel("Selected:"))
@@ -1724,19 +1910,39 @@ class MainPanel(QWidget):
 
         return w
 
-    def _format_item(self, entry: dict) -> str:
-        when = humanize_time(entry.get("ts", 0))
-        text = (entry.get("text") or "").replace("\n", " ")
-        if len(text) > 70:
-            text = text[:70] + "…"
-        return f"{when}  ·  {text}"
+    # --- list construction & refresh -----------------------------------
+
+    def _sorted_filtered_entries(self) -> list[dict]:
+        """Apply search filter and pinned-first sort. Pinned items show at
+        the top in newest-first order; unpinned follow, also newest-first."""
+        query = self._search.text().strip().lower() if hasattr(self, "_search") else ""
+        all_entries = self._log.entries()
+        if query:
+            all_entries = [e for e in all_entries if query in (e.get("text") or "").lower()]
+        # Each list is already in append order (oldest → newest). Reverse to
+        # show newest at top, then split into pinned and unpinned.
+        all_entries = list(reversed(all_entries))
+        pinned = [e for e in all_entries if e.get("pinned")]
+        unpinned = [e for e in all_entries if not e.get("pinned")]
+        return pinned + unpinned
+
+    def _install_row(self, item: "QListWidgetItem", entry: dict) -> None:
+        """Build a HistoryRow widget for an entry and install it on the list item."""
+        row = HistoryRow(entry)
+        row.copy_requested.connect(self._on_row_copy)
+        row.pin_toggled.connect(self._on_row_pin)
+        row.delete_requested.connect(self._on_row_delete)
+        row.edit_started.connect(self._on_row_edit_start)
+        item.setSizeHint(row.sizeHint())
+        item.setData(Qt.ItemDataRole.UserRole, entry)
+        self._list.setItemWidget(item, row)
 
     def _refresh_list(self) -> None:
         self._list.clear()
-        for entry in reversed(self._log.entries()):
-            item = QListWidgetItem(self._format_item(entry))
-            item.setData(Qt.ItemDataRole.UserRole, entry)
+        for entry in self._sorted_filtered_entries():
+            item = QListWidgetItem()
             self._list.addItem(item)
+            self._install_row(item, entry)
         if self._list.count():
             self._list.setCurrentRow(0)
         else:
@@ -1745,16 +1951,36 @@ class MainPanel(QWidget):
     def _refresh_visible_timestamps(self) -> None:
         for i in range(self._list.count()):
             item = self._list.item(i)
-            entry = item.data(Qt.ItemDataRole.UserRole)
-            if isinstance(entry, dict):
-                item.setText(self._format_item(entry))
+            widget = self._list.itemWidget(item)
+            if isinstance(widget, HistoryRow):
+                widget.refresh()
+
+    def _find_row(self, entry: dict) -> "tuple[QListWidgetItem | None, HistoryRow | None]":
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) is entry:
+                return item, self._list.itemWidget(item)
+        return None, None
 
     def _on_entry_added(self, entry: dict) -> None:
-        item = QListWidgetItem(self._format_item(entry))
-        item.setData(Qt.ItemDataRole.UserRole, entry)
-        self._list.insertItem(0, item)
-        while self._list.count() > self._log.max_entries:
-            self._list.takeItem(self._list.count() - 1)
+        # Re-sort on add: pinned-first ordering means insert is non-trivial.
+        # Cheap to just rebuild for our cap of 500.
+        self._refresh_list()
+
+    def _on_entry_changed(self, entry: dict) -> None:
+        # Pin toggle changes the row's group; re-sort the whole list.
+        self._refresh_list()
+        # Try to re-select the same entry so the detail pane keeps showing it.
+        item, _ = self._find_row(entry)
+        if item is not None:
+            self._list.setCurrentItem(item)
+
+    def _on_entry_removed(self, entry: dict) -> None:
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) is entry:
+                self._list.takeItem(i)
+                break
 
     def _on_selection(self) -> None:
         items = self._list.selectedItems()
@@ -1790,12 +2016,109 @@ class MainPanel(QWidget):
     def _clear_history(self) -> None:
         reply = QMessageBox.question(
             self, "Clear history",
-            "Clear all transcription history? This cannot be undone.",
+            "Clear all transcription history? This cannot be undone.\n\n"
+            "Pinned items will also be removed.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
             self._log.clear()
+
+    # --- per-row actions ------------------------------------------------
+
+    def _on_row_copy(self, entry: dict) -> None:
+        self._copy_to_clipboard(entry.get("text", ""), source="row-copy")
+
+    def _on_row_pin(self, entry: dict) -> None:
+        new_state = self._log.toggle_pin(entry)
+        log_app.info("pin %s for %r", "set" if new_state else "cleared", entry.get("text", "")[:40])
+
+    def _on_row_delete(self, entry: dict) -> None:
+        self._log.delete_entry(entry)
+
+    def _on_row_edit_start(self, entry: dict) -> None:
+        current = entry.get("text", "")
+        new_text, ok = QInputDialog.getMultiLineText(
+            self, "Edit transcription",
+            "Fix typos, then click OK. The edited text replaces the original.",
+            current,
+        )
+        if ok and new_text.strip() and new_text != current:
+            self._log.update_text(entry, new_text)
+
+    def _on_context_menu(self, pos) -> None:
+        item = self._list.itemAt(pos)
+        if item is None:
+            return
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(entry, dict):
+            return
+        menu = QMenu(self)
+
+        copy_act = QAction("Copy", self)
+        copy_act.triggered.connect(lambda: self._copy_to_clipboard(entry.get("text", ""), "ctx-copy"))
+        menu.addAction(copy_act)
+
+        copy_ts_act = QAction("Copy with timestamp", self)
+        def _copy_ts() -> None:
+            ts = entry.get("ts", 0)
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else ""
+            text = entry.get("text", "")
+            self._copy_to_clipboard(f"[{stamp}] {text}" if stamp else text, "ctx-copy-ts")
+        copy_ts_act.triggered.connect(_copy_ts)
+        menu.addAction(copy_ts_act)
+
+        copy_md_act = QAction("Copy as markdown quote", self)
+        def _copy_md() -> None:
+            text = entry.get("text", "")
+            lines = ["> " + ln for ln in text.splitlines() or [""]]
+            self._copy_to_clipboard("\n".join(lines), "ctx-copy-md")
+        copy_md_act.triggered.connect(_copy_md)
+        menu.addAction(copy_md_act)
+
+        menu.addSeparator()
+
+        is_pinned = bool(entry.get("pinned"))
+        pin_act = QAction("Unpin" if is_pinned else "Pin to top", self)
+        pin_act.triggered.connect(lambda: self._log.toggle_pin(entry))
+        menu.addAction(pin_act)
+
+        edit_act = QAction("Edit text…", self)
+        edit_act.triggered.connect(lambda: self._on_row_edit_start(entry))
+        menu.addAction(edit_act)
+
+        menu.addSeparator()
+
+        del_act = QAction("Delete", self)
+        del_act.triggered.connect(lambda: self._log.delete_entry(entry))
+        menu.addAction(del_act)
+
+        menu.exec(self._list.mapToGlobal(pos))
+
+    def eventFilter(self, obj, event) -> bool:
+        """Handle list-level keyboard shortcuts: Enter=copy, Delete=delete,
+        Ctrl+P=pin, Ctrl+F=focus search."""
+        from PyQt6.QtCore import QEvent
+        if obj is self._list and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            mods = event.modifiers()
+            items = self._list.selectedItems()
+            entry = items[0].data(Qt.ItemDataRole.UserRole) if items else None
+            if entry is not None and isinstance(entry, dict):
+                if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    self._copy_to_clipboard(entry.get("text", ""), "key-enter")
+                    return True
+                if key == Qt.Key.Key_Delete:
+                    self._log.delete_entry(entry)
+                    return True
+                if key == Qt.Key.Key_P and mods & Qt.KeyboardModifier.ControlModifier:
+                    self._log.toggle_pin(entry)
+                    return True
+            if key == Qt.Key.Key_F and mods & Qt.KeyboardModifier.ControlModifier:
+                self._search.setFocus()
+                self._search.selectAll()
+                return True
+        return super().eventFilter(obj, event)
 
     # --- settings tab ---------------------------------------------------
 

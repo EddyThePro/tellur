@@ -2,6 +2,39 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] — 2026-05-17
+
+History panel overhaul. Every row now has inline actions; the "select then click the bottom button" friction is gone.
+
+### Added
+
+- **Per-row buttons** on every History entry, always visible:
+  - **★ / ☆** — pin / unpin (pinned items float to the top of the list)
+  - **📋** — copy that transcription to the clipboard
+  - **✕** — delete that transcription
+- **Search/filter box** at the top of the History tab — instant case-insensitive search across every saved transcript. Ctrl+F focuses it.
+- **Pinned section** — starred entries always show at the top, separated from chronological entries. They also survive the 500-entry rolling cap.
+- **Right-click context menu** on any row:
+  - Copy
+  - Copy with timestamp
+  - Copy as markdown quote
+  - Pin / Unpin
+  - Edit text…
+  - Delete
+- **Inline edit** — double-click a row's text to fix typos. The edited text replaces the original (and is flagged with `· edited` in the row's metadata).
+- **Word count** per row (in addition to the time-ago badge).
+- **Keyboard shortcuts** when the History list is focused:
+  - `Enter` — copy the selected row
+  - `Delete` — delete the selected row
+  - `Ctrl+P` — toggle pin on the selected row
+  - `Ctrl+F` — focus the search box
+
+### Changed
+
+- `TranscriptLog` grows three new methods (`toggle_pin`, `delete_entry`, `update_text`) and three new Qt signals (`entry_changed`, `entry_removed`, plus the existing `entry_added` / `cleared`). All persist through the async save thread.
+
+---
+
 ## [1.2.2] — 2026-05-17
 
 Stability release — no new features, but a wide sweep of real and latent bugs caught during a deep audit pass.
