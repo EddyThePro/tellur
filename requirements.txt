@@ -1,0 +1,12 @@
+faster-whisper>=1.0.3
+sounddevice>=0.4.7
+numpy>=1.26,<2.3
+pyperclip>=1.9.0
+keyboard>=0.13.5
+PyQt6>=6.7.0
+
+# CUDA runtime DLLs (Windows) — installed everywhere on Windows for simplicity;
+# they're only loaded when CUDA is actually used, so CPU-only machines just pay
+# the extra disk space.
+nvidia-cublas-cu12; sys_platform == "win32"
+nvidia-cudnn-cu12==9.*; sys_platform == "win32"

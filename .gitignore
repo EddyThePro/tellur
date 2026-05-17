@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tellur runtime artifacts (created at %LOCALAPPDATA%\Tellur by default, but
+# listed here too in case anyone configures TELLUR_HOME to point at the repo)
+logs/
+*.log
+hf-cache/
+history.json
+settings.json
+
+# IDEs / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code state
+.claude/
+
+# Misc
+*.tmp
+build/
+dist/
+*.spec
