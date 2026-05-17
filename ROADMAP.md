@@ -137,8 +137,8 @@ Bigger architectural moves.
 | 1.6.0 | Audio control | ✅ shipped |
 | 1.7.0 | AI post-processing | ✅ shipped |
 | 1.8.0 | Integration & automation | ✅ shipped |
-| **1.9.0** | **Privacy & data management** | ✅ shipped |
-| 2.0 | Power user / extensibility | 🚧 next |
+| 1.9.0 | Privacy & data management | ✅ shipped |
+| **2.0.0** | **Light theme + per-app vocabulary** | ✅ shipped — roadmap complete |
 | 1.7 | AI post-processing | planned |
 | 1.8 | Integration & automation | planned |
 | 1.9 | Privacy & data management | planned |

@@ -336,6 +336,78 @@ def test_hotkey_watcher_modes():
     return "hold/toggle/invalid all behave correctly"
 
 
+def test_theme_palettes_and_qss():
+    """v2.0: both themes are defined and produce non-empty QSS with the
+    expected palette colors substituted."""
+    assert "dark" in t.THEME_PALETTES
+    assert "light" in t.THEME_PALETTES
+    # Each palette must define every key the QSS template references.
+    keys_dark = set(t.THEME_PALETTES["dark"].keys())
+    keys_light = set(t.THEME_PALETTES["light"].keys())
+    assert keys_dark == keys_light, \
+        f"theme palettes diverge: only-in-dark={keys_dark - keys_light}, " \
+        f"only-in-light={keys_light - keys_dark}"
+
+    dark_qss = t.build_panel_qss("dark")
+    light_qss = t.build_panel_qss("light")
+    assert "QWidget#mainPanel" in dark_qss
+    assert "QWidget#mainPanel" in light_qss
+    # The dark bg color should appear in dark_qss only.
+    dark_bg = t.THEME_PALETTES["dark"]["bg"]
+    light_bg = t.THEME_PALETTES["light"]["bg"]
+    assert dark_bg in dark_qss and dark_bg not in light_qss
+    assert light_bg in light_qss and light_bg not in dark_qss
+    # Unknown theme name should fall back to dark, not crash.
+    fallback = t.build_panel_qss("nonexistent-theme")
+    assert dark_bg in fallback
+    return f"{len(keys_dark)} palette keys; dark/light QSS sized {len(dark_qss)}/{len(light_qss)} chars"
+
+
+def test_replacements_per_context_overlay():
+    """v2.0: per-app overlay merges OVER the base dictionary; entries in
+    the overlay win on conflict; missing overlay falls back to base."""
+    base_path = TMPDIR / "replacements-base.json"
+    ctx_dir = TMPDIR / "ctx-replacements"
+    ctx_dir.mkdir(exist_ok=True)
+    base_path.write_text(json.dumps({
+        "pi": "3.14",
+        "todo": "TODO",
+    }), encoding="utf-8")
+    (ctx_dir / "code.json").write_text(json.dumps({
+        "pi": ".py",        # overrides base
+        "tee dee oh": "TODO",
+        "dot py": ".py",
+    }), encoding="utf-8")
+
+    r = t.Replacements(base_path, per_context_dir=ctx_dir)
+    # No context → base rules: "pi" → "3.14"
+    out_base = r.apply("Open pi file", context=None)
+    assert "3.14" in out_base, f"base rule should apply, got {out_base!r}"
+
+    # context=code → overlay: "pi" → ".py", "dot py" → ".py"
+    out_code = r.apply("Open pi file with dot py extension", context="code")
+    assert "3.14" not in out_code, "overlay should override base, but didn't"
+    assert ".py" in out_code, f"code overlay didn't apply, got {out_code!r}"
+
+    # context with no overlay file → silently falls back to base
+    out_unknown = r.apply("pi", context="nonexistent-app")
+    assert "3.14" in out_unknown, f"unknown ctx should fall back to base, got {out_unknown!r}"
+    return "base + overlay merge; overlay wins on conflict; unknown ctx falls back"
+
+
+def test_get_foreground_process_basename():
+    """v2.0: ctypes wrapper returns a string (or None) without crashing."""
+    name = t.get_foreground_process_basename()
+    # On Windows we usually get *something* (e.g., "python" or "pythonw");
+    # on a hypothetical headless run we could get None. Either is OK as long
+    # as we don't crash and the type is correct.
+    assert name is None or isinstance(name, str), f"got {type(name).__name__}"
+    if isinstance(name, str):
+        assert name == name.lower(), "expected lowercased basename"
+        assert "." not in name, f"expected no extension, got {name!r}"
+    return f"foreground process basename = {name!r}"
+
+
 def test_audio_recorder_set_methods():
     """v1.6: AudioRecorder set_device / set_gain don't crash without a mic."""
     rec = t.AudioRecorder()
@@ -370,6 +442,9 @@ if __name__ == "__main__":
     check("LLM prompt registry",                  test_llm_prompt_registry)
     check("HotkeyWatcher: hold/toggle modes",     test_hotkey_watcher_modes)
     check("AudioRecorder: set_device/set_gain",   test_audio_recorder_set_methods)
+    check("theme palettes + build_panel_qss",     test_theme_palettes_and_qss)
+    check("Replacements: per-context overlay",    test_replacements_per_context_overlay)
+    check("foreground process detection",         test_get_foreground_process_basename)
 
     # LLM live test — checks reachability first; reports as SKIP otherwise.
     print()

@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.9.0"
+__version__ = "2.0.0"
 APP_NAME = "Tellur"
 
 
@@ -216,6 +216,7 @@ DATA_DIR = _default_data_dir()
 HISTORY_FILE = DATA_DIR / "history.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_MARKDOWN_DIR = DATA_DIR / "transcripts"   # one .md per day
+PER_CONTEXT_DICT_DIR = DATA_DIR / "replacements.d"  # v2.0 per-app overlays
 MAX_HISTORY_ENTRIES = 500
 
 # logging
@@ -338,14 +339,40 @@ class Replacements:
     case-insensitive, whitespace-tolerant, and word-boundary aware so "pi"
     won't replace inside "pickle". Reloads on the fly when the file's mtime
     changes — no app restart needed.
+
+    Per-context (v2.0): if `per_context_dir` is set, an additional JSON file
+    matching the *active app's executable basename* (e.g. `code.json` for
+    VS Code, `slack.json` for Slack) is overlaid on top of the base rules.
+    Per-app entries WIN on conflict — the base dictionary is the fallback.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, per_context_dir: Path | None = None):
         self.path = path
         self._mtime = 0.0
+        self._raw: dict[str, str] = {}
         self._compiled: list[tuple[re.Pattern, str]] = []
         self._values: list[str] = []
+        # Per-context cache: { context_key: (mtime, compiled, values) }.
+        # Loaded lazily on first apply() with that context.
+        self.per_context_dir = per_context_dir
+        self._ctx_cache: dict[str, tuple[float, list[tuple[re.Pattern, str]], list[str]]] = {}
+        # Last active context — used by `vocab` so hotwords reflect per-app rules too.
+        self._last_context: str | None = None
         self.reload_if_changed()
+
+    @staticmethod
+    def _compile_rules(raw: dict) -> tuple[list[tuple[re.Pattern, str]], list[str]]:
+        items = sorted(raw.items(), key=lambda kv: -len(kv[0]))
+        compiled: list[tuple[re.Pattern, str]] = []
+        for key, val in items:
+            if not isinstance(key, str) or not isinstance(val, str) or not key:
+                continue
+            parts = key.split()
+            body = r"\s+".join(re.escape(p) for p in parts)
+            pat = re.compile(rf"(?<!\w){body}(?!\w)", re.IGNORECASE)
+            compiled.append((pat, val))
+        values = [v for _, v in compiled if v.strip()]
+        return compiled, values
 
     def reload_if_changed(self) -> bool:
         try:
@@ -354,6 +381,7 @@ class Replacements:
             if self._compiled:
                 self._compiled = []
                 self._values = []
+                self._raw = {}
                 self._mtime = 0.0
                 log_repl.warning("%s disappeared; using empty dictionary", self.path.name)
                 return True
@@ -368,38 +396,125 @@ class Replacements:
         if not isinstance(raw, dict):
             log_repl.error("%s must be a JSON object", self.path.name)
             return False
-
-        items = sorted(raw.items(), key=lambda kv: -len(kv[0]))
-        compiled: list[tuple[re.Pattern, str]] = []
-        for key, val in items:
-            if not isinstance(key, str) or not isinstance(val, str) or not key:
-                continue
-            parts = key.split()
-            body = r"\s+".join(re.escape(p) for p in parts)
-            pat = re.compile(rf"(?<!\w){body}(?!\w)", re.IGNORECASE)
-            compiled.append((pat, val))
-        self._compiled = compiled
-        self._values = [v for _, v in compiled if v.strip()]
+        self._raw = {str(k): str(v) for k, v in raw.items()
+                     if isinstance(k, str) and isinstance(v, str)}
+        self._compiled, self._values = self._compile_rules(self._raw)
         self._mtime = m
-        log_repl.info("loaded %d replacement(s) from %s", len(compiled), self.path.name)
+        log_repl.info("loaded %d replacement(s) from %s",
+                      len(self._compiled), self.path.name)
         return True
 
-    def apply(self, text: str) -> str:
+    def _load_context(self, context: str) -> tuple[list[tuple[re.Pattern, str]], list[str]] | None:
+        """Load + compile a per-context overlay if present. Returns the
+        merged-with-base compiled rules or None if no overlay exists.
+        Caches by mtime so repeated dictations don't re-read or re-compile."""
+        if not self.per_context_dir or not context:
+            return None
+        path = self.per_context_dir / f"{context.lower()}.json"
+        try:
+            m = path.stat().st_mtime
+        except FileNotFoundError:
+            self._ctx_cache.pop(context, None)
+            return None
+        cached = self._ctx_cache.get(context)
+        if cached and cached[0] == m:
+            return cached[1], cached[2]
+        try:
+            ctx_raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, OSError):
+            log_repl.exception("failed to load per-context dict %s", path.name)
+            return None
+        if not isinstance(ctx_raw, dict):
+            log_repl.error("%s must be a JSON object", path.name)
+            return None
+        # Merge with base: context wins on conflict.
+        merged = dict(self._raw)
+        for k, v in ctx_raw.items():
+            if isinstance(k, str) and isinstance(v, str):
+                merged[k] = v
+        compiled, values = self._compile_rules(merged)
+        self._ctx_cache[context] = (m, compiled, values)
+        log_repl.info("loaded %d replacement(s) from %s (context=%s, %d total after merge)",
+                      len(ctx_raw), path.name, context, len(compiled))
+        return compiled, values
+
+    def apply(self, text: str, context: str | None = None) -> str:
+        """Apply replacements. If `context` matches a per-app overlay file,
+        merged rules (overlay wins on conflict) apply instead of the base
+        rules only."""
         self.reload_if_changed()
         if not text:
             return text
-        for pat, repl in self._compiled:
+        self._last_context = context
+        compiled = self._compiled
+        if context:
+            ctx_result = self._load_context(context)
+            if ctx_result is not None:
+                compiled = ctx_result[0]
+        for pat, repl in compiled:
             text = pat.sub(repl, text)
         return text
 
     @property
     def vocab(self) -> list[str]:
+        """Vocabulary list used as Whisper hotwords. Reflects the most
+        recently-applied context (if any) so per-app vocab also biases
+        decoding, not just post-processing."""
+        values = self._values
+        if self._last_context:
+            ctx = self._ctx_cache.get(self._last_context)
+            if ctx is not None:
+                values = ctx[2]
         seen, out = set(), []
-        for v in self._values:
+        for v in values:
             if v not in seen:
                 seen.add(v)
                 out.append(v)
         return out
+
+
+def get_foreground_process_basename() -> str | None:
+    """Return the basename (without extension, lowercase) of the executable
+    that owns the current foreground window. Used for per-context vocabulary
+    selection. Windows-only — relies on ctypes Win32 calls. Returns None on
+    any failure rather than raising; callers should treat None as "no
+    context override available"."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return None
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value,
+        )
+        if not handle:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(len(buf))
+            ok = kernel32.QueryFullProcessImageNameW(
+                handle, 0, buf, ctypes.byref(size),
+            )
+            if not ok:
+                return None
+            path = Path(buf.value)
+            return path.stem.lower() or None
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        log_app.debug("foreground-process detection failed", exc_info=True)
+        return None
 
 
 def apply_smart_defaults(text: str) -> str:
@@ -855,6 +970,8 @@ class Settings(QObject):
         # - history_retention_days: 0 = keep forever; >0 = auto-purge older entries
         self.save_history: bool = True
         self.history_retention_days: int = 0
+        # Theme (v2.0) — "dark" or "light".
+        self.theme: str = "dark"
         self._load()
 
     def _load(self) -> None:
@@ -895,6 +1012,10 @@ class Settings(QObject):
                         self.history_retention_days = 0
                     if self.history_retention_days < 0:
                         self.history_retention_days = 0
+                    th = str(data.get("theme", self.theme)).lower()
+                    if th not in ("dark", "light"):
+                        th = "dark"
+                    self.theme = th
                     requested = str(data.get("model_name", self.model_name))
                     valid_names = {m["name"] for m in KNOWN_MODELS}
                     if requested not in valid_names:
@@ -937,6 +1058,7 @@ class Settings(QObject):
             "webhook_template": self.webhook_template,
             "save_history": self.save_history,
             "history_retention_days": self.history_retention_days,
+            "theme": self.theme,
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -2380,137 +2502,226 @@ class TrayIcon(QSystemTrayIcon):
 # ===========================================================================
 # main panel (History + Settings tabs)
 # ===========================================================================
-PANEL_QSS = """
-QWidget#mainPanel {
-    background-color: #1a1b1f;
-    color: #e6e8ee;
+# Theme palettes — every QSS color is sourced from here so the light / dark
+# stylesheets are produced from the same template with different inputs.
+# Keys are stable; values are CSS color literals.
+THEME_PALETTES: dict[str, dict[str, str]] = {
+    "dark": {
+        "bg":              "#1a1b1f",
+        "bg_alt":          "#15161a",
+        "border":          "#2a2b30",
+        "border_strong":   "#3a3b42",
+        "row_hover":       "#20212a",
+        "row_selected":    "#2c3a55",
+        "row_separator":   "#22232a",
+        "text":            "#e6e8ee",
+        "text_strong":     "#ffffff",
+        "text_dim":        "#9a9da6",
+        "text_muted":      "#6a6e78",
+        "text_form_label": "#c0c4cc",
+        "text_header":     "#d8dbe2",
+        "header_underline":"#2b2e36",
+        "btn_bg":          "#2a2b30",
+        "btn_hover":       "#34353c",
+        "btn_pressed":     "#4a4b54",
+        "accent":          "#6080ff",
+        "accent_hover":    "#7a98ff",
+        "accent_selection":"#5078ff",
+        "danger":          "#e07c7c",
+        "success":         "#6bd47b",
+        "icon_btn_hover":  "#2c2d34",
+        "tab_hover":       "#ccd0d8",
+    },
+    "light": {
+        "bg":              "#f7f7fa",
+        "bg_alt":          "#ffffff",
+        "border":          "#d6d8dc",
+        "border_strong":   "#b8bcc4",
+        "row_hover":       "#eef0f6",
+        "row_selected":    "#cdd9ff",
+        "row_separator":   "#e4e6ea",
+        "text":            "#1a1b21",
+        "text_strong":     "#000000",
+        "text_dim":        "#5a5e68",
+        "text_muted":      "#7a7e88",
+        "text_form_label": "#33363c",
+        "text_header":     "#1a1b21",
+        "header_underline":"#d6d8dc",
+        "btn_bg":          "#ffffff",
+        "btn_hover":       "#eef0f6",
+        "btn_pressed":     "#d9dde4",
+        "accent":          "#3057d8",
+        "accent_hover":    "#4068e8",
+        "accent_selection":"#3057d8",
+        "danger":          "#c44a4a",
+        "success":         "#2c8c3b",
+        "icon_btn_hover":  "#dde0e6",
+        "tab_hover":       "#3a3d44",
+    },
+}
+
+
+def build_panel_qss(theme: str) -> str:
+    """Render the panel stylesheet for the named theme. Driven entirely by
+    the THEME_PALETTES dict so adding a new theme is a one-entry addition."""
+    p = THEME_PALETTES.get(theme) or THEME_PALETTES["dark"]
+    return f"""
+QWidget#mainPanel {{
+    background-color: {p['bg']};
+    color: {p['text']};
     font-family: "Segoe UI";
     font-size: 10pt;
-}
-QWidget#mainPanel QLabel { color: #e6e8ee; }
-QWidget#mainPanel QListWidget {
-    background-color: #15161a;
-    border: 1px solid #2a2b30;
+}}
+QWidget#mainPanel QLabel {{ color: {p['text']}; }}
+QWidget#mainPanel QLabel#sectionHeader {{
+    font-weight: 600;
+    color: {p['text_header']};
+    font-size: 10.5pt;
+    padding-top: 4px;
+    padding-bottom: 2px;
+    border-bottom: 1px solid {p['header_underline']};
+}}
+QWidget#mainPanel QLabel#sectionHint {{
+    color: {p['text_muted']};
+    font-size: 9pt;
+}}
+QWidget#mainPanel QLabel#formLabel {{
+    color: {p['text_form_label']};
+}}
+QWidget#mainPanel QLabel#valueDim {{
+    color: {p['text_dim']};
+}}
+QWidget#mainPanel QLabel#footerLabel {{
+    color: {p['text_muted']};
+    font-size: 9pt;
+}}
+QWidget#mainPanel QListWidget {{
+    background-color: {p['bg_alt']};
+    border: 1px solid {p['border']};
     border-radius: 4px;
     outline: 0;
-}
-QWidget#mainPanel QListWidget::item {
-    /* No padding or border at the item level — HistoryRow widget owns the
-       row's visuals. The item only contributes hover and selection
-       backgrounds, which paint through the transparent row. */
+}}
+QWidget#mainPanel QListWidget::item {{
     padding: 0;
     border: none;
-}
-QWidget#mainPanel QListWidget::item:hover { background-color: #20212a; }
-QWidget#mainPanel QListWidget::item:selected {
-    background-color: #2c3a55;
-    color: #ffffff;
-}
-QWidget#mainPanel QPushButton {
-    background-color: #2a2b30;
-    color: #e6e8ee;
-    border: 1px solid #3a3b42;
+}}
+QWidget#mainPanel QListWidget::item:hover {{ background-color: {p['row_hover']}; }}
+QWidget#mainPanel QListWidget::item:selected {{
+    background-color: {p['row_selected']};
+    color: {p['text_strong']};
+}}
+QWidget#mainPanel QPushButton {{
+    background-color: {p['btn_bg']};
+    color: {p['text']};
+    border: 1px solid {p['border_strong']};
     border-radius: 4px;
     padding: 6px 14px;
     min-width: 70px;
-}
-QWidget#mainPanel QPushButton:hover { background-color: #34353c; }
-QWidget#mainPanel QPushButton:pressed { background-color: #4a4b54; }
-QWidget#mainPanel QTextEdit {
-    background-color: #15161a;
-    color: #e6e8ee;
-    border: 1px solid #2a2b30;
+}}
+QWidget#mainPanel QPushButton:hover {{ background-color: {p['btn_hover']}; }}
+QWidget#mainPanel QPushButton:pressed {{ background-color: {p['btn_pressed']}; }}
+QWidget#mainPanel QPushButton#dangerButton {{ color: {p['danger']}; }}
+QWidget#mainPanel QTextEdit {{
+    background-color: {p['bg_alt']};
+    color: {p['text']};
+    border: 1px solid {p['border']};
     border-radius: 4px;
     padding: 8px;
-    selection-background-color: #5078ff;
-}
-QWidget#mainPanel QTabWidget::pane {
+    selection-background-color: {p['accent_selection']};
+    selection-color: {p['text_strong']};
+}}
+QWidget#mainPanel QTabWidget::pane {{
     border: none;
-    background-color: #1a1b1f;
-}
-QWidget#mainPanel QTabBar::tab {
+    background-color: {p['bg']};
+}}
+QWidget#mainPanel QTabBar::tab {{
     background-color: transparent;
-    color: #9a9da6;
+    color: {p['text_dim']};
     padding: 8px 18px;
     border: none;
-}
-QWidget#mainPanel QTabBar::tab:selected {
-    color: #e6e8ee;
-    border-bottom: 2px solid #6080ff;
-}
-QWidget#mainPanel QTabBar::tab:hover:!selected { color: #ccd0d8; }
-QWidget#mainPanel QCheckBox { color: #e6e8ee; spacing: 8px; }
-QWidget#mainPanel QSlider::groove:horizontal {
-    background: #2a2b30; height: 4px; border-radius: 2px;
-}
-QWidget#mainPanel QSlider::handle:horizontal {
-    background: #6080ff; width: 14px; margin: -5px 0; border-radius: 7px;
-}
-QWidget#mainPanel QSlider::handle:horizontal:hover { background: #7a98ff; }
-QWidget#mainPanel QComboBox {
-    background-color: #15161a;
-    color: #e6e8ee;
-    border: 1px solid #2a2b30;
+}}
+QWidget#mainPanel QTabBar::tab:selected {{
+    color: {p['text']};
+    border-bottom: 2px solid {p['accent']};
+}}
+QWidget#mainPanel QTabBar::tab:hover:!selected {{ color: {p['tab_hover']}; }}
+QWidget#mainPanel QCheckBox {{ color: {p['text']}; spacing: 8px; }}
+QWidget#mainPanel QSlider::groove:horizontal {{
+    background: {p['border']}; height: 4px; border-radius: 2px;
+}}
+QWidget#mainPanel QSlider::handle:horizontal {{
+    background: {p['accent']}; width: 14px; margin: -5px 0; border-radius: 7px;
+}}
+QWidget#mainPanel QSlider::handle:horizontal:hover {{ background: {p['accent_hover']}; }}
+QWidget#mainPanel QComboBox {{
+    background-color: {p['bg_alt']};
+    color: {p['text']};
+    border: 1px solid {p['border']};
     border-radius: 4px;
     padding: 4px 8px;
-    selection-background-color: #2c3a55;
-}
-QWidget#mainPanel QComboBox:hover { border: 1px solid #3a3b42; }
-QWidget#mainPanel QComboBox::drop-down { border: none; width: 22px; }
-QWidget#mainPanel QComboBox QAbstractItemView {
-    background-color: #15161a;
-    color: #e6e8ee;
-    border: 1px solid #2a2b30;
-    selection-background-color: #2c3a55;
-    selection-color: #ffffff;
+    selection-background-color: {p['row_selected']};
+}}
+QWidget#mainPanel QComboBox:hover {{ border: 1px solid {p['border_strong']}; }}
+QWidget#mainPanel QComboBox::drop-down {{ border: none; width: 22px; }}
+QWidget#mainPanel QComboBox QAbstractItemView {{
+    background-color: {p['bg_alt']};
+    color: {p['text']};
+    border: 1px solid {p['border']};
+    selection-background-color: {p['row_selected']};
+    selection-color: {p['text_strong']};
     outline: 0;
-}
-QWidget#mainPanel QProgressBar {
-    background-color: #15161a;
-    border: 1px solid #2a2b30;
+}}
+QWidget#mainPanel QProgressBar {{
+    background-color: {p['bg_alt']};
+    border: 1px solid {p['border']};
     border-radius: 4px;
     text-align: center;
-    color: #e6e8ee;
+    color: {p['text']};
     font-size: 9pt;
-}
-QWidget#mainPanel QProgressBar::chunk {
-    background-color: #6080ff;
+}}
+QWidget#mainPanel QProgressBar::chunk {{
+    background-color: {p['accent']};
     border-radius: 3px;
-}
-QWidget#mainPanel QLineEdit {
-    background-color: #15161a;
-    color: #e6e8ee;
-    border: 1px solid #2a2b30;
+}}
+QWidget#mainPanel QLineEdit {{
+    background-color: {p['bg_alt']};
+    color: {p['text']};
+    border: 1px solid {p['border']};
     border-radius: 4px;
     padding: 6px 10px;
-    selection-background-color: #2c3a55;
-}
-QWidget#mainPanel QLineEdit:focus { border: 1px solid #6080ff; }
-QWidget#historyRow {
+    selection-background-color: {p['row_selected']};
+}}
+QWidget#mainPanel QLineEdit:focus {{ border: 1px solid {p['accent']}; }}
+QWidget#historyRow {{
     background-color: transparent;
-    border-bottom: 1px solid #22232a;
-}
-QWidget#historyRow QLabel#historyRowText {
-    color: #e6e8ee;
+    border-bottom: 1px solid {p['row_separator']};
+}}
+QWidget#historyRow QLabel#historyRowText {{
+    color: {p['text']};
     font-size: 10pt;
     background: transparent;
-}
-QWidget#historyRow QLabel#historyRowMeta {
-    color: #6a6e78;
+}}
+QWidget#historyRow QLabel#historyRowMeta {{
+    color: {p['text_muted']};
     font-size: 9pt;
     background: transparent;
-}
-QPushButton#iconButton {
+}}
+QPushButton#iconButton {{
     background: transparent;
     border: none;
     border-radius: 4px;
     padding: 0;
     margin: 0;
-}
-QPushButton#iconButton:hover {
-    background-color: #2c2d34;
-}
+    min-width: 0;
+}}
+QPushButton#iconButton:hover {{
+    background-color: {p['icon_btn_hover']};
+}}
 """
+
+
+# Back-compat alias — old code paths that referenced PANEL_QSS still work.
+PANEL_QSS = build_panel_qss("dark")
 
 
 class ElidedLabel(QLabel):
@@ -2795,7 +3006,12 @@ class MainPanel(QWidget):
         self.setWindowTitle(APP_NAME)
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
-        self.setStyleSheet(PANEL_QSS)
+        self._current_theme = ""  # will be set by _apply_theme
+        self._apply_theme(self._settings.theme)
+        # React to live theme changes (Settings → Appearance dropdown).
+        self._settings.changed.connect(
+            lambda: self._apply_theme(self._settings.theme)
+        )
         # Fixed default size — tabs are independently sized; Settings scrolls
         # internally so it never forces the window taller.
         self.resize(640, 560)
@@ -3116,6 +3332,24 @@ class MainPanel(QWidget):
                 return True
         return super().eventFilter(obj, event)
 
+    def _apply_theme(self, theme: str) -> None:
+        """Swap the panel's stylesheet to the requested theme. Idempotent —
+        a no-op when the theme is already active. Forces a style refresh
+        on every styled descendant so objectName-driven rules re-render."""
+        if theme not in THEME_PALETTES:
+            theme = "dark"
+        if theme == self._current_theme:
+            return
+        self._current_theme = theme
+        self.setStyleSheet(build_panel_qss(theme))
+        # Qt caches polished state per widget — unpolish/polish forces a
+        # re-evaluation of QSS so newly-named objects pick up the new colors
+        # immediately (without this, some labels stay on the prior theme
+        # until they're next interacted with).
+        for w in self.findChildren(QWidget):
+            w.style().unpolish(w)
+            w.style().polish(w)
+
     # --- settings tab ---------------------------------------------------
 
     # Common label width for left-hand labels in form rows. Picked so the
@@ -3125,19 +3359,15 @@ class MainPanel(QWidget):
 
     def _section_header(self, text: str) -> QLabel:
         lbl = QLabel(text)
-        lbl.setStyleSheet(
-            "font-weight: 600; color: #d8dbe2; font-size: 10.5pt; "
-            "padding-top: 4px; padding-bottom: 2px; "
-            "border-bottom: 1px solid #2b2e36;"
-        )
+        lbl.setObjectName("sectionHeader")
         return lbl
 
     def _section_hint(self, text: str, *, rich: bool = False) -> QLabel:
         lbl = QLabel(text)
+        lbl.setObjectName("sectionHint")
         if rich:
             lbl.setTextFormat(Qt.TextFormat.RichText)
         lbl.setWordWrap(True)
-        lbl.setStyleSheet("color: #6a6e78; font-size: 9pt;")
         return lbl
 
     def _form_row(self, label_text: str, control: QWidget) -> QHBoxLayout:
@@ -3147,8 +3377,8 @@ class MainPanel(QWidget):
         row.setSpacing(10)
         row.setContentsMargins(0, 0, 0, 0)
         lbl = QLabel(label_text)
+        lbl.setObjectName("formLabel")
         lbl.setFixedWidth(self._FORM_LABEL_WIDTH)
-        lbl.setStyleSheet("color: #c0c4cc;")
         lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         row.addWidget(lbl)
         # Let the control expand horizontally inside the row.
@@ -3177,6 +3407,20 @@ class MainPanel(QWidget):
         # bit larger to leave room for the vertical scrollbar.
         layout.setContentsMargins(14, 16, 18, 14)
         layout.setSpacing(20)
+
+        # --- appearance section (v2.0) ---
+        appearance_box = QVBoxLayout()
+        appearance_box.setSpacing(10)
+        appearance_box.addWidget(self._section_header("Appearance"))
+        self._theme_combo = _NoWheelComboBox()
+        self._theme_combo.addItem("Dark", userData="dark")
+        self._theme_combo.addItem("Light", userData="light")
+        self._theme_combo.setCurrentIndex(
+            0 if self._settings.theme == "dark" else 1
+        )
+        self._theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        appearance_box.addLayout(self._form_row("Theme", self._theme_combo))
+        layout.addLayout(appearance_box)
 
         # --- general toggles section ---
         gen_box = QVBoxLayout()
@@ -3261,7 +3505,7 @@ class MainPanel(QWidget):
         self._gain_slider.valueChanged.connect(self._on_gain_changed)
         self._gain_label = QLabel(f"{self._settings.input_gain:.2f}x")
         self._gain_label.setFixedWidth(56)
-        self._gain_label.setStyleSheet("color: #9a9da6;")
+        self._gain_label.setObjectName("valueDim")
         gain_widget = QWidget()
         gain_inner = QHBoxLayout(gain_widget)
         gain_inner.setContentsMargins(0, 0, 0, 0)
@@ -3286,7 +3530,7 @@ class MainPanel(QWidget):
         self._sens_slider.valueChanged.connect(self._on_sens_changed)
         self._sens_label = QLabel(str(int(self._settings.sensitivity)))
         self._sens_label.setFixedWidth(40)
-        self._sens_label.setStyleSheet("color: #9a9da6;")
+        self._sens_label.setObjectName("valueDim")
         sens_widget = QWidget()
         sens_inner = QHBoxLayout(sens_widget)
         sens_inner.setContentsMargins(0, 0, 0, 0)
@@ -3314,7 +3558,7 @@ class MainPanel(QWidget):
         model_box.addWidget(self._model_combo)
 
         self._model_status = QLabel(f"Active: {self._settings.model_name}")
-        self._model_status.setStyleSheet("color: #9a9da6;")
+        self._model_status.setObjectName("valueDim")
         model_box.addWidget(self._model_status)
 
         self._model_progress = QProgressBar()
@@ -3383,7 +3627,7 @@ class MainPanel(QWidget):
         self._llm_test_btn.clicked.connect(self._on_llm_test_clicked)
         test_row.addWidget(self._llm_test_btn)
         self._llm_test_status = QLabel("")
-        self._llm_test_status.setStyleSheet("color: #9a9da6;")
+        self._llm_test_status.setObjectName("valueDim")
         test_row.addWidget(self._llm_test_status, stretch=1)
         llm_box.addLayout(test_row)
 
@@ -3487,7 +3731,7 @@ class MainPanel(QWidget):
         self._retention_slider.valueChanged.connect(self._on_retention_changed)
         self._retention_label = QLabel(self._format_retention(self._settings.history_retention_days))
         self._retention_label.setFixedWidth(110)
-        self._retention_label.setStyleSheet("color: #9a9da6;")
+        self._retention_label.setObjectName("valueDim")
         retention_row.addWidget(self._retention_slider, stretch=1)
         retention_row.addWidget(self._retention_label)
         priv_box.addLayout(self._form_row("Auto-delete after", retention_widget))
@@ -3515,7 +3759,7 @@ class MainPanel(QWidget):
         self._clear_all_btn.setToolTip(
             "Wipe history.json AND your replacements dictionary. settings.json is kept."
         )
-        self._clear_all_btn.setStyleSheet("color: #e07c7c;")
+        self._clear_all_btn.setObjectName("dangerButton")
         self._clear_all_btn.clicked.connect(self._on_clear_all_clicked)
         clear_row.addWidget(self._clear_all_btn)
         clear_row.addStretch()
@@ -3530,6 +3774,41 @@ class MainPanel(QWidget):
 
         layout.addLayout(priv_box)
 
+        # --- per-context vocabulary section (v2.0) ---
+        ctx_box = QVBoxLayout()
+        ctx_box.setSpacing(10)
+        ctx_box.addWidget(self._section_header("Per-app vocabulary"))
+        ctx_box.addWidget(self._section_hint(
+            "Drop a JSON file named after an app's executable into "
+            "<code>replacements.d/</code> to swap in a tailored dictionary "
+            "whenever that app is the foreground window. "
+            "Example: <code>code.json</code> wins when VS Code is focused, "
+            "<code>slack.json</code> wins when Slack is. Entries merge with "
+            "your base <code>replacements.json</code>; per-app entries win "
+            "on conflict. Same JSON format as the main dictionary."
+        , rich=True))
+
+        ctx_actions = QHBoxLayout()
+        ctx_actions.setSpacing(8)
+        self._open_ctx_dir_btn = QPushButton("Open per-app folder")
+        self._open_ctx_dir_btn.clicked.connect(self._on_open_ctx_dir_clicked)
+        ctx_actions.addWidget(self._open_ctx_dir_btn)
+        self._show_ctx_btn = QPushButton("Show current app")
+        self._show_ctx_btn.setToolTip(
+            "Identify the foreground window's process name (use this to know "
+            "what to name your JSON file)."
+        )
+        self._show_ctx_btn.clicked.connect(self._on_show_ctx_clicked)
+        ctx_actions.addWidget(self._show_ctx_btn)
+        ctx_actions.addStretch()
+        ctx_box.addLayout(ctx_actions)
+
+        self._ctx_status = QLabel("")
+        self._ctx_status.setObjectName("valueDim")
+        ctx_box.addWidget(self._ctx_status)
+
+        layout.addLayout(ctx_box)
+
         # --- software updates section ---
         if self._updater is not None:
             update_box = QVBoxLayout()
@@ -3539,7 +3818,7 @@ class MainPanel(QWidget):
             row = QHBoxLayout()
             row.setSpacing(10)
             self._update_status = QLabel(f"Tellur {__version__} — checking for updates…")
-            self._update_status.setStyleSheet("color: #9a9da6;")
+            self._update_status.setObjectName("valueDim")
             self._update_status.setWordWrap(True)
             row.addWidget(self._update_status, stretch=1)
 
@@ -3559,7 +3838,7 @@ class MainPanel(QWidget):
             f"{APP_NAME} {__version__}  ·  Ctrl+Win to talk  ·  Esc cancel  ·  "
             f"Ctrl+Win+B re-paste  ·  Ctrl+Win+L AI prompt  ·  Ctrl+Win+Q quit"
         )
-        footer.setStyleSheet("color: #6a6e78; font-size: 9pt;")
+        footer.setObjectName("footerLabel")
         footer.setWordWrap(True)
         layout.addWidget(footer)
 
@@ -3635,7 +3914,9 @@ class MainPanel(QWidget):
     def _on_llm_test_clicked(self) -> None:
         self._llm_test_btn.setEnabled(False)
         self._llm_test_status.setText("Testing…")
-        self._llm_test_status.setStyleSheet("color: #9a9da6;")
+        # Clear any green/red inline style from a previous run so the
+        # objectName-driven QSS (theme-aware dim color) takes effect.
+        self._llm_test_status.setStyleSheet("")
 
         # Run in a worker thread so the UI doesn't freeze on slow endpoints.
         def worker():
@@ -3668,10 +3949,21 @@ class MainPanel(QWidget):
     def _set_llm_test_result(self, ok: bool, message: str) -> None:
         self._llm_test_btn.setEnabled(True)
         self._llm_test_status.setText(message)
-        if ok:
-            self._llm_test_status.setStyleSheet("color: #6bd47b;")
-        else:
-            self._llm_test_status.setStyleSheet("color: #e07c7c;")
+        # Source the color from the current theme palette so success/fail
+        # contrast properly against both light and dark backgrounds.
+        palette = THEME_PALETTES.get(self._settings.theme) or THEME_PALETTES["dark"]
+        color = palette["success"] if ok else palette["danger"]
+        self._llm_test_status.setStyleSheet(f"color: {color};")
+
+    # --- appearance handler --------------------------------------------
+
+    def _on_theme_changed(self, _idx: int) -> None:
+        new_theme = self._theme_combo.currentData() or "dark"
+        if new_theme == self._settings.theme:
+            return
+        self._settings.theme = new_theme
+        self._settings.save()  # emits `changed` → _apply_theme via connection
+        log_app.info("theme -> %s", new_theme)
 
     # --- privacy & data management handlers ----------------------------
 
@@ -3822,6 +4114,36 @@ class MainPanel(QWidget):
             self, "Cleared",
             "History and dictionary cleared. Settings retained.",
         )
+
+    # --- per-context vocabulary handlers -------------------------------
+
+    def _on_open_ctx_dir_clicked(self) -> None:
+        try:
+            PER_CONTEXT_DICT_DIR.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(PER_CONTEXT_DICT_DIR))  # noqa: SLF001
+        except Exception:
+            log_app.exception("failed to open per-context folder")
+
+    def _on_show_ctx_clicked(self) -> None:
+        ctx = get_foreground_process_basename()
+        if ctx is None:
+            self._ctx_status.setText(
+                "Couldn't identify the foreground app — try clicking somewhere "
+                "outside Tellur first, then come back and click this button."
+            )
+            return
+        existing = PER_CONTEXT_DICT_DIR / f"{ctx}.json"
+        if existing.exists():
+            self._ctx_status.setText(
+                f"Foreground app: <b>{ctx}</b> — overlay file already exists "
+                f"at <code>{existing.name}</code>."
+            )
+        else:
+            self._ctx_status.setText(
+                f"Foreground app: <b>{ctx}</b> — create "
+                f"<code>{ctx}.json</code> in the per-app folder to add an overlay."
+            )
+        self._ctx_status.setTextFormat(Qt.TextFormat.RichText)
 
     # --- integration & automation handlers -----------------------------
 
@@ -4100,7 +4422,15 @@ class App(QObject):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.settings = Settings(SETTINGS_FILE)
         self.log = TranscriptLog(HISTORY_FILE)
-        self.replacements = Replacements(here / REPLACEMENTS_FILE)
+        self.replacements = Replacements(
+            here / REPLACEMENTS_FILE,
+            per_context_dir=PER_CONTEXT_DICT_DIR,
+        )
+        # Per-context vocabulary (v2.0): captured on hotkey press so the
+        # foreground app at the start of the recording is what gets matched
+        # — by the time transcription finishes the user may have switched
+        # windows.
+        self._current_context: str | None = None
         self.voice_commands = VoiceCommandProcessor()
         self.updater = Updater(self.install_dir)
 
@@ -4427,7 +4757,12 @@ class App(QObject):
         gen = self._bump_gen()
         # Reset the per-recording cancel flag; Esc during this session will set it.
         self._cancel_current_recording = False
-        log_hotkey.debug("press (gen=%d, mode=%s)", gen, self.settings.hotkey_mode)
+        # Capture the foreground app NOW so per-context vocab matches what the
+        # user is actually dictating into — by the time transcription returns
+        # they may have switched windows.
+        self._current_context = get_foreground_process_basename()
+        log_hotkey.debug("press (gen=%d, mode=%s, context=%s)",
+                         gen, self.settings.hotkey_mode, self._current_context)
         try:
             self.recorder.start()
         except Exception:
@@ -4607,7 +4942,7 @@ class App(QObject):
                 self.ui_state.emit("idle")
             return
 
-        text = self.replacements.apply(raw)
+        text = self.replacements.apply(raw, context=self._current_context)
         if self.settings.voice_commands:
             before_vc = text
             text = self.voice_commands.process(text)

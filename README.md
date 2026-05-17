@@ -74,11 +74,12 @@ Closing the main window only hides it — only **Quit** actually exits the app.
 
 ## Personalizing transcription
 
-Three layers steer Whisper toward your vocabulary, all with effectively zero performance cost:
+Four layers steer Whisper toward your vocabulary, all with effectively zero performance cost:
 
 1. **Custom dictionary** — `replacements.json` next to `tellur.py`. A flat `{"wrong": "right"}` map. Matching is case-insensitive, whitespace-tolerant, and word-boundary aware (so `pi` won't replace inside `pickle`). Live-reloaded on every transcription.
-2. **Whisper `initial_prompt`** — your most recent transcript plus your dictionary values are fed back as context, so the model gets steered toward your vocabulary over a session.
-3. **Hotwords** — the same vocab is passed as faster-whisper's `hotwords` attention bias.
+2. **Per-app vocabulary overlays** (v2.0) — drop additional JSON files into `<TELLUR_HOME>\replacements.d\` named after an app's executable (`code.json`, `slack.json`, etc.). When that app is the foreground window, its rules merge on top of the base dictionary (per-app wins on conflict). Manage via Settings → Per-app vocabulary.
+3. **Whisper `initial_prompt`** — your most recent transcript plus your dictionary values are fed back as context, so the model gets steered toward your vocabulary over a session.
+4. **Hotwords** — the same vocab is passed as faster-whisper's `hotwords` attention bias.
 
 ### Editing the dictionary from the CLI
 

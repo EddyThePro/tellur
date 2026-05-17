@@ -2,6 +2,42 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] — 2026-05-17
+
+**Phase 8 — the v2.0 finale.** Two quality-of-life features close out the roadmap: a light/dark theme toggle, and per-app vocabulary overlays.
+
+### Light theme
+
+- **Settings → Appearance → Theme** dropdown: pick **Dark** (default) or **Light**. Applies instantly, persists across restarts, restyles the entire main window (list, buttons, combos, sliders, tabs, form labels, hints, section headers — everything).
+- Under the hood, both themes are rendered from a single QSS template fed by a `THEME_PALETTES` color dictionary, so adding a new theme is a one-entry change.
+- All inline label colors were refactored to `objectName`-driven QSS rules (`#sectionHeader`, `#sectionHint`, `#formLabel`, `#valueDim`, `#footerLabel`, `#dangerButton`) so a single `setStyleSheet` swap covers every label without iterating through the widget tree.
+- The LLM "Test connection" success/fail color now reads from the active palette so it stays readable in both themes.
+
+### Per-app vocabulary overlays
+
+- Drop a JSON file into `<TELLUR_HOME>\replacements.d\` named after an app's executable basename (`code.json`, `slack.json`, `discord.json`, `chrome.json`, etc.). Whenever that app is the foreground window, its entries merge into your base `replacements.json` — per-app entries win on conflict, base entries are the fallback.
+- The foreground app is captured on the hotkey **press** (via Win32 `GetForegroundWindow` + `QueryFullProcessImageNameW` through ctypes), not on release, so per-context vocab matches what you're actually dictating *into* — even if you tab away while Whisper finishes.
+- Same JSON format as the main dictionary; mtime-cached so repeated dictations don't re-read or re-compile the overlay.
+- Per-app vocab also drives Whisper's `hotwords` attention bias for that session, so the model is biased toward the right vocabulary during decode — not just patched after the fact.
+- **Settings → Per-app vocabulary** gives you:
+  - **Open per-app folder** — drops you in `replacements.d\` in Explorer
+  - **Show current app** — reports the foreground process's basename so you know exactly what to name the file
+  - Inline docs explaining the merge order
+
+### Under the hood
+
+- New `THEME_PALETTES` dict + `build_panel_qss(theme)` function — single source of truth for theme colors.
+- New `Replacements.per_context_dir` parameter, internal context-cache (mtime-keyed), and `apply(text, context=...)` signature. The `vocab` property tracks the last context too, so hotwords reflect per-app rules.
+- New module-level helper `get_foreground_process_basename()` — returns lowercase executable basename without extension, `None` on any failure. Pure-stdlib (`ctypes`), Windows-only.
+- New `PER_CONTEXT_DICT_DIR = <DATA_DIR>/replacements.d`.
+- One new setting field: `theme` (`"dark"` | `"light"`, default `"dark"`).
+
+### Roadmap closeout
+
+This ships the last planned milestone. Tellur is now feature-complete against its v1.0 roadmap: push-to-talk dictation, model picker, in-app updates, voice commands, modes & hotkey flexibility, audio control, AI post-processing, integration & automation, privacy & data management, and now theme + per-app vocab.
+
+---
+
 ## [1.9.0] — 2026-05-17
 
 **Phase 7 of the roadmap — privacy & data management.** A new "Privacy & data" section in Settings gives you full control over what gets written to disk, how long it sticks around, how to get it out, and how to wipe it.
