@@ -9,8 +9,24 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 APP_NAME = "Tellur"
+
+
+# ===========================================================================
+# stderr/stdout fix MUST run BEFORE any third-party imports.
+# Under pythonw.exe, sys.stderr and sys.stdout are None. Libraries that try
+# to write progress / warnings at import time (tqdm via huggingface_hub is
+# the main offender) crash with AttributeError: 'NoneType' has no 'write'.
+# Give them a silent sink so import-time writes are discarded harmlessly.
+# ===========================================================================
+import io
+import sys
+
+if sys.stderr is None:
+    sys.stderr = io.StringIO()
+if sys.stdout is None:
+    sys.stdout = io.StringIO()
 
 
 # ===========================================================================
@@ -18,6 +34,7 @@ APP_NAME = "Tellur"
 # ===========================================================================
 import argparse
 import inspect
+import itertools
 import json
 import logging
 import logging.handlers
@@ -26,7 +43,6 @@ import queue
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -113,6 +129,7 @@ KNOWN_MODELS: list[dict] = [
 # audio
 SAMPLE_RATE = 16000
 MIN_AUDIO_SECONDS = 0.25
+MAX_RECORDING_SECONDS = 300   # 5 minutes — hard cap to prevent unbounded RAM
 
 # hotkey
 HOTKEY_POLL_MS = 20
@@ -149,6 +166,7 @@ UPDATE_REPO = "EddyThePro/tellur"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_TIMEOUT_SEC = 6
 UPDATE_HELPER_PARENT_WAIT_SEC = 30
+UPDATE_MAX_ZIP_BYTES = 250 * 1024 * 1024   # refuse any release zip > 250 MB
 
 # branding — the logo PNG ships next to tellur.py. Used for window icon,
 # taskbar, alt-tab. The tray icon is intentionally a separate, simpler
@@ -339,7 +357,7 @@ class Replacements:
         if m == self._mtime:
             return False
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except (json.JSONDecodeError, OSError):
             log_repl.exception("failed to load %s", self.path.name)
             return False
@@ -397,12 +415,21 @@ class TranscriptLog(QObject):
         self.max_entries = max_entries
         self._entries: list[dict] = []
         self._lock = threading.Lock()
+        # Single dedicated saver thread fed by a queue. Each add() enqueues a
+        # snapshot; the saver coalesces (only the most-recent snapshot is
+        # actually written) so a burst of rapid dictations doesn't fan out
+        # into N concurrent writers racing on the same .tmp filename.
+        self._save_queue: "queue.Queue[list[dict] | None]" = queue.Queue()
+        self._saver_thread = threading.Thread(
+            target=self._save_worker, daemon=True, name="history-saver",
+        )
+        self._saver_thread.start()
         self._load()
 
     def _load(self) -> None:
         try:
             if self.path.exists():
-                data = json.loads(self.path.read_text(encoding="utf-8"))
+                data = json.loads(self.path.read_text(encoding="utf-8-sig"))
                 if isinstance(data, list):
                     self._entries = [
                         e for e in data
@@ -413,20 +440,39 @@ class TranscriptLog(QObject):
         except Exception:
             log_app.exception("failed to load %s", self.path.name)
 
-    def _save_async(self) -> None:
-        snapshot = list(self._entries)
-        def _w():
+    def _save_worker(self) -> None:
+        """Drain the save queue. If multiple snapshots are queued, only the
+        latest is actually written (coalescing) — saves us redundant disk I/O
+        when dictations are bursty."""
+        while True:
+            snap = self._save_queue.get()
+            if snap is None:
+                return  # shutdown signal (currently unused; daemon dies with proc)
+            # Coalesce: drain any newer snapshots that landed while waiting.
+            while True:
+                try:
+                    newer = self._save_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if newer is None:
+                    return
+                snap = newer
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self.path.with_suffix(self.path.suffix + ".tmp")
                 tmp.write_text(
-                    json.dumps(snapshot, ensure_ascii=False, indent=2),
+                    json.dumps(snap, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
                 tmp.replace(self.path)
             except Exception:
                 log_app.exception("failed to save history")
-        threading.Thread(target=_w, daemon=True, name="history-save").start()
+
+    def _save_async(self) -> None:
+        # Snapshot under the lock so we can't race a concurrent mutation.
+        with self._lock:
+            snapshot = list(self._entries)
+        self._save_queue.put(snapshot)
 
     def add(self, text: str, raw: str | None = None) -> dict | None:
         text = (text or "").strip()
@@ -481,11 +527,20 @@ class Settings(QObject):
     def _load(self) -> None:
         try:
             if self.path.exists():
-                data = json.loads(self.path.read_text(encoding="utf-8"))
+                data = json.loads(self.path.read_text(encoding="utf-8-sig"))
                 if isinstance(data, dict):
                     self.auto_paste = bool(data.get("auto_paste", self.auto_paste))
                     self.sensitivity = float(data.get("sensitivity", self.sensitivity))
-                    self.model_name = str(data.get("model_name", self.model_name))
+                    requested = str(data.get("model_name", self.model_name))
+                    valid_names = {m["name"] for m in KNOWN_MODELS}
+                    if requested not in valid_names:
+                        log_app.warning(
+                            "settings.json has unknown model_name %r; "
+                            "falling back to %s",
+                            requested, DEFAULT_MODEL,
+                        )
+                        requested = DEFAULT_MODEL
+                    self.model_name = requested
                     log_app.info(
                         "loaded settings: auto_paste=%s sensitivity=%.1f model=%s",
                         self.auto_paste, self.sensitivity, self.model_name,
@@ -638,16 +693,23 @@ class AudioRecorder:
     def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
         self._frames: list[np.ndarray] = []
+        self._sample_count = 0
+        self._max_samples = int(MAX_RECORDING_SECONDS * sample_rate)
         self._stream: sd.InputStream | None = None
         self._level = 0.0
 
     def _callback(self, indata, _frames, _time_info, _status) -> None:
         chunk = indata.copy().reshape(-1).astype(np.float32)
+        # Hard cap to prevent unbounded RAM growth on a stuck-down hotkey.
+        if self._sample_count + chunk.size > self._max_samples:
+            return  # silently drop further audio
         self._frames.append(chunk)
+        self._sample_count += chunk.size
         self._level = float(np.sqrt(np.mean(chunk * chunk)))
 
     def start(self) -> None:
         self._frames = []
+        self._sample_count = 0
         self._level = 0.0
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
@@ -691,7 +753,16 @@ class WhisperEngine:
         self.device = PREFERRED_DEVICE
         self.compute_type = CUDA_COMPUTE_TYPE
         self._model: WhisperModel | None = None
-        self._lock = threading.Lock()
+        # Two locks with distinct responsibilities:
+        #   _state_lock — short critical section for reading/swapping the
+        #                 self._model reference and adjacent flags. Also held
+        #                 during transcribe() so a concurrent switch can't
+        #                 tear down the model mid-decode.
+        #   _build_lock — serializes the (potentially multi-minute) builds.
+        #                 Held during _build_model, NEVER held during the swap
+        #                 or during transcribe.
+        self._state_lock = threading.Lock()
+        self._build_lock = threading.Lock()
         self._supports_hotwords = False
 
     def _build_model(self, name: str) -> tuple["WhisperModel", str, str]:
@@ -714,36 +785,54 @@ class WhisperEngine:
             return False
 
     def load(self) -> WhisperModel:
-        with self._lock:
+        # Fast path: already loaded.
+        with self._state_lock:
             if self._model is not None:
                 return self._model
+        # Serialize with any concurrent build (warm-up vs. user switch race).
+        with self._build_lock:
+            with self._state_lock:
+                if self._model is not None:
+                    return self._model  # another builder beat us to it
             t0 = time.monotonic()
-            self._model, self.device, self.compute_type = self._build_model(self.name)
-            self._supports_hotwords = self._detect_hotwords_support(self._model)
+            new_model, dev, ct = self._build_model(self.name)
+            supports = self._detect_hotwords_support(new_model)
+            with self._state_lock:
+                self._model = new_model
+                self.device = dev
+                self.compute_type = ct
+                self._supports_hotwords = supports
             log_engine.info(
                 "model loaded name=%s device=%s compute=%s hotwords=%s in %.2fs",
-                self.name, self.device, self.compute_type,
-                self._supports_hotwords, time.monotonic() - t0,
+                self.name, dev, ct, supports, time.monotonic() - t0,
             )
-            return self._model
+            return new_model
 
     def switch_to(self, name: str) -> None:
         """Swap to a different model. Blocks until loaded (and downloaded, if
-        not cached). Raises on failure. The build happens OUTSIDE the lock so
-        in-flight transcribe calls aren't blocked during a multi-minute
-        download; only the brief reference swap holds the lock."""
-        if name == self.name and self._model is not None:
-            return
+        not cached). The build runs under _build_lock (so a concurrent load()
+        or switch_to() waits) but NOT under _state_lock (so in-flight
+        transcribe()s aren't blocked during a multi-minute download). Only the
+        brief reference swap takes _state_lock."""
+        with self._state_lock:
+            if name == self.name and self._model is not None:
+                return
         log_engine.info("switching model: %s -> %s", self.name, name)
         t0 = time.monotonic()
-        new_model, dev, ct = self._build_model(name)
-        supports_hotwords = self._detect_hotwords_support(new_model)
-        with self._lock:
-            self._model = new_model
-            self.name = name
-            self.device = dev
-            self.compute_type = ct
-            self._supports_hotwords = supports_hotwords
+        with self._build_lock:
+            # Re-check under build_lock: another switch may have already
+            # landed the same model while we waited.
+            with self._state_lock:
+                if name == self.name and self._model is not None:
+                    return
+            new_model, dev, ct = self._build_model(name)
+            supports = self._detect_hotwords_support(new_model)
+            with self._state_lock:
+                self._model = new_model
+                self.name = name
+                self.device = dev
+                self.compute_type = ct
+                self._supports_hotwords = supports
         log_engine.info("model switched to %s (%s/%s) in %.2fs",
                         name, dev, ct, time.monotonic() - t0)
 
@@ -756,27 +845,36 @@ class WhisperEngine:
         if audio.size < int(SAMPLE_RATE * MIN_AUDIO_SECONDS):
             log_engine.debug("audio too short (%d samples); skipping", audio.size)
             return ""
-        model = self.load()
-        kwargs = dict(
-            language=LANGUAGE,
-            beam_size=BEAM_SIZE,
-            no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
-            repetition_penalty=REPETITION_PENALTY,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 250},
-            condition_on_previous_text=False,
-            initial_prompt=initial_prompt,
-        )
-        if self._supports_hotwords and hotwords:
-            kwargs["hotwords"] = hotwords
-        t0 = time.monotonic()
-        segments, _info = model.transcribe(audio, **kwargs)
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-        log_engine.info(
-            "transcribed audio=%.2fs in %.0fms text=%r",
-            audio.size / SAMPLE_RATE, (time.monotonic() - t0) * 1000, text,
-        )
-        return text
+        # Ensure a model is loaded (may take minutes on first run).
+        self.load()
+        # Hold _state_lock for the entire decode so a switch_to() can't tear
+        # the model down mid-call. The lock is microseconds compared to the
+        # decode itself, but it correctly serializes against the swap.
+        with self._state_lock:
+            model = self._model
+            supports_hotwords = self._supports_hotwords
+            if model is None:
+                return ""
+            kwargs = dict(
+                language=LANGUAGE,
+                beam_size=BEAM_SIZE,
+                no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
+                repetition_penalty=REPETITION_PENALTY,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 250},
+                condition_on_previous_text=False,
+                initial_prompt=initial_prompt,
+            )
+            if supports_hotwords and hotwords:
+                kwargs["hotwords"] = hotwords
+            t0 = time.monotonic()
+            segments, _info = model.transcribe(audio, **kwargs)
+            text = " ".join(seg.text.strip() for seg in segments).strip()
+            log_engine.info(
+                "transcribed audio=%.2fs in %.0fms text=%r",
+                audio.size / SAMPLE_RATE, (time.monotonic() - t0) * 1000, text,
+            )
+            return text
 
 
 # ===========================================================================
@@ -796,25 +894,39 @@ class TextInjector:
     def paste(self, text: str) -> None:
         if not text:
             return
+        # Track whether THIS call was the one that populated _saved, so that if
+        # we abort early we can roll it back (otherwise the user's clipboard
+        # gets permanently stuck under our _saved).
+        we_set_saved = False
         with self._lock:
             if self._saved is None:
                 try:
                     self._saved = pyperclip.paste()
+                    we_set_saved = True
                 except Exception:
                     log_paste.debug("clipboard read failed", exc_info=True)
             self._gen += 1
             my_gen = self._gen
 
+        def _abort_clear() -> None:
+            if we_set_saved:
+                with self._lock:
+                    # Only clear if no newer paste has populated it.
+                    if self._gen == my_gen:
+                        self._saved = None
+
         try:
             pyperclip.copy(text)
         except Exception:
             log_paste.exception("clipboard copy failed")
+            _abort_clear()
             return
         time.sleep(PASTE_KEYSTROKE_DELAY_SEC)
         try:
             keyboard.send("ctrl+v")
         except Exception:
             log_paste.exception("paste keystroke failed")
+            _abort_clear()
             return
         log_paste.debug("pasted %d chars", len(text))
 
@@ -905,6 +1017,13 @@ class Overlay(QWidget):
         self._anim.start(33)
         self._position()
 
+        # Re-position if the user changes their primary monitor while the
+        # app is running, so the overlay doesn't end up on a screen that
+        # no longer exists.
+        guiapp = QGuiApplication.instance()
+        if guiapp is not None:
+            guiapp.primaryScreenChanged.connect(lambda _s: self._position())
+
     def set_scale(self, scale: float) -> None:
         self._scale = max(1.0, float(scale))
         if self._state == "recording":
@@ -980,23 +1099,34 @@ class Overlay(QWidget):
 log_update = logging.getLogger("update")
 
 
-def _version_tuple(v: str) -> tuple:
-    """Parse a SemVer-ish version string to a comparable tuple. Non-numeric
-    parts are treated as -1 so pre-release suffixes sort below releases."""
-    parts: list[int] = []
-    for chunk in (v or "").lstrip("v").split("."):
-        try:
-            parts.append(int(chunk))
-        except ValueError:
-            # strip non-digits, fall back to 0
-            digits = "".join(c for c in chunk if c.isdigit())
-            parts.append(int(digits) if digits else 0)
-    return tuple(parts)
+def _is_newer_version(remote: str, local: str) -> bool:
+    """True if `remote` represents a strictly newer version than `local`.
+    Uses packaging.version so pre-release suffixes (1.2.0-rc1) sort correctly
+    BELOW the matching release. Falls back to a naive tuple comparison if
+    packaging.version is unavailable for any reason."""
+    remote = (remote or "").lstrip("v")
+    local = (local or "").lstrip("v")
+    try:
+        from packaging.version import Version
+        return Version(remote) > Version(local)
+    except Exception:
+        def _parts(v: str) -> tuple:
+            out: list[int] = []
+            for chunk in v.split("."):
+                digits = "".join(c for c in chunk if c.isdigit())
+                out.append(int(digits) if digits else 0)
+            return tuple(out)
+        return _parts(remote) > _parts(local)
 
 
 def _pid_alive(pid: int) -> bool:
     """Return True iff a process with the given PID is currently running.
-    Used by the update helper to know when the old app has fully exited."""
+    Used by the update helper to know when the old app has fully exited.
+
+    Uses WaitForSingleObject(handle, 0) on Windows rather than GetExitCodeProcess,
+    because the latter returns STILL_ACTIVE (259) — which is also a legitimate
+    exit code, so a process that exited with code 259 would look "alive".
+    """
     if sys.platform != "win32":
         try:
             os.kill(pid, 0)
@@ -1005,20 +1135,19 @@ def _pid_alive(pid: int) -> bool:
             return False
     try:
         import ctypes
-        from ctypes import wintypes
     except Exception:
         return False
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    STILL_ACTIVE = 259
-    h = ctypes.windll.kernel32.OpenProcess(
-        PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
-    )
+    PROCESS_SYNCHRONIZE = 0x00100000
+    WAIT_OBJECT_0 = 0   # signaled — process has exited
+    WAIT_TIMEOUT = 0x102
+    h = ctypes.windll.kernel32.OpenProcess(PROCESS_SYNCHRONIZE, False, pid)
     if not h:
+        # OpenProcess fails when the PID doesn't exist OR when we lack
+        # permissions; treat both as "not alive" (correct for our parent).
         return False
     try:
-        code = wintypes.DWORD()
-        ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
-        return code.value == STILL_ACTIVE
+        result = ctypes.windll.kernel32.WaitForSingleObject(h, 0)
+        return result == WAIT_TIMEOUT  # still running == not signaled
     finally:
         ctypes.windll.kernel32.CloseHandle(h)
 
@@ -1048,9 +1177,7 @@ def check_for_update() -> dict | None:
     tag = (data.get("tag_name") or "").strip()
     if not tag:
         return None
-    remote_v = _version_tuple(tag)
-    local_v = _version_tuple(__version__)
-    if remote_v <= local_v:
+    if not _is_newer_version(tag, __version__):
         log_update.info("on latest version (%s)", __version__)
         return None
 
@@ -1103,9 +1230,10 @@ def _spawn_update_helper(zip_path: Path, install_dir: Path) -> None:
     log_update.info("spawned update helper for %s", zip_path)
 
 
-# Files in the install dir we should NOT overwrite during update because the
-# user may have customized them. Their data (settings.json / history.json /
-# logs) lives in TELLUR_HOME, not the install dir, so they're not at risk.
+# Relative paths in the install dir we should NOT overwrite during update —
+# user may have customized them. Matched against the POSIX-style relative
+# path from the unpacked archive root, not by basename, so we don't
+# accidentally preserve a same-named file in some future subdirectory.
 _PRESERVE_FILES = frozenset({"replacements.json"})
 
 
@@ -1162,16 +1290,31 @@ def _update_helper_main(args) -> int:
             w(f"extract failed: {e}")
             return 3
 
+        # 2b) If the archive has a single top-level directory (e.g. a GitHub
+        # "Source code (zip)" download wraps everything in `tellur-1.2.2/`),
+        # treat that as the real source root so we don't deposit a folder
+        # inside install_dir.
+        source_root = staging_dir
+        top_items = [p for p in staging_dir.iterdir()]
+        if (
+            len(top_items) == 1
+            and top_items[0].is_dir()
+            and top_items[0].name.lower().startswith(("tellur", APP_NAME.lower()))
+        ):
+            source_root = top_items[0]
+            w(f"detected wrapper dir; using {source_root.name} as source root")
+
         # 3) copy files over the install dir, skipping preserved user files.
         copied = 0
         skipped = 0
-        for src in staging_dir.rglob("*"):
+        for src in source_root.rglob("*"):
             if not src.is_file():
                 continue
-            rel = src.relative_to(staging_dir)
+            rel = src.relative_to(source_root)
+            rel_posix = rel.as_posix()
             dst = install_dir / rel
-            if rel.name in _PRESERVE_FILES and dst.exists():
-                w(f"preserved: {rel}")
+            if rel_posix in _PRESERVE_FILES and dst.exists():
+                w(f"preserved: {rel_posix}")
                 skipped += 1
                 continue
             try:
@@ -1179,7 +1322,7 @@ def _update_helper_main(args) -> int:
                 shutil.copy2(src, dst)
                 copied += 1
             except OSError as e:
-                w(f"copy failed for {rel}: {e}")
+                w(f"copy failed for {rel_posix}: {e}")
                 return 4
         w(f"install complete: copied={copied} skipped={skipped}")
 
@@ -1274,6 +1417,18 @@ class Updater(QObject):
 
     def _install_worker(self, info: dict) -> None:
         try:
+            # Refuse oversized release assets — sane defense even though
+            # we're downloading from a trusted repo, in case a release is
+            # ever misconfigured or a CDN serves a wrong file.
+            claimed_bytes = int(info.get("zip_size") or 0)
+            if claimed_bytes > UPDATE_MAX_ZIP_BYTES:
+                self.install_failed.emit(
+                    f"Update archive too large "
+                    f"({claimed_bytes // (1024 * 1024)} MB > "
+                    f"{UPDATE_MAX_ZIP_BYTES // (1024 * 1024)} MB cap). "
+                    f"Refusing to download."
+                )
+                return
             self.state_changed.emit(f"Downloading v{info['version']}…")
             tmpdir = Path(tempfile.mkdtemp(prefix="tellur_dl_"))
             zip_path = tmpdir / f"Tellur-{info['version']}.zip"
@@ -1282,6 +1437,14 @@ class Updater(QObject):
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 log_update.exception("download failed")
                 self.install_failed.emit(f"Download failed: {e}")
+                return
+            # Post-download sanity: if the file on disk is way bigger than
+            # the API claimed, something's off — abort before we install it.
+            actual_bytes = zip_path.stat().st_size if zip_path.exists() else 0
+            if actual_bytes > UPDATE_MAX_ZIP_BYTES:
+                self.install_failed.emit(
+                    f"Downloaded archive is larger than the {UPDATE_MAX_ZIP_BYTES // (1024 * 1024)} MB cap; aborting."
+                )
                 return
 
             # quick integrity check
@@ -1942,6 +2105,9 @@ class App(QObject):
 
         # serialize GPU calls; generation token lets stale state emits be skipped
         self._engine_lock = threading.Lock()
+        # Generation counter — read/written across main and worker threads, so
+        # protected by its own lock. Use the helpers _bump_gen / _is_latest.
+        self._gen_lock = threading.Lock()
         self._latest_gen = 0
 
         threading.Thread(target=self._warm_up, daemon=True, name="model-warmup").start()
@@ -1958,6 +2124,13 @@ class App(QObject):
 
     def quit(self) -> None:
         log_app.info("quit requested")
+        # Release the global keyboard hooks (Ctrl+Win polls + the
+        # Ctrl+Win+Q hotkey). The `keyboard` library spawns a low-level
+        # Windows hook thread that can leak across abnormal exits otherwise.
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            log_app.debug("keyboard.unhook_all failed", exc_info=True)
         # Hide tray icon explicitly so it disappears immediately rather than waiting
         # for Windows tray cleanup on process exit.
         try:
@@ -1992,6 +2165,15 @@ class App(QObject):
         except Exception:
             log_engine.exception("model load failed")
             self.ui_state.emit("error")
+            # Auto-reset the overlay to idle after a few seconds so it doesn't
+            # stay orange forever. The next dictation attempt will retry the
+            # load and either succeed or re-emit error.
+            def _reset() -> None:
+                time.sleep(3.0)
+                self.ui_state.emit("idle")
+            threading.Thread(
+                target=_reset, daemon=True, name="warmup-error-reset",
+            ).start()
 
     def switch_model_async(self, new_name: str) -> None:
         if new_name == self.engine.name:
@@ -2124,11 +2306,22 @@ class App(QObject):
         log_engine.info("download finished for %s", model_name)
         return True
 
+    # --- generation counter helpers (lock-protected against cross-thread reads)
+
+    def _bump_gen(self) -> int:
+        with self._gen_lock:
+            self._latest_gen += 1
+            return self._latest_gen
+
+    def _is_latest(self, gen: int) -> bool:
+        with self._gen_lock:
+            return gen == self._latest_gen
+
     def on_press(self) -> None:
         # Bump gen FIRST so any pending reset timer from a prior release becomes
         # stale and skips its emit — otherwise it can clobber our "recording".
-        self._latest_gen += 1
-        log_hotkey.debug("press (gen=%d)", self._latest_gen)
+        gen = self._bump_gen()
+        log_hotkey.debug("press (gen=%d)", gen)
         try:
             self.recorder.start()
         except Exception:
@@ -2150,8 +2343,7 @@ class App(QObject):
             log_hotkey.debug("release (no audio)")
             self.ui_state.emit("idle")
             return
-        self._latest_gen += 1
-        gen = self._latest_gen
+        gen = self._bump_gen()
         log_hotkey.debug("release → transcribe (gen=%d, %.2fs)",
                          gen, audio.size / SAMPLE_RATE)
         self.ui_state.emit("transcribing")
@@ -2164,6 +2356,10 @@ class App(QObject):
         self.ui_level.emit(self.recorder.level)
 
     def _process_audio(self, audio: np.ndarray, gen: int) -> None:
+        # Bail early if this audio is already stale (user pressed again).
+        if not self._is_latest(gen):
+            log_app.debug("transcribe(gen=%d) stale before start — skip", gen)
+            return
         prompt = build_initial_prompt(self.log)
         hotwords = ", ".join(self.replacements.vocab) or None
         with self._engine_lock:
@@ -2171,13 +2367,13 @@ class App(QObject):
                 raw = self.engine.transcribe(audio, initial_prompt=prompt, hotwords=hotwords)
             except Exception:
                 log_engine.exception("transcribe failed (gen=%d)", gen)
-                if gen == self._latest_gen:
+                if self._is_latest(gen):
                     self.ui_state.emit("error")
                     self._schedule_reset(gen)
                 return
 
         if not raw:
-            if gen == self._latest_gen:
+            if self._is_latest(gen):
                 self.ui_state.emit("idle")
             return
 
@@ -2188,18 +2384,17 @@ class App(QObject):
             self.injector.paste(text)
         self.log.add(text, raw=raw)
 
-        if gen == self._latest_gen:
+        if self._is_latest(gen):
             self.ui_state.emit("done")
             self._schedule_reset(gen)
 
     def _schedule_reset(self, gen: int) -> None:
         def reset():
             time.sleep(RESET_AFTER_DONE_SEC)
-            if gen == self._latest_gen:
+            if self._is_latest(gen):
                 self.ui_state.emit("idle")
             else:
-                log_app.debug("reset(gen=%d) stale (latest=%d) — skip",
-                              gen, self._latest_gen)
+                log_app.debug("reset(gen=%d) stale — skip", gen)
         threading.Thread(target=reset, daemon=True, name=f"reset-{gen}").start()
 
 
@@ -2241,17 +2436,6 @@ def main() -> int:
         if not (args.zip and args.install_dir and args.parent_pid):
             return 64
         return _update_helper_main(args)
-
-    # Under pythonw.exe, sys.stderr and sys.stdout are None. Libraries that
-    # assume a tty-style writable stream (tqdm via huggingface_hub being the
-    # main one) crash with "NoneType has no attribute 'write'". Give them a
-    # silent sink so progress-bar writes are discarded harmlessly.
-    if sys.stderr is None or sys.stdout is None:
-        import io
-        if sys.stderr is None:
-            sys.stderr = io.StringIO()
-        if sys.stdout is None:
-            sys.stdout = io.StringIO()
 
     listener = setup_logging(args.debug)
     startup = logging.getLogger("startup")

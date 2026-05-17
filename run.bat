@@ -45,15 +45,28 @@ if not exist "%TELLUR_VENV%\Scripts\pythonw.exe" (
     if errorlevel 1 (
         echo.
         echo ERROR: Python launcher ^("py"^) not found on PATH.
-        echo Install Python 3.11+ from https://www.python.org/downloads/
+        echo Install Python 3.11 from https://www.python.org/downloads/
         echo ^(check "Add to PATH" during install^)
+        echo.
+        pause
+        exit /b 1
+    )
+    rem Probe specifically for Python 3.11 so we can give a clearer message
+    rem than the cryptic venv-failure path.
+    py -3.11 --version >nul 2>&1
+    if errorlevel 1 (
+        echo.
+        echo ERROR: Python 3.11 specifically is required, but `py -3.11` failed.
+        echo You may have a different version installed ^(3.10, 3.12, etc.^).
+        echo Please install Python 3.11 from https://www.python.org/downloads/release/python-3119/
+        echo Both versions can coexist; the `py` launcher will pick the right one.
         echo.
         pause
         exit /b 1
     )
     py -3.11 -m venv "%TELLUR_VENV%"
     if errorlevel 1 (
-        echo Failed to create venv with Python 3.11. Is it installed?
+        echo Failed to create venv with Python 3.11.
         pause
         exit /b 1
     )

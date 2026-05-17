@@ -25,10 +25,14 @@ def load() -> dict[str, str]:
 
 
 def save(d: dict[str, str]) -> None:
-    REPL.write_text(
+    # Write atomically via temp + rename so a power loss or kill mid-write
+    # can't corrupt replacements.json.
+    tmp = REPL.with_suffix(REPL.suffix + ".tmp")
+    tmp.write_text(
         json.dumps(d, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    tmp.replace(REPL)
 
 
 def main() -> int:

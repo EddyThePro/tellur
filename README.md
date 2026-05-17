@@ -156,7 +156,7 @@ tellur.py --version
 
 Constants near the top of `tellur.py`:
 
-- `MODEL_NAME` — `large-v3-turbo` is the sweet spot. Try `distil-large-v3` for faster English-only, or `medium` for lower VRAM use.
+- `DEFAULT_MODEL` — `large-v3-turbo` is the sweet spot. Try `distil-large-v3` for faster English-only, or `medium` for lower VRAM use. You can also switch models live from **Settings → Transcription model**.
 - `LANGUAGE` — `"en"` by default; set to `None` for auto-detect across languages.
 - `BAR_LEVEL_SCALE` — default mic-meter sensitivity (also adjustable from Settings).
 - `OVERLAY_WIDTH` / `OVERLAY_HEIGHT` / `OVERLAY_BOTTOM_MARGIN` — overlay size & position.

@@ -2,6 +2,42 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.2] — 2026-05-17
+
+Stability release — no new features, but a wide sweep of real and latent bugs caught during a deep audit pass.
+
+### Fixed — concurrency
+
+- **Engine: transcribe vs model-swap thread safety.** `transcribe()` now holds an engine state lock for the duration of the decode, so a concurrent `switch_to()` can't tear down the model mid-call. The model build still happens outside any lock, so a multi-minute model download never blocks dictation.
+- **Engine: concurrent builds on startup.** Switching models before warm-up finished could launch two CUDA model builds in parallel and OOM the GPU. A dedicated build-lock now serializes builds while leaving in-flight transcribes unblocked.
+- **Generation counter race.** The `_latest_gen` counter that prevents stale state emits is now protected by its own lock, so cross-thread reads can't see torn writes. Adds an early-stale-check in `_process_audio` to also drop work before it hits the GPU.
+- **TranscriptLog: concurrent saves.** Replaced per-add save threads (which raced on a shared `.tmp` filename) with a single dedicated saver thread fed by a coalescing queue. Bursty dictations now write at most one final snapshot.
+
+### Fixed — correctness
+
+- **BOM tolerance** on `settings.json`, `history.json`, and `replacements.json`. A Notepad-saved file with a UTF-8 BOM no longer silently wipes user data; reads use `utf-8-sig`, writes still use `utf-8` (no BOM).
+- **`pythonw` stderr/stdout fix moved to top of file** — runs before third-party imports, so any future library that writes to stderr at import time can't crash a silent boot.
+- **Audio buffer cap.** Holding the hotkey for hours no longer accumulates unbounded RAM. Capped at `MAX_RECORDING_SECONDS = 300` (5 min); further audio is silently dropped.
+- **`Settings.model_name` validation.** Hand-edit to a bogus model name no longer causes an unrecoverable startup error — falls back to default with a warning in the log.
+- **Pre-release version comparison.** Update check now uses `packaging.version` so `1.2.0-rc1` correctly sorts below `1.2.0` (the previous naive parse would have flagged a pre-release as "newer" than the matching release).
+- **`_warm_up` error recovery.** A failed model load no longer leaves the overlay stuck in the orange "error" state forever; it auto-resets to idle after 3 seconds.
+- **TextInjector stuck-state fix.** If clipboard copy or keystroke send fails after the original clipboard was captured, the saved state is now rolled back instead of leaking forever (which would cause a future paste's restore thread to clobber a much-newer clipboard).
+- **Update helper handles wrapper-directory archives.** If someone downloads GitHub's "Source code (zip)" instead of the named release asset (which wraps everything in `tellur-X.Y.Z/`), the helper now detects the wrapper and treats its contents as the source root.
+- **Update download size cap.** Refuse any release zip larger than 250 MB before downloading; sanity guard against a misconfigured release asset filling the temp drive.
+- **`_pid_alive` uses `WaitForSingleObject` on Windows** instead of `GetExitCodeProcess`. The previous code would have treated a parent that exited with code 259 as still alive (a known Windows footgun).
+- **`_PRESERVE_FILES` match by full relative path** rather than basename — future-proofing in case we ever ship a same-named file in a subdirectory.
+- **Multi-monitor.** The overlay now repositions itself if the user changes their primary monitor while the app is running.
+- **`keyboard.unhook_all()` on quit** — releases the global Win32 keyboard hook cleanly instead of leaking on abnormal exits.
+
+### Fixed — tooling
+
+- **`teach.py` writes atomically** (temp + rename), so a power loss or kill mid-write can't corrupt `replacements.json`.
+- **`teach.bat` and `tail-log.bat`** now read `TELLUR_HOME` from `HKCU\Environment` if it isn't set in the process env, matching `run.bat`. Previously they'd fall back to `%LOCALAPPDATA%\Tellur` even when `setx TELLUR_HOME D:\Tellur` had been run.
+- **`run.bat`** now probes `py -3.11 --version` separately so the user gets a clear "Python 3.11 specifically is required" message if they have e.g. only 3.10 or 3.12 installed.
+- **README** corrected: `MODEL_NAME` → `DEFAULT_MODEL` (the actual constant name).
+
+---
+
 ## [1.2.1] — 2026-05-17
 
 ### Changed
