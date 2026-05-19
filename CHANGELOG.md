@@ -2,6 +2,75 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] — 2026-05-18
+
+Three things: **audio ducking** (lower other apps while you talk), **customizable secondary hotkeys**, and the notes default moved off `Ctrl+Win+N`.
+
+### Audio ducking
+
+When you start recording, every other app's volume drops to a low level so background videos / music / Discord don't compete with your voice. Snaps back the moment you release the key.
+
+- New section in **Settings → Lower other apps while recording**. Toggle + slider for the duck level (default 5%, range 0–50%).
+- Per-app session ducking via the Windows Core Audio API (pycaw / `ISimpleAudioVolume`). Tellur's own process is excluded so any future Tellur sound isn't ducked under itself.
+- Sessions already below the target level are left untouched — we wouldn't be lowering them, only confusing the user by pushing them back up on release.
+- Restore runs at every recording boundary that matters: hotkey release, Esc cancel, note end, Refresh UI, and `quit()`. If a recording somehow ends without going through any of those paths, the next press will detect we're already ducked and noop.
+- Off by default — opt-in via Settings.
+
+### Customizable secondary hotkeys
+
+Four hotkeys are now user-editable from **Settings → Hotkeys**: **Notes**, **Re-paste last**, **Apply AI prompt**, **Quit Tellur**. Each is a Qt key-sequence field — click it, press your new combo, it saves and rebinds live (no restart). A per-row **Reset** button restores the default.
+
+- `Ctrl+Win` push-to-talk and `Esc` cancel remain fixed — the former uses key polling rather than a registered hotkey (so changing it would be a different and bigger change), and the latter is universally Esc by convention.
+- Combo strings are translated between Qt's format (`Ctrl+Meta+Z`) and the `keyboard` library's format (`ctrl+windows+z`) via two small helpers.
+- `HotkeyWatcher` now tracks `add_hotkey` handles per slot so a Settings edit cleanly removes the old combo before installing the new one — no leaking bindings across edits.
+
+### Default note hotkey: Ctrl+Win+N → Ctrl+Win+Z
+
+`Ctrl+Win+N` overlapped with users muscle-memory for Windows 11's Notification Center (which uses bare `Win+N`). Moving to `Z` clears the ambiguity. Existing users get the new default automatically since v2.1.0 didn't persist a `hotkey_note` field; if you'd already remapped it, your choice is preserved.
+
+### Under the hood
+
+- New `AudioDucker` class — pycaw-backed, idempotent, thread-safe, with deferred imports so a missing pycaw doesn't break startup (Settings UI greys out the toggle in that case).
+- New Settings fields: `duck_enabled`, `duck_level_pct`, `hotkey_quit`, `hotkey_repaste`, `hotkey_llm`, `hotkey_note`. All round-trip through the existing `_load` / `save` flow.
+- `HotkeyWatcher.__init__` now accepts a `settings=` argument and exposes `apply_settings()` so `App` can re-bind hotkeys whenever Settings emits `changed`.
+- New module-level helpers `keyseq_to_combo()` / `combo_to_keyseq()` for translating between Qt key sequences and the `keyboard` library's combo strings.
+- `requirements.txt` gains `pycaw>=20240210; sys_platform == "win32"`. On non-Windows it's not pulled in, and on Windows the missing-pycaw path is handled gracefully (ducking UI is disabled with a hint).
+
+---
+
+## [2.1.0] — 2026-05-18
+
+Two new features: **voice-captured notes** and a **Refresh UI** recovery affordance.
+
+### Notes (Ctrl+Win+N)
+
+A second dictation lane that doesn't paste — it saves the transcription to a separate Notes log for later review.
+
+- **New hotkey: `Ctrl+Win+N`.** Press to start a note recording, press again to stop. Toggle behavior regardless of the global Push-to-talk mode setting — notes are typically longer than dictations, so a hold-style key isn't ergonomic for them.
+- **Auto-flagged by foreground app.** The basename of the app that had focus when you started the note (e.g. `code.exe`, `chrome.exe`) is captured into the entry as an `app` field. Lets you find notes from a specific session/context later.
+- **Manual flags.** Right-click any note → **Flag as** → **Critical / Important / Followup / Random / None**. Flag renders as a colored chip on the row; the default is no flag.
+- **New Notes tab** in the main window, between History and Settings. Filter by flag (combo box) or by free-text search (matches note body or app name). Same row interactions as History — copy, delete-with-confirm, right-click context menu.
+- **Notes are never pasted.** This is the whole point: silent capture for later. Auto-paste / LLM auto-apply / markdown daily-file / webhook integrations are all bypassed for notes. They land in `<TELLUR_HOME>\notes.json`.
+- Dictation+note ergonomics: pressing `Ctrl+Win+N` while a dictation is in flight cancels the dictation (no phantom paste) and starts the note cleanly. While a note is recording, the Ctrl+Win polling stands down so a still-held modifier doesn't retrigger dictation underneath.
+
+### Refresh UI
+
+A recovery action for when the visible UI gets wedged — overlay vanished, "recording" state stuck, tray icon dropped after an Explorer restart.
+
+- **Tray right-click menu → Refresh UI** — the fastest path when the panel itself isn't reachable.
+- **Settings → Troubleshooting → Refresh UI** — same action, from inside the main window.
+- What it does: stops the live-level timer, abandons any in-flight recording (audio dropped, mic stream closed), tears down and re-creates the overlay widget, re-shows the tray icon, rebuilds the History + Notes lists. The Whisper model stays loaded, so a refresh is fast — no model re-warmup, no settings reload.
+
+### Under the hood
+
+- New `NotesLog` class — same JSON-on-disk + async saver pattern as `TranscriptLog`, with an extra `set_flag()` method and an `app` field on every entry. Cap: 2000 notes.
+- New `NOTES_FILE` constant (`<TELLUR_HOME>\notes.json`) and `NOTE_FLAGS` list.
+- New `HotkeyWatcher.note_toggle_requested` signal and `set_note_in_progress()` helper so the Ctrl+Win poll can stand down while a note is being captured.
+- New `App.refresh_ui()` method, exposed via `TrayIcon.refresh_ui_requested` and `MainPanel.refresh_ui_requested`.
+- New `NoteRow` widget with two chips (app + flag); flag color is themed via QSS `[flag="..."]` attribute selectors so a future theme just needs to provide palette colors.
+
+---
+
 ## [2.0.1] — 2026-05-17
 
 UI fix: clicking **Check for updates** (or any button in the lower Settings sections) no longer shifts the entire panel to the right with no way to scroll back.

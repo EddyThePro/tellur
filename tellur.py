@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "2.0.1"
+__version__ = "2.2.0"
 APP_NAME = "Tellur"
 
 
@@ -94,12 +94,13 @@ from faster_whisper import WhisperModel
 
 from PyQt6.QtCore import Qt, QSize, QTimer, QObject, QRectF, pyqtSignal
 from PyQt6.QtGui import (
-    QAction, QColor, QGuiApplication, QIcon, QPainter, QPainterPath, QPixmap,
+    QAction, QColor, QGuiApplication, QIcon, QKeySequence, QPainter,
+    QPainterPath, QPixmap,
 )
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QInputDialog,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
-    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider,
+    QKeySequenceEdit, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider,
     QSystemTrayIcon, QTabWidget, QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -214,10 +215,16 @@ def _default_data_dir() -> Path:
 
 DATA_DIR = _default_data_dir()
 HISTORY_FILE = DATA_DIR / "history.json"
+NOTES_FILE = DATA_DIR / "notes.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_MARKDOWN_DIR = DATA_DIR / "transcripts"   # one .md per day
 PER_CONTEXT_DICT_DIR = DATA_DIR / "replacements.d"  # v2.0 per-app overlays
 MAX_HISTORY_ENTRIES = 500
+MAX_NOTES_ENTRIES = 2000
+
+# Flags that can be applied to a note. "" / None means "no flag" (the default).
+# Order matters: the UI's right-click flag menu enumerates these.
+NOTE_FLAGS = ["critical", "important", "followup", "random"]
 
 # logging
 DEFAULT_LOG_DIR = DATA_DIR / "logs"              # TELLUR_LOG_DIR env var overrides
@@ -891,6 +898,154 @@ class TranscriptLog(QObject):
         return " ".join(e["text"] for e in recent if e.get("text"))
 
 
+class NotesLog(QObject):
+    """Persistent record of voice-captured notes (Ctrl+Win+N).
+
+    Same JSON-on-disk pattern as TranscriptLog, but each entry also carries
+    an `app` field (foreground process basename at capture time, auto-flag)
+    and an optional `flag` field (one of NOTE_FLAGS, or "" for unflagged).
+
+    Notes are *not* pasted into the focused window — they're captured for
+    later review in the Notes tab.
+    """
+
+    entry_added = pyqtSignal(dict)
+    entry_changed = pyqtSignal(dict)
+    entry_removed = pyqtSignal(dict)
+    cleared = pyqtSignal()
+
+    def __init__(self, path: Path, max_entries: int = MAX_NOTES_ENTRIES):
+        super().__init__()
+        self.path = path
+        self.max_entries = max_entries
+        self._entries: list[dict] = []
+        self._lock = threading.Lock()
+        self._save_queue: "queue.Queue[list[dict] | None]" = queue.Queue()
+        self._saver_thread = threading.Thread(
+            target=self._save_worker, daemon=True, name="notes-saver",
+        )
+        self._saver_thread.start()
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                data = json.loads(self.path.read_text(encoding="utf-8-sig"))
+                if isinstance(data, list):
+                    self._entries = [
+                        e for e in data
+                        if isinstance(e, dict) and isinstance(e.get("text"), str)
+                    ]
+                    log_app.info("loaded %d notes from %s",
+                                 len(self._entries), self.path.name)
+        except Exception:
+            log_app.exception("failed to load %s", self.path.name)
+
+    def _save_worker(self) -> None:
+        while True:
+            snap = self._save_queue.get()
+            if snap is None:
+                return
+            while True:
+                try:
+                    newer = self._save_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if newer is None:
+                    return
+                snap = newer
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+                tmp.write_text(
+                    json.dumps(snap, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                tmp.replace(self.path)
+            except Exception:
+                log_app.exception("failed to save notes")
+
+    def _save_async(self) -> None:
+        with self._lock:
+            snapshot = list(self._entries)
+        self._save_queue.put(snapshot)
+
+    def add(self, text: str, *, app: str | None = None,
+            flag: str = "", raw: str | None = None) -> dict | None:
+        text = (text or "").strip()
+        if not text:
+            return None
+        entry: dict = {"text": text, "ts": time.time()}
+        if app:
+            entry["app"] = app
+        if flag:
+            entry["flag"] = flag
+        if raw and raw != text:
+            entry["raw"] = raw
+        with self._lock:
+            self._entries.append(entry)
+            if len(self._entries) > self.max_entries:
+                self._entries = self._entries[-self.max_entries:]
+        self._save_async()
+        self.entry_added.emit(entry)
+        return entry
+
+    def entries(self) -> list[dict]:
+        with self._lock:
+            return list(self._entries)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+        self._save_async()
+        self.cleared.emit()
+        log_app.info("notes cleared")
+
+    def delete_entry(self, entry: dict) -> bool:
+        removed = False
+        with self._lock:
+            for i, e in enumerate(self._entries):
+                if e is entry:
+                    self._entries.pop(i)
+                    removed = True
+                    break
+            if not removed:
+                target_ts = entry.get("ts")
+                target_text = entry.get("text")
+                for i, e in enumerate(self._entries):
+                    if e.get("ts") == target_ts and e.get("text") == target_text:
+                        self._entries.pop(i)
+                        removed = True
+                        break
+        if removed:
+            self._save_async()
+            self.entry_removed.emit(entry)
+        return removed
+
+    def set_flag(self, entry: dict, flag: str) -> bool:
+        """Set or clear the flag on a note. flag="" means unflag.
+        Returns True if the entry was found."""
+        if flag and flag not in NOTE_FLAGS:
+            log_app.warning("set_flag: ignoring unknown flag %r", flag)
+            return False
+        found = False
+        with self._lock:
+            for e in self._entries:
+                if e is entry:
+                    if flag:
+                        e["flag"] = flag
+                    else:
+                        e.pop("flag", None)
+                    found = True
+                    break
+        if found:
+            self._save_async()
+            self.entry_changed.emit(entry)
+            log_app.info("note flag -> %r (text=%r)",
+                         flag or "", (entry.get("text") or "")[:40])
+        return found
+
+
 def export_history(entries: list[dict], path: Path, fmt: str) -> int:
     """Export `entries` to `path` in the requested format. Returns the count
     of exported entries. Supported formats: txt, md, json, csv."""
@@ -972,6 +1127,19 @@ class Settings(QObject):
         self.history_retention_days: int = 0
         # Theme (v2.0) — "dark" or "light".
         self.theme: str = "dark"
+        # Audio ducking (v2.2) — while a dictation/note is recording, lower
+        # every other app's volume so background audio doesn't distract.
+        self.duck_enabled: bool = False
+        self.duck_level_pct: int = 5    # 0..100; level other apps drop to
+        # Customizable hotkeys (v2.2) — secondary hotkeys are user-editable
+        # via Settings; stored in the `keyboard` library's combo format
+        # (e.g. "ctrl+windows+z"). The primary Ctrl+Win push-to-talk and the
+        # Esc cancel are intentionally NOT in this list — the former uses
+        # polling rather than add_hotkey, and the latter is universally Esc.
+        self.hotkey_quit: str = "ctrl+windows+q"
+        self.hotkey_repaste: str = "ctrl+windows+b"
+        self.hotkey_llm: str = "ctrl+windows+l"
+        self.hotkey_note: str = "ctrl+windows+z"
         self._load()
 
     def _load(self) -> None:
@@ -1016,6 +1184,20 @@ class Settings(QObject):
                     if th not in ("dark", "light"):
                         th = "dark"
                     self.theme = th
+                    self.duck_enabled = bool(data.get("duck_enabled", self.duck_enabled))
+                    try:
+                        self.duck_level_pct = int(data.get("duck_level_pct", self.duck_level_pct))
+                    except (TypeError, ValueError):
+                        self.duck_level_pct = 5
+                    self.duck_level_pct = max(0, min(100, self.duck_level_pct))
+                    # Hotkeys — accept any non-empty string; HotkeyWatcher
+                    # validates via keyboard.add_hotkey at register time and
+                    # logs (rather than crashes) on bad combos.
+                    for name in ("hotkey_quit", "hotkey_repaste",
+                                 "hotkey_llm", "hotkey_note"):
+                        v = data.get(name)
+                        if isinstance(v, str) and v.strip():
+                            setattr(self, name, v.strip().lower())
                     requested = str(data.get("model_name", self.model_name))
                     valid_names = {m["name"] for m in KNOWN_MODELS}
                     if requested not in valid_names:
@@ -1059,6 +1241,12 @@ class Settings(QObject):
             "save_history": self.save_history,
             "history_retention_days": self.history_retention_days,
             "theme": self.theme,
+            "duck_enabled": self.duck_enabled,
+            "duck_level_pct": self.duck_level_pct,
+            "hotkey_quit": self.hotkey_quit,
+            "hotkey_repaste": self.hotkey_repaste,
+            "hotkey_llm": self.hotkey_llm,
+            "hotkey_note": self.hotkey_note,
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1366,6 +1554,90 @@ class AudioRecorder:
     @property
     def monitor_level(self) -> float:
         return self._monitor_level
+
+
+# ===========================================================================
+# audio ducking — lower per-app volume while recording so background
+# audio (videos, music, game sounds) doesn't distract the speaker
+# ===========================================================================
+class AudioDucker:
+    """Snapshot every per-app audio session's master volume, set them to a
+    low level while recording, then restore on release.
+
+    Uses pycaw (Core Audio APIs via comtypes) — Windows-only. Imports are
+    deferred so a missing pycaw doesn't break startup; `available()` reports
+    whether the feature is usable.
+
+    Skips our own process (so a future Tellur sound — e.g. confirm chime —
+    wouldn't be ducked under itself) and is idempotent: a double-duck is a
+    no-op, a restore-without-duck is a no-op.
+    """
+
+    def __init__(self):
+        self._our_pid = os.getpid()
+        self._lock = threading.Lock()
+        self._active = False
+        # List of (ISimpleAudioVolume, prior_level) tuples captured at duck time.
+        self._saved: list[tuple[object, float]] = []
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            from pycaw.pycaw import AudioUtilities  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def duck(self, level: float = 0.05) -> None:
+        """Lower every other app's master volume to `level` (0.0–1.0).
+        Snapshots prior levels for restore(). Cheap (~10ms on a typical
+        machine); safe to call from the hotkey thread."""
+        level = max(0.0, min(1.0, float(level)))
+        with self._lock:
+            if self._active:
+                return
+            try:
+                from pycaw.pycaw import AudioUtilities
+                sessions = AudioUtilities.GetAllSessions()
+            except Exception:
+                log_audio.exception("ducker: failed to enumerate audio sessions")
+                return
+            saved: list[tuple[object, float]] = []
+            for s in sessions:
+                try:
+                    if s.Process and s.Process.pid == self._our_pid:
+                        continue
+                    vol = s.SimpleAudioVolume
+                    prev = vol.GetMasterVolume()
+                    # Don't bother saving + clobbering sessions already below
+                    # the duck level — restore would only push them back up to
+                    # where they already were.
+                    if prev <= level:
+                        continue
+                    vol.SetMasterVolume(level, None)
+                    saved.append((vol, prev))
+                except Exception:
+                    log_audio.debug("ducker: per-session duck failed", exc_info=True)
+            self._saved = saved
+            self._active = True
+            log_audio.info(
+                "ducked %d audio sessions to %.0f%%", len(saved), level * 100
+            )
+
+    def restore(self) -> None:
+        """Restore every ducked session to its pre-duck level. Idempotent."""
+        with self._lock:
+            if not self._active:
+                return
+            for vol, prev in self._saved:
+                try:
+                    vol.SetMasterVolume(prev, None)
+                except Exception:
+                    log_audio.debug("ducker: per-session restore failed", exc_info=True)
+            count = len(self._saved)
+            self._saved = []
+            self._active = False
+            log_audio.info("restored volume on %d sessions", count)
 
 
 # ===========================================================================
@@ -1839,42 +2111,85 @@ class HotkeyWatcher(QObject):
     cancel_requested = pyqtSignal()       # Esc during recording → abandon
     repaste_requested = pyqtSignal()      # Ctrl+Win+B → re-paste last transcript
     llm_apply_requested = pyqtSignal()    # Ctrl+Win+L → run default LLM prompt on last
+    note_toggle_requested = pyqtSignal()  # Ctrl+Win+N → start/stop a note recording
 
-    def __init__(self, poll_ms: int = HOTKEY_POLL_MS):
+    # Slots whose binding is configurable via Settings (everything but the
+    # primary Ctrl+Win poll, which doesn't use keyboard.add_hotkey at all).
+    _CONFIGURABLE_SLOTS = ("quit", "repaste", "llm", "note")
+    _ALL_SLOTS = _CONFIGURABLE_SLOTS + ("cancel",)
+
+    def __init__(self, poll_ms: int = HOTKEY_POLL_MS,
+                 settings: "Settings | None" = None):
         super().__init__()
-        self._held_keys = False    # raw "are both Ctrl+Win held?" state
-        self._recording = False    # logical "are we currently recording?" state
-        self._mode = "hold"        # "hold" or "toggle"; set via set_mode()
+        self._held_keys = False
+        self._recording = False
+        self._mode = "hold"
+        # When the App is mid note-recording, dictation-poll must stand down
+        # so a still-held Ctrl+Win doesn't keep retriggering dictation under
+        # the note. App flips this via set_note_in_progress().
+        self._note_in_progress = False
+        self._settings = settings
+        # Track add_hotkey handles per slot so we can remove a stale binding
+        # before installing a new one (user changes a hotkey in Settings).
+        self._hotkey_handles: dict[str, int] = {}
         self._timer = QTimer(self)
         self._timer.setInterval(poll_ms)
         self._timer.timeout.connect(self._poll)
-        self._register_global_hotkeys()
+        for slot in self._ALL_SLOTS:
+            self._register_slot(slot)
 
-    def _register_global_hotkeys(self) -> None:
+    def _slot_emit(self, slot: str):
+        return {
+            "quit":    self.quit_requested.emit,
+            "repaste": self.repaste_requested.emit,
+            "llm":     self.llm_apply_requested.emit,
+            "note":    self.note_toggle_requested.emit,
+            "cancel":  self.cancel_requested.emit,
+        }[slot]
+
+    def _slot_combo(self, slot: str) -> str:
+        """Resolve a slot's combo string. Cancel is always Esc; the
+        configurable ones come from Settings (with a built-in default if
+        Settings isn't wired up or the field is missing)."""
+        if slot == "cancel":
+            return "escape"
+        defaults = {
+            "quit":    "ctrl+windows+q",
+            "repaste": "ctrl+windows+b",   # ctrl+win+v is reserved by Win11
+            "llm":     "ctrl+windows+l",
+            "note":    "ctrl+windows+z",
+        }
+        if self._settings is not None:
+            v = getattr(self._settings, f"hotkey_{slot}", None)
+            if isinstance(v, str) and v.strip():
+                return v.strip().lower()
+        return defaults[slot]
+
+    def _register_slot(self, slot: str) -> None:
+        """Bind (or rebind) one slot. Removes any prior binding first so a
+        Settings edit doesn't leave the old combo wired up."""
+        combo = self._slot_combo(slot)
+        if slot in self._hotkey_handles:
+            try:
+                keyboard.remove_hotkey(self._hotkey_handles[slot])
+            except (KeyError, ValueError):
+                pass
+            except Exception:
+                log_hotkey.exception("failed to remove prior %s hotkey", slot)
+            self._hotkey_handles.pop(slot, None)
         try:
-            keyboard.add_hotkey("ctrl+windows+q", self.quit_requested.emit)
-            log_hotkey.info("registered quit hotkey: ctrl+win+q")
+            kwargs = {"suppress": False} if slot == "cancel" else {}
+            handle = keyboard.add_hotkey(combo, self._slot_emit(slot), **kwargs)
+            self._hotkey_handles[slot] = handle
+            log_hotkey.info("registered %s hotkey: %s", slot, combo)
         except Exception:
-            log_hotkey.exception("failed to register quit hotkey")
-        # Note: Ctrl+Win+V is reserved by Windows 11 (audio output device
-        # picker flyout), so we use Ctrl+Win+B for re-paste-last instead.
-        try:
-            keyboard.add_hotkey("ctrl+windows+b", self.repaste_requested.emit)
-            log_hotkey.info("registered re-paste-last hotkey: ctrl+win+b")
-        except Exception:
-            log_hotkey.exception("failed to register re-paste hotkey")
-        try:
-            keyboard.add_hotkey("ctrl+windows+l", self.llm_apply_requested.emit)
-            log_hotkey.info("registered LLM-apply hotkey: ctrl+win+l")
-        except Exception:
-            log_hotkey.exception("failed to register LLM-apply hotkey")
-        try:
-            # Esc fires globally even when no other modifier is held; we'll
-            # filter in the slot so it only cancels when actively recording.
-            keyboard.add_hotkey("escape", self.cancel_requested.emit, suppress=False)
-            log_hotkey.info("registered cancel-recording hotkey: esc")
-        except Exception:
-            log_hotkey.exception("failed to register cancel hotkey")
+            log_hotkey.exception("failed to register %s hotkey (%r)", slot, combo)
+
+    def apply_settings(self) -> None:
+        """Re-bind every configurable hotkey from current Settings. Call
+        this when Settings.changed fires so edits take effect live."""
+        for slot in self._CONFIGURABLE_SLOTS:
+            self._register_slot(slot)
 
     def set_mode(self, mode: str) -> None:
         """Switch between 'hold' and 'toggle'. Mid-recording mode changes
@@ -1916,7 +2231,22 @@ class HotkeyWatcher(QObject):
             self._recording = False
             self.released.emit()
 
+    def set_note_in_progress(self, on: bool) -> None:
+        """Pause/resume Ctrl+Win dictation polling while a Ctrl+Win+N note is
+        being recorded. Without this, a user still holding Ctrl+Win after
+        triggering the note would keep retriggering dictation underneath."""
+        self._note_in_progress = bool(on)
+        if on and self._recording:
+            self._recording = False
+
     def _poll(self) -> None:
+        if self._note_in_progress:
+            # Stand down so the note recording isn't fighting a dictation
+            # press/release in parallel. Treat keys as not-held so when the
+            # note ends and the user has long since released Ctrl+Win, the
+            # next press is a clean fresh transition.
+            self._held_keys = False
+            return
         held = self._all_held()
         # Detect raw key transitions
         key_press = held and not self._held_keys
@@ -2439,6 +2769,7 @@ class TrayIcon(QSystemTrayIcon):
     copy_last = pyqtSignal()
     quit_requested = pyqtSignal()
     install_update = pyqtSignal()
+    refresh_ui_requested = pyqtSignal()
 
     def __init__(self, updater: "Updater | None" = None, parent: QObject | None = None):
         super().__init__(self._make_icon(), parent)
@@ -2454,6 +2785,11 @@ class TrayIcon(QSystemTrayIcon):
         copy_act = QAction("Copy last transcription", self)
         copy_act.triggered.connect(self.copy_last)
         menu.addAction(copy_act)
+
+        refresh_act = QAction("Refresh UI", self)
+        refresh_act.setToolTip("Re-create the overlay and reset stuck UI state")
+        refresh_act.triggered.connect(self.refresh_ui_requested)
+        menu.addAction(refresh_act)
 
         # Update entry — hidden until an update is found, then becomes visible.
         self._update_act = QAction("Install update", self)
@@ -2572,7 +2908,20 @@ QWidget#mainPanel {{
     font-family: "Segoe UI";
     font-size: 10pt;
 }}
-QWidget#mainPanel QLabel {{ color: {p['text']}; }}
+/* Inner containers need explicit backgrounds — plain QWidgets fall back
+   to the system palette otherwise, which leaves a dark inner area when
+   the light theme is active. */
+QWidget#mainPanel QWidget#settingsContent {{
+    background-color: {p['bg']};
+}}
+QWidget#mainPanel QScrollArea {{
+    background-color: {p['bg']};
+    border: none;
+}}
+QWidget#mainPanel QScrollArea > QWidget > QWidget {{
+    background-color: {p['bg']};
+}}
+QWidget#mainPanel QLabel {{ color: {p['text']}; background: transparent; }}
 QWidget#mainPanel QLabel#sectionHeader {{
     font-weight: 600;
     color: {p['text_header']};
@@ -2706,6 +3055,39 @@ QWidget#historyRow QLabel#historyRowMeta {{
     font-size: 9pt;
     background: transparent;
 }}
+QWidget#noteRow {{
+    background-color: transparent;
+    border-bottom: 1px solid {p['row_separator']};
+}}
+QWidget#noteRow QLabel#historyRowText {{
+    color: {p['text']};
+    font-size: 10pt;
+    background: transparent;
+}}
+QWidget#noteRow QLabel#historyRowMeta {{
+    color: {p['text_muted']};
+    font-size: 9pt;
+    background: transparent;
+}}
+QWidget#noteRow QLabel#noteAppChip {{
+    color: {p['text_dim']};
+    font-size: 8.5pt;
+    background: transparent;
+    padding: 1px 6px;
+    border: 1px solid {p['border']};
+    border-radius: 7px;
+}}
+QWidget#noteRow QLabel#noteFlagChip {{
+    font-size: 8.5pt;
+    padding: 1px 6px;
+    border-radius: 7px;
+    color: white;
+    font-weight: 600;
+}}
+QWidget#noteRow QLabel#noteFlagChip[flag="critical"]  {{ background-color: {p['danger']}; }}
+QWidget#noteRow QLabel#noteFlagChip[flag="important"] {{ background-color: {p['accent']}; }}
+QWidget#noteRow QLabel#noteFlagChip[flag="followup"]  {{ background-color: {p['success']}; }}
+QWidget#noteRow QLabel#noteFlagChip[flag="random"]    {{ background-color: {p['text_muted']}; }}
 QPushButton#iconButton {{
     background: transparent;
     border: none;
@@ -2937,6 +3319,100 @@ class HistoryRow(QWidget):
         super().mouseDoubleClickEvent(event)
 
 
+class NoteRow(QWidget):
+    """Custom row widget for the Notes list. Same shape as HistoryRow but
+    shows two trailing chips: an auto-flag (foreground app at capture time)
+    and an optional manual flag (critical/important/etc.). Both chips render
+    inline via QSS object names so the theme palette controls their color.
+    """
+
+    copy_requested = pyqtSignal(dict)
+
+    def __init__(self, entry: dict):
+        super().__init__()
+        self.entry = entry
+        self.setObjectName("noteRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(34)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 14, 0)
+        layout.setSpacing(10)
+
+        self.text_label = ElidedLabel(self._full_text())
+        self.text_label.setObjectName("historyRowText")
+        self.text_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+        )
+        layout.addWidget(self.text_label, stretch=1)
+
+        # App-flag chip — always present, dim/neutral color.
+        self._app_chip = QLabel(self._app_text())
+        self._app_chip.setObjectName("noteAppChip")
+        self._app_chip.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        self._app_chip.setMinimumWidth(64)
+        layout.addWidget(self._app_chip)
+
+        # Manual flag chip — only visible when a flag is set; color follows
+        # the flag (set via dynamic property so QSS can theme it).
+        self._flag_chip = QLabel("")
+        self._flag_chip.setObjectName("noteFlagChip")
+        self._flag_chip.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        self._flag_chip.setMinimumWidth(0)
+        layout.addWidget(self._flag_chip)
+
+        self._meta_label = QLabel(self._meta_text())
+        self._meta_label.setObjectName("historyRowMeta")
+        self._meta_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        self._meta_label.setMinimumWidth(90)
+        layout.addWidget(self._meta_label)
+
+        copy_btn = IconButton(IconButton.COPY)
+        copy_btn.setToolTip("Copy this note")
+        copy_btn.clicked.connect(lambda: self.copy_requested.emit(self.entry))
+        layout.addWidget(copy_btn)
+
+        self._apply_flag_style()
+
+    def _full_text(self) -> str:
+        return (self.entry.get("text") or "").replace("\n", " ")
+
+    def _app_text(self) -> str:
+        app = (self.entry.get("app") or "").strip()
+        return app or "—"
+
+    def _meta_text(self) -> str:
+        text = self.entry.get("text") or ""
+        word_count = len(text.split())
+        when = humanize_time(self.entry.get("ts", 0))
+        return f"{word_count} word{'' if word_count == 1 else 's'}  ·  {when}"
+
+    def _apply_flag_style(self) -> None:
+        flag = (self.entry.get("flag") or "").strip().lower()
+        if flag:
+            self._flag_chip.setText(flag)
+            self._flag_chip.setVisible(True)
+        else:
+            self._flag_chip.setText("")
+            self._flag_chip.setVisible(False)
+        # Drive QSS via dynamic property so theme palettes can color per-flag.
+        self._flag_chip.setProperty("flag", flag or "none")
+        # Force re-polish so the property change takes effect.
+        self._flag_chip.style().unpolish(self._flag_chip)
+        self._flag_chip.style().polish(self._flag_chip)
+
+    def refresh(self) -> None:
+        self.text_label.setText(self._full_text())
+        self._app_chip.setText(self._app_text())
+        self._meta_label.setText(self._meta_text())
+        self._apply_flag_style()
+
+
 class HistoryList(QListWidget):
     """QListWidget subclass that constrains every row widget to the
     viewport's width.
@@ -2967,6 +3443,35 @@ class HistoryList(QListWidget):
             widget.setFixedWidth(w)
 
 
+def keyseq_to_combo(seq: "QKeySequence") -> str:
+    """Translate a Qt key sequence (e.g. 'Ctrl+Meta+Z') to the format the
+    `keyboard` library uses ('ctrl+windows+z'). Empty sequence → ''."""
+    if seq.isEmpty():
+        return ""
+    s = seq.toString().strip().lower()
+    # Qt names the Windows key 'meta'; keyboard library calls it 'windows'.
+    parts = [("windows" if p == "meta" else p) for p in s.split("+")]
+    return "+".join(parts)
+
+
+def combo_to_keyseq(combo: str) -> "QKeySequence":
+    """Inverse of keyseq_to_combo — turn 'ctrl+windows+z' into a
+    QKeySequence Qt can render in a QKeySequenceEdit."""
+    combo = (combo or "").strip().lower()
+    if not combo:
+        return QKeySequence()
+    parts = []
+    for p in combo.split("+"):
+        p = p.strip()
+        if not p:
+            continue
+        if p == "windows":
+            parts.append("Meta")
+        else:
+            parts.append(p.capitalize())
+    return QKeySequence("+".join(parts))
+
+
 class _NoWheelComboBox(QComboBox):
     """QComboBox that doesn't consume mouse wheel events. Wheel events get
     ignore()'d so the parent scroll area handles them — otherwise scrolling
@@ -2984,13 +3489,15 @@ class _NoWheelSlider(QSlider):
 
 
 class MainPanel(QWidget):
-    """The 'open from the tray' window. Two tabs: History and Settings."""
+    """The 'open from the tray' window. Tabs: History, Notes, Settings."""
 
     model_switch_requested = pyqtSignal(str)
+    refresh_ui_requested = pyqtSignal()
 
     def __init__(
         self,
         log: TranscriptLog,
+        notes: "NotesLog",
         settings: Settings,
         updater: "Updater | None" = None,
         recorder: "AudioRecorder | None" = None,
@@ -2998,6 +3505,7 @@ class MainPanel(QWidget):
     ):
         super().__init__()
         self._log = log
+        self._notes = notes
         self._settings = settings
         self._updater = updater
         self._recorder = recorder
@@ -3008,9 +3516,16 @@ class MainPanel(QWidget):
             self.setWindowIcon(QIcon(str(ICON_PATH)))
         self._current_theme = ""  # will be set by _apply_theme
         self._apply_theme(self._settings.theme)
-        # React to live theme changes (Settings → Appearance dropdown).
+        # React to live theme changes (Settings → Appearance dropdown), but
+        # defer the heavy restyle to the next event-loop tick. Without the
+        # defer, picking "Light" from the Theme combo would interrupt Qt's
+        # own click-processing on that combo — the first click silently
+        # got eaten and the user needed a second click for it to register.
+        # By the time the QTimer fires, the combo has finished its event.
         self._settings.changed.connect(
-            lambda: self._apply_theme(self._settings.theme)
+            lambda: QTimer.singleShot(
+                0, lambda: self._apply_theme(self._settings.theme)
+            )
         )
         # Fixed default size — tabs are independently sized; Settings scrolls
         # internally so it never forces the window taller. Width gives the
@@ -3025,6 +3540,7 @@ class MainPanel(QWidget):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_history_tab(), "History")
+        tabs.addTab(self._build_notes_tab(), "Notes")
         # Settings tab is wrapped in a QScrollArea (built inside the helper)
         # so the window doesn't have to grow to fit every section.
         tabs.addTab(self._build_settings_tab(), "Settings")
@@ -3038,6 +3554,13 @@ class MainPanel(QWidget):
         log.entry_removed.connect(self._on_entry_removed)
         log.cleared.connect(self._refresh_list)
         self._refresh_list()
+
+        # subscribe to notes-log changes
+        notes.entry_added.connect(self._on_note_added)
+        notes.entry_changed.connect(self._on_note_changed)
+        notes.entry_removed.connect(self._on_note_removed)
+        notes.cleared.connect(self._refresh_notes_list)
+        self._refresh_notes_list()
 
         # refresh time labels every 30s so "just now" rolls to "1m ago" etc.
         self._tick = QTimer(self)
@@ -3156,6 +3679,12 @@ class MainPanel(QWidget):
             widget = self._list.itemWidget(item)
             if isinstance(widget, HistoryRow):
                 widget.refresh()
+        if hasattr(self, "_notes_list"):
+            for i in range(self._notes_list.count()):
+                item = self._notes_list.item(i)
+                widget = self._notes_list.itemWidget(item)
+                if isinstance(widget, NoteRow):
+                    widget.refresh()
 
     def _find_row(self, entry: dict) -> "tuple[QListWidgetItem | None, HistoryRow | None]":
         for i in range(self._list.count()):
@@ -3313,6 +3842,228 @@ class MainPanel(QWidget):
 
         menu.exec(self._list.mapToGlobal(pos))
 
+    # --- notes tab ------------------------------------------------------
+
+    def _build_notes_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(0, 14, 0, 0)
+        layout.setSpacing(8)
+
+        hint = QLabel(
+            "Notes are captured with the <b>Notes hotkey</b> (default <b>Ctrl+Win+Z</b>; "
+            "remap in Settings → Hotkeys). Press to start, press again to stop. "
+            "Notes are <i>not</i> pasted into the focused window. Right-click a note to flag it."
+        )
+        hint.setObjectName("sectionHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(8)
+        self._notes_delete_btn = QPushButton("Delete selected")
+        self._notes_delete_btn.setEnabled(False)
+        self._notes_delete_btn.clicked.connect(self._delete_selected_note_confirm)
+        top_bar.addWidget(self._notes_delete_btn)
+
+        self._notes_flag_filter = _NoWheelComboBox()
+        self._notes_flag_filter.addItem("All flags", "")
+        self._notes_flag_filter.addItem("Unflagged only", "__none__")
+        for f in NOTE_FLAGS:
+            self._notes_flag_filter.addItem(f.capitalize(), f)
+        self._notes_flag_filter.currentIndexChanged.connect(
+            lambda _i: self._refresh_notes_list()
+        )
+        top_bar.addWidget(self._notes_flag_filter)
+
+        self._notes_search = QLineEdit()
+        self._notes_search.setPlaceholderText("Search notes…")
+        self._notes_search.textChanged.connect(lambda _s: self._refresh_notes_list())
+        self._notes_search.setClearButtonEnabled(True)
+        top_bar.addWidget(self._notes_search, stretch=1)
+        layout.addLayout(top_bar)
+
+        self._notes_list = HistoryList()
+        self._notes_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self._notes_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._notes_list.customContextMenuRequested.connect(self._on_notes_context_menu)
+        self._notes_list.itemSelectionChanged.connect(self._on_notes_selection)
+        self._notes_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._notes_list.setUniformItemSizes(True)
+        layout.addWidget(self._notes_list, stretch=2)
+
+        layout.addWidget(QLabel("Selected:"))
+        self._notes_detail = QTextEdit()
+        self._notes_detail.setReadOnly(True)
+        self._notes_detail.setPlaceholderText("Click a note above to view its full text.")
+        layout.addWidget(self._notes_detail, stretch=1)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        copy_sel = QPushButton("Copy selected")
+        copy_sel.clicked.connect(self._copy_selected_note)
+        actions.addWidget(copy_sel)
+        actions.addStretch()
+        clear = QPushButton("Clear notes")
+        clear.clicked.connect(self._clear_notes)
+        actions.addWidget(clear)
+        layout.addLayout(actions)
+
+        return w
+
+    def _sorted_filtered_notes(self) -> list[dict]:
+        query = (self._notes_search.text().strip().lower()
+                 if hasattr(self, "_notes_search") else "")
+        flag_pick = (self._notes_flag_filter.currentData()
+                     if hasattr(self, "_notes_flag_filter") else "")
+        all_entries = self._notes.entries()
+        if query:
+            all_entries = [
+                e for e in all_entries
+                if query in (e.get("text") or "").lower()
+                or query in (e.get("app") or "").lower()
+            ]
+        if flag_pick == "__none__":
+            all_entries = [e for e in all_entries if not (e.get("flag") or "")]
+        elif flag_pick:
+            all_entries = [e for e in all_entries if (e.get("flag") or "") == flag_pick]
+        return list(reversed(all_entries))
+
+    def _install_note_row(self, item: "QListWidgetItem", entry: dict) -> None:
+        row = NoteRow(entry)
+        row.copy_requested.connect(self._on_note_row_copy)
+        item.setData(Qt.ItemDataRole.UserRole, entry)
+        w = self._notes_list.viewport().width() if self._notes_list.viewport().width() > 0 else 580
+        item.setSizeHint(QSize(w, 34))
+        row.setFixedWidth(w)
+        self._notes_list.setItemWidget(item, row)
+
+    def _refresh_notes_list(self) -> None:
+        if not hasattr(self, "_notes_list"):
+            return
+        self._notes_list.clear()
+        for entry in self._sorted_filtered_notes():
+            item = QListWidgetItem()
+            self._notes_list.addItem(item)
+            self._install_note_row(item, entry)
+        self._notes_list.refit_rows()
+        if self._notes_list.count():
+            self._notes_list.setCurrentRow(0)
+        else:
+            self._notes_detail.setPlainText("")
+
+    def _find_note_row(self, entry: dict) -> "tuple[QListWidgetItem | None, NoteRow | None]":
+        for i in range(self._notes_list.count()):
+            item = self._notes_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) is entry:
+                return item, self._notes_list.itemWidget(item)
+        return None, None
+
+    def _on_note_added(self, _entry: dict) -> None:
+        self._refresh_notes_list()
+
+    def _on_note_changed(self, entry: dict) -> None:
+        # Flag change can affect filter membership — rebuild whole list and
+        # reselect the same entry if it survived the filter.
+        self._refresh_notes_list()
+        item, _ = self._find_note_row(entry)
+        if item is not None:
+            self._notes_list.setCurrentItem(item)
+
+    def _on_note_removed(self, _entry: dict) -> None:
+        self._refresh_notes_list()
+
+    def _on_notes_selection(self) -> None:
+        items = self._notes_list.selectedItems()
+        entry = items[0].data(Qt.ItemDataRole.UserRole) if items else None
+        if isinstance(entry, dict):
+            self._notes_detail.setPlainText(entry.get("text", ""))
+            self._notes_delete_btn.setEnabled(True)
+        else:
+            self._notes_detail.setPlainText("")
+            self._notes_delete_btn.setEnabled(False)
+
+    def _on_note_row_copy(self, entry: dict) -> None:
+        self._copy_to_clipboard(entry.get("text", ""), source="note-row-copy")
+
+    def _copy_selected_note(self) -> None:
+        items = self._notes_list.selectedItems()
+        if not items:
+            return
+        entry = items[0].data(Qt.ItemDataRole.UserRole)
+        if isinstance(entry, dict):
+            self._copy_to_clipboard(entry.get("text", ""), source="note-copy-selected")
+
+    def _clear_notes(self) -> None:
+        reply = QMessageBox.question(
+            self, "Clear notes",
+            "Delete all notes? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._notes.clear()
+
+    def _delete_note_with_confirm(self, entry: dict) -> None:
+        text = entry.get("text", "")
+        preview = text if len(text) <= 80 else text[:77] + "…"
+        reply = QMessageBox.question(
+            self, "Delete note",
+            f"Delete this note?\n\n“{preview}”\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._notes.delete_entry(entry)
+
+    def _delete_selected_note_confirm(self) -> None:
+        items = self._notes_list.selectedItems()
+        if not items:
+            return
+        entry = items[0].data(Qt.ItemDataRole.UserRole)
+        if isinstance(entry, dict):
+            self._delete_note_with_confirm(entry)
+
+    def _on_notes_context_menu(self, pos) -> None:
+        item = self._notes_list.itemAt(pos)
+        if item is None:
+            return
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(entry, dict):
+            return
+        menu = QMenu(self)
+
+        copy_act = QAction("Copy", self)
+        copy_act.triggered.connect(
+            lambda: self._copy_to_clipboard(entry.get("text", ""), "note-ctx-copy")
+        )
+        menu.addAction(copy_act)
+
+        menu.addSeparator()
+
+        flag_menu = menu.addMenu("Flag as")
+        current_flag = (entry.get("flag") or "").lower()
+        none_act = QAction("None (clear flag)", self)
+        none_act.setCheckable(True)
+        none_act.setChecked(current_flag == "")
+        none_act.triggered.connect(lambda: self._notes.set_flag(entry, ""))
+        flag_menu.addAction(none_act)
+        flag_menu.addSeparator()
+        for f in NOTE_FLAGS:
+            act = QAction(f.capitalize(), self)
+            act.setCheckable(True)
+            act.setChecked(current_flag == f)
+            act.triggered.connect(lambda _checked=False, flag=f: self._notes.set_flag(entry, flag))
+            flag_menu.addAction(act)
+
+        menu.addSeparator()
+
+        del_act = QAction("Delete…", self)
+        del_act.triggered.connect(lambda: self._delete_note_with_confirm(entry))
+        menu.addAction(del_act)
+
+        menu.exec(self._notes_list.mapToGlobal(pos))
+
     def eventFilter(self, obj, event) -> bool:
         """List keyboard shortcuts: Enter=copy, Delete=delete-with-confirm,
         Ctrl+F=focus search."""
@@ -3404,6 +4155,11 @@ class MainPanel(QWidget):
         # QScrollArea so a long Settings tab doesn't force the window taller.
         content = QWidget()
         content.setObjectName("settingsContent")
+        # Plain QWidget ignores QSS-defined backgrounds by default; enable
+        # styled background painting so the theme's bg actually fills the
+        # content area (otherwise it falls back to the system dark color,
+        # which broke the light theme).
+        content.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QVBoxLayout(content)
         # Left padding kept generous so checkbox indicators and button edges
         # don't get clipped by the scroll-area viewport. Right padding is a
@@ -3467,22 +4223,85 @@ class MainPanel(QWidget):
         ))
         layout.addLayout(hk_box)
 
-        # --- hotkey reference (read-only) ---
+        # --- hotkeys (editable + fixed-reference) ---
         ref_box = QVBoxLayout()
         ref_box.setSpacing(10)
         ref_box.addWidget(self._section_header("Hotkeys"))
-        ref_text = QLabel(
-            "<table cellpadding='3' style='color:#9a9da6;'>"
-            "<tr><td><b>Ctrl + Win</b></td><td>&nbsp;&nbsp;&nbsp;Push-to-talk dictation (hold or toggle)</td></tr>"
-            "<tr><td><b>Esc</b></td><td>&nbsp;&nbsp;&nbsp;Cancel current recording (no transcribe)</td></tr>"
-            "<tr><td><b>Ctrl + Win + B</b></td><td>&nbsp;&nbsp;&nbsp;Re-paste last transcription (B = &quot;bring back&quot;)</td></tr>"
-            "<tr><td><b>Ctrl + Win + L</b></td><td>&nbsp;&nbsp;&nbsp;Apply default AI prompt to last transcript</td></tr>"
-            "<tr><td><b>Ctrl + Win + Q</b></td><td>&nbsp;&nbsp;&nbsp;Quit Tellur</td></tr>"
-            "</table>"
-        )
-        ref_text.setTextFormat(Qt.TextFormat.RichText)
-        ref_box.addWidget(ref_text)
+        ref_box.addWidget(self._section_hint(
+            "<b>Ctrl + Win</b> (push-to-talk) and <b>Esc</b> (cancel) are fixed. "
+            "Click a field below, press the new combo, then it saves automatically. "
+            "Modifier-free single keys (like <i>F2</i>) work but may collide with other apps."
+        ))
+        # Built each via a small helper so editing one set rebinds itself
+        # against current Settings without restarting Tellur.
+        self._hotkey_edits: dict[str, QKeySequenceEdit] = {}
+        for slot, label, tip in (
+            ("note",    "Notes (toggle)",
+             "Start/stop a voice note (saved to the Notes tab; not pasted)"),
+            ("repaste", "Re-paste last",
+             "Paste the most recent transcript into the focused window again"),
+            ("llm",     "Apply AI prompt",
+             "Run the default AI prompt on the last transcript and paste the result"),
+            ("quit",    "Quit Tellur",
+             "Exit Tellur"),
+        ):
+            current = getattr(self._settings, f"hotkey_{slot}", "")
+            row_widget = QWidget()
+            row_inner = QHBoxLayout(row_widget)
+            row_inner.setContentsMargins(0, 0, 0, 0)
+            row_inner.setSpacing(8)
+            edit = QKeySequenceEdit(combo_to_keyseq(current))
+            edit.setToolTip(tip)
+            edit.editingFinished.connect(
+                lambda s=slot, e=edit: self._on_hotkey_changed(s, e)
+            )
+            self._hotkey_edits[slot] = edit
+            row_inner.addWidget(edit, stretch=1)
+            reset_btn = QPushButton("Reset")
+            reset_btn.setToolTip("Restore this hotkey to its default")
+            reset_btn.clicked.connect(lambda _checked=False, s=slot: self._reset_hotkey(s))
+            row_inner.addWidget(reset_btn)
+            ref_box.addLayout(self._form_row(label, row_widget))
         layout.addLayout(ref_box)
+
+        # --- audio ducking (v2.2) ---
+        duck_box = QVBoxLayout()
+        duck_box.setSpacing(10)
+        duck_box.addWidget(self._section_header("Lower other apps while recording"))
+        duck_box.addWidget(self._section_hint(
+            "When you start recording, drop the volume of every other app "
+            "(Discord, browser, music, games) to a low level so background "
+            "audio doesn't compete with your voice. Volume snaps back when "
+            "you release the key. Tellur itself is never ducked."
+        ))
+        self._duck_enabled_cb = QCheckBox("Enabled")
+        self._duck_enabled_cb.setChecked(self._settings.duck_enabled)
+        self._duck_enabled_cb.toggled.connect(self._on_duck_enabled_toggled)
+        duck_box.addLayout(self._form_row("Audio ducking", self._duck_enabled_cb))
+
+        self._duck_slider = _NoWheelSlider(Qt.Orientation.Horizontal)
+        self._duck_slider.setRange(0, 50)
+        self._duck_slider.setValue(int(self._settings.duck_level_pct))
+        self._duck_slider.valueChanged.connect(self._on_duck_level_changed)
+        self._duck_label = QLabel(f"{int(self._settings.duck_level_pct)}%")
+        self._duck_label.setFixedWidth(40)
+        self._duck_label.setObjectName("valueDim")
+        duck_widget = QWidget()
+        duck_inner = QHBoxLayout(duck_widget)
+        duck_inner.setContentsMargins(0, 0, 0, 0)
+        duck_inner.setSpacing(8)
+        duck_inner.addWidget(self._duck_slider, stretch=1)
+        duck_inner.addWidget(self._duck_label)
+        duck_box.addLayout(self._form_row("Lower to", duck_widget))
+        if not AudioDucker.available():
+            warn = self._section_hint(
+                "<b>pycaw is not available</b> — install it (<i>pip install pycaw</i>) "
+                "into the Tellur venv to enable ducking."
+            )
+            duck_box.addWidget(warn)
+            self._duck_enabled_cb.setEnabled(False)
+            self._duck_slider.setEnabled(False)
+        layout.addLayout(duck_box)
 
         # --- audio input section (v1.6) ---
         audio_box = QVBoxLayout()
@@ -3835,11 +4654,32 @@ class MainPanel(QWidget):
             self._updater.update_found.connect(self._on_update_found)
             self._updater.install_failed.connect(self._on_update_failed)
 
+        # Troubleshooting ------------------------------------------------
+        tb_box = QVBoxLayout()
+        tb_box.setSpacing(10)
+        tb_box.addWidget(self._section_header("Troubleshooting"))
+        tb_box.addWidget(self._section_hint(
+            "If the overlay disappears, the recording state seems stuck, or "
+            "the tray icon misbehaves, click <b>Refresh UI</b> to rebuild the "
+            "visible UI without restarting Tellur. The Whisper model stays "
+            "loaded so this is fast."
+        ))
+        tb_row = QHBoxLayout()
+        tb_row.setSpacing(10)
+        refresh_btn = QPushButton("Refresh UI")
+        refresh_btn.setToolTip("Re-create the overlay and reset any wedged UI state")
+        refresh_btn.clicked.connect(self.refresh_ui_requested)
+        tb_row.addWidget(refresh_btn)
+        tb_row.addStretch()
+        tb_box.addLayout(tb_row)
+        layout.addLayout(tb_box)
+
         layout.addStretch()
 
         footer = QLabel(
             f"{APP_NAME} {__version__}  ·  Ctrl+Win to talk  ·  Esc cancel  ·  "
-            f"Ctrl+Win+B re-paste  ·  Ctrl+Win+L AI prompt  ·  Ctrl+Win+Q quit"
+            f"hotkeys are editable above (defaults: Ctrl+Win+Z note, "
+            f"Ctrl+Win+B re-paste, Ctrl+Win+L AI prompt, Ctrl+Win+Q quit)"
         )
         footer.setObjectName("footerLabel")
         footer.setWordWrap(True)
@@ -3878,6 +4718,51 @@ class MainPanel(QWidget):
         self._settings.hotkey_mode = mode
         self._settings.save()  # emits `changed` for live-apply
         log_app.info("hotkey mode -> %s", mode)
+
+    # --- editable hotkey + ducking handlers ---------------------------
+
+    _HOTKEY_DEFAULTS = {
+        "quit":    "ctrl+windows+q",
+        "repaste": "ctrl+windows+b",
+        "llm":     "ctrl+windows+l",
+        "note":    "ctrl+windows+z",
+    }
+
+    def _on_hotkey_changed(self, slot: str, edit: "QKeySequenceEdit") -> None:
+        new_combo = keyseq_to_combo(edit.keySequence())
+        if not new_combo:
+            # User cleared the field — fall back to the default rather than
+            # leaving the slot unbound (which would silently disable it).
+            new_combo = self._HOTKEY_DEFAULTS.get(slot, "")
+            edit.setKeySequence(combo_to_keyseq(new_combo))
+        attr = f"hotkey_{slot}"
+        if getattr(self._settings, attr, "") == new_combo:
+            return
+        setattr(self._settings, attr, new_combo)
+        self._settings.save()  # triggers HotkeyWatcher.apply_settings via changed
+        log_app.info("hotkey %s -> %s", slot, new_combo)
+
+    def _reset_hotkey(self, slot: str) -> None:
+        default = self._HOTKEY_DEFAULTS.get(slot, "")
+        edit = self._hotkey_edits.get(slot)
+        if edit is None:
+            return
+        edit.setKeySequence(combo_to_keyseq(default))
+        self._on_hotkey_changed(slot, edit)
+
+    def _on_duck_enabled_toggled(self, checked: bool) -> None:
+        self._settings.duck_enabled = bool(checked)
+        self._settings.save()
+        log_app.info("audio ducking %s", "enabled" if checked else "disabled")
+
+    def _on_duck_level_changed(self, value: int) -> None:
+        v = max(0, min(100, int(value)))
+        if hasattr(self, "_duck_label"):
+            self._duck_label.setText(f"{v}%")
+        if v == self._settings.duck_level_pct:
+            return
+        self._settings.duck_level_pct = v
+        self._settings.save()
 
     # --- LLM post-processing handlers ----------------------------------
 
@@ -4430,6 +5315,7 @@ class App(QObject):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.settings = Settings(SETTINGS_FILE)
         self.log = TranscriptLog(HISTORY_FILE)
+        self.notes = NotesLog(NOTES_FILE)
         self.replacements = Replacements(
             here / REPLACEMENTS_FILE,
             per_context_dir=PER_CONTEXT_DICT_DIR,
@@ -4443,9 +5329,10 @@ class App(QObject):
         self.updater = Updater(self.install_dir)
 
         self.recorder = AudioRecorder()
+        self.ducker = AudioDucker()
         self.engine = WhisperEngine(self.settings.model_name)
         self.overlay = Overlay()
-        self.hotkey = HotkeyWatcher()
+        self.hotkey = HotkeyWatcher(settings=self.settings)
         self.injector = TextInjector()
 
         # Apply persisted audio settings to the recorder.
@@ -4459,7 +5346,7 @@ class App(QObject):
         )
 
         # Tray + panel — panel is hidden by default; opened from the tray.
-        self.panel = MainPanel(self.log, self.settings, self.updater, self.recorder)
+        self.panel = MainPanel(self.log, self.notes, self.settings, self.updater, self.recorder)
         self.tray = TrayIcon(self.updater, self)
         if not QSystemTrayIcon.isSystemTrayAvailable():
             log_app.warning("system tray not available — tray icon will be inactive")
@@ -4467,10 +5354,12 @@ class App(QObject):
         self.tray.copy_last.connect(self._copy_last_to_clipboard)
         self.tray.quit_requested.connect(self.quit)
         self.tray.install_update.connect(self.updater.install_async)
+        self.tray.refresh_ui_requested.connect(self.refresh_ui)
         self.updater.update_found.connect(self.tray.set_update_available)
 
         # Model-switching: panel asks → App orchestrates → panel renders progress.
         self.panel.model_switch_requested.connect(self.switch_model_async)
+        self.panel.refresh_ui_requested.connect(self.refresh_ui)
         self.model_switch_state.connect(self.panel.on_model_switch_state)
         self.model_download_progress.connect(self.panel.on_model_download_progress)
 
@@ -4480,11 +5369,20 @@ class App(QObject):
         self.hotkey.cancel_requested.connect(self.on_cancel)
         self.hotkey.repaste_requested.connect(self.on_repaste_last)
         self.hotkey.llm_apply_requested.connect(self.on_llm_apply_last)
+        self.hotkey.note_toggle_requested.connect(self.on_note_toggle)
+        # Note recording state — separate from dictation recording. A note
+        # toggle press flips this; on release we transcribe and save to
+        # NotesLog (no paste).
+        self._note_recording = False
+        self._note_cancel = False
         # Apply hotkey mode from settings and react to live changes.
         self.hotkey.set_mode(self.settings.hotkey_mode)
         self.settings.changed.connect(
             lambda: self.hotkey.set_mode(self.settings.hotkey_mode)
         )
+        # Re-bind configurable hotkeys whenever Settings is saved (user
+        # edited a hotkey in the Settings tab).
+        self.settings.changed.connect(self.hotkey.apply_settings)
         self.ui_state.connect(self.overlay.set_state)
         self.ui_level.connect(self.overlay.push_level)
 
@@ -4521,6 +5419,13 @@ class App(QObject):
 
     def quit(self) -> None:
         log_app.info("quit requested")
+        # Restore other-app audio if we exit mid-recording — otherwise the
+        # user's Discord / VLC / browser stays stuck at 5% until they
+        # adjust it manually.
+        try:
+            self.ducker.restore()
+        except Exception:
+            log_app.debug("quit: ducker.restore failed", exc_info=True)
         # Release the global keyboard hooks (Ctrl+Win polls + the
         # Ctrl+Win+Q hotkey). The `keyboard` library spawns a low-level
         # Windows hook thread that can leak across abnormal exits otherwise.
@@ -4535,6 +5440,95 @@ class App(QObject):
         except Exception:
             pass
         QApplication.instance().quit()
+
+    def refresh_ui(self) -> None:
+        """Reset the overlay + tray + hotkey state when the visible UI gets
+        wedged (overlay disappeared, recording state stuck, tray icon
+        missing). Safe to call from the tray menu or the Settings button.
+        Does NOT touch the Whisper model or in-flight transcription threads —
+        a transcribe in progress will still complete and emit its result; we
+        only rebuild the surface visuals + hotkey watchers around it.
+        """
+        log_app.info("refresh_ui: rebuilding overlay + tray + hotkey state")
+        # 1. Stop the live-level timer so we're not pushing into an overlay
+        #    we're about to replace.
+        try:
+            self._level_timer.stop()
+        except Exception:
+            log_app.debug("refresh_ui: level timer stop failed", exc_info=True)
+
+        # 2. Bump generation so any in-flight transcribe stops emitting UI
+        #    state — its result still gets saved to history/notes, but it
+        #    won't paint "done" / "idle" over our fresh overlay.
+        self._bump_gen()
+
+        # 2b. Restore any ducked audio sessions — we're tearing down the
+        #     recording surface, so leaving other apps' volume at 5% would
+        #     be a nasty surprise.
+        try:
+            self.ducker.restore()
+        except Exception:
+            log_audio.debug("refresh_ui: ducker.restore failed", exc_info=True)
+
+        # 3. If we were mid-recording (either dictation or note), abandon
+        #    cleanly. Audio buffer is dropped; mic stream is closed.
+        if self._note_recording:
+            try:
+                self.recorder.stop()
+            except Exception:
+                log_audio.debug("refresh_ui: recorder.stop failed", exc_info=True)
+            self._note_recording = False
+            self._note_cancel = False
+            self.hotkey.set_note_in_progress(False)
+        if self.hotkey.recording:
+            self._cancel_current_recording = True
+            try:
+                self.recorder.stop()
+            except Exception:
+                log_audio.debug("refresh_ui: recorder.stop failed", exc_info=True)
+            self.hotkey.force_release()
+
+        # 4. Rebuild the overlay. Just hiding+showing isn't enough when the
+        #    Qt window has gone funky (state lost, parent destroyed); a
+        #    fresh widget is the most reliable reset.
+        old_overlay = self.overlay
+        try:
+            self.ui_state.disconnect(old_overlay.set_state)
+        except Exception:
+            pass
+        try:
+            self.ui_level.disconnect(old_overlay.push_level)
+        except Exception:
+            pass
+        try:
+            old_overlay.hide()
+            old_overlay.deleteLater()
+        except Exception:
+            log_app.debug("refresh_ui: overlay teardown noise", exc_info=True)
+        self.overlay = Overlay()
+        self.overlay.set_scale(self.settings.sensitivity)
+        self.ui_state.connect(self.overlay.set_state)
+        self.ui_level.connect(self.overlay.push_level)
+        self.overlay.show()
+        self.ui_state.emit("idle")
+
+        # 5. Make sure the tray icon is still visible — Explorer can drop tray
+        #    icons after an Explorer.exe restart and we'd never know.
+        try:
+            if not self.tray.isVisible():
+                self.tray.show()
+        except Exception:
+            log_app.debug("refresh_ui: tray re-show failed", exc_info=True)
+
+        # 6. Force-rebuild the panel's history + notes lists in case a list
+        #    rendering hiccup left rows in a bad state.
+        try:
+            self.panel._refresh_list()
+            self.panel._refresh_notes_list()
+        except Exception:
+            log_app.debug("refresh_ui: panel refresh failed", exc_info=True)
+
+        log_app.info("refresh_ui: done")
 
     def _show_panel(self) -> None:
         # Position once per session: horizontally centered on the primary
@@ -4585,6 +5579,17 @@ class App(QObject):
                 )
         self.recorder.set_device(idx)
         self.recorder.set_gain(self.settings.input_gain)
+
+    def _duck_if_enabled(self) -> None:
+        """Lower other apps' volume if the user has enabled ducking. No-op
+        otherwise — pycaw isn't even imported until we get here."""
+        if not self.settings.duck_enabled:
+            return
+        level = max(0, min(100, int(self.settings.duck_level_pct))) / 100.0
+        try:
+            self.ducker.duck(level=level)
+        except Exception:
+            log_audio.exception("ducker.duck raised")
 
     def _copy_last_to_clipboard(self) -> None:
         last = self.log.last()
@@ -4777,11 +5782,16 @@ class App(QObject):
             log_audio.exception("mic start failed")
             self.ui_state.emit("error")
             return
+        self._duck_if_enabled()
         self.ui_state.emit("recording")
         self._level_timer.start()
 
     def on_release(self) -> None:
         self._level_timer.stop()
+        # Restore other apps' volume immediately on release — doing it here
+        # (rather than after transcription) keeps the perceived ducking
+        # window tight to the actual recording window.
+        self.ducker.restore()
         try:
             audio = self.recorder.stop()
         except Exception:
@@ -4808,8 +5818,13 @@ class App(QObject):
 
     def on_cancel(self) -> None:
         """Esc pressed — abandon the current recording without transcribing.
-        Only acts when we're actually recording; otherwise Esc behaves
-        normally for whatever app the user is in."""
+        Only acts when we're actually recording (dictation OR a note);
+        otherwise Esc behaves normally for whatever app the user is in."""
+        if self._note_recording:
+            log_hotkey.info("Esc: cancel current note recording")
+            self._note_cancel = True
+            self._end_note_recording()
+            return
         if not self.hotkey.recording:
             return
         log_hotkey.info("Esc: cancel current recording")
@@ -4857,6 +5872,105 @@ class App(QObject):
             daemon=True,
             name="llm-apply",
         ).start()
+
+    def on_note_toggle(self) -> None:
+        """Ctrl+Win+N: toggle a note recording. First press starts; second
+        press stops, transcribes, and saves to the Notes tab (no paste).
+        Auto-flags the note with the foreground app's basename so notes can
+        later be searched/grouped by where you were when you captured them.
+        """
+        if self._note_recording:
+            self._end_note_recording()
+            return
+        # If a dictation is currently active, drop it cleanly so the audio
+        # stream is free and we don't end up with a phantom partial paste.
+        if self.hotkey.recording:
+            log_hotkey.info("note toggle: cancelling in-flight dictation")
+            self._cancel_current_recording = True
+            self.hotkey.force_release()
+        self._begin_note_recording()
+
+    def _begin_note_recording(self) -> None:
+        gen = self._bump_gen()
+        self._note_cancel = False
+        self._current_context = get_foreground_process_basename()
+        log_hotkey.info("note begin (gen=%d, context=%s)", gen, self._current_context)
+        try:
+            self.recorder.start()
+        except Exception:
+            log_audio.exception("note: mic start failed")
+            self.ui_state.emit("error")
+            return
+        self._note_recording = True
+        self.hotkey.set_note_in_progress(True)
+        self._duck_if_enabled()
+        self.ui_state.emit("recording")
+        self._level_timer.start()
+
+    def _end_note_recording(self) -> None:
+        self._level_timer.stop()
+        self.ducker.restore()
+        try:
+            audio = self.recorder.stop()
+        except Exception:
+            log_audio.exception("note: mic stop failed")
+            self.ui_state.emit("error")
+            self._note_recording = False
+            self.hotkey.set_note_in_progress(False)
+            return
+        self._note_recording = False
+        self.hotkey.set_note_in_progress(False)
+        if self._note_cancel:
+            log_hotkey.info("note: cancelled — skipping transcribe")
+            self._note_cancel = False
+            self.ui_state.emit("idle")
+            return
+        if audio.size == 0:
+            log_hotkey.debug("note: no audio")
+            self.ui_state.emit("idle")
+            return
+        gen = self._bump_gen()
+        log_hotkey.debug("note → transcribe (gen=%d, %.2fs)",
+                         gen, audio.size / SAMPLE_RATE)
+        self.ui_state.emit("transcribing")
+        threading.Thread(
+            target=self._process_note_audio, args=(audio, gen, self._current_context),
+            daemon=True, name=f"note-transcribe-{gen}",
+        ).start()
+
+    def _process_note_audio(self, audio: np.ndarray, gen: int, app: str | None) -> None:
+        if not self._is_latest(gen):
+            log_app.debug("note transcribe(gen=%d) stale before start — skip", gen)
+            return
+        prompt = build_initial_prompt(self.log)
+        hotwords = ", ".join(self.replacements.vocab) or None
+        with self._engine_lock:
+            try:
+                raw = self.engine.transcribe(audio, initial_prompt=prompt, hotwords=hotwords)
+            except Exception:
+                log_engine.exception("note transcribe failed (gen=%d)", gen)
+                if self._is_latest(gen):
+                    self.ui_state.emit("error")
+                    self._schedule_reset(gen)
+                return
+        if not raw:
+            if self._is_latest(gen):
+                self.ui_state.emit("idle")
+            return
+        text = self.replacements.apply(raw, context=app)
+        if self.settings.voice_commands:
+            text = self.voice_commands.process(text)
+        text = apply_smart_defaults(text)
+        if text != raw:
+            log_app.info("note rewrite %r -> %r", raw, text)
+        # Notes are NEVER pasted (that's the whole point — silent capture).
+        # No LLM auto-apply either; notes go in raw-clean so the user can
+        # decide later what to do with them.
+        self.notes.add(text, app=app, raw=raw)
+        log_app.info("note saved: %d chars (app=%s)", len(text), app or "?")
+        if self._is_latest(gen):
+            self.ui_state.emit("done")
+            self._schedule_reset(gen)
 
     def _llm_apply_worker(self, text: str, prompt: dict, paste: bool) -> None:
         gen = self._bump_gen()
