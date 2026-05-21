@@ -2,6 +2,26 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [2.2.1] — 2026-05-20
+
+Two narrowly-scoped additions on top of v2.2.0. An earlier `v2.2.1 → v2.2.3` fix-pack was reverted because part of it correlated with empty-transcribe bugs we couldn't fully isolate; this release re-introduces only the two pieces that are clearly safe and useful.
+
+### Orange flash on empty transcribes
+
+When Whisper returns empty text (too-short press, silent audio, VAD-rejected) the overlay now flashes an orange dot before resetting to idle, instead of silently returning to idle. This makes "we tried, got nothing" visually distinct from "pasted successfully into a window you're not looking at". Pure render-state change — no audio-pipeline side effects.
+
+### `run.bat` self-elevates by default
+
+`run.bat` checks for Administrator privilege at launch and re-spawns itself elevated via PowerShell's `Start-Process -Verb RunAs` if it isn't. Triggers one UAC prompt per launch. This makes Tellur a privilege peer to elevated foreground apps, so paste keystrokes aren't dropped by Windows UIPI when targeting admin terminals / certain games.
+
+Opt out by setting `TELLUR_NO_ELEVATE=1` before running the script — useful if elevation correlates with a problem and you need to bisect.
+
+### Not re-introduced from the reverted commit
+
+These were also in the original 2.2.1–2.2.3 work but stayed out of this release pending further investigation: paste-target elevation mismatch warning, mic-device name re-resolution on every press, LLM "Test connection" exception-scope fix, personalized dictionary, debug logging.
+
+---
+
 ## [2.2.0] — 2026-05-18
 
 Three things: **audio ducking** (lower other apps while you talk), **customizable secondary hotkeys**, and the notes default moved off `Ctrl+Win+N`.

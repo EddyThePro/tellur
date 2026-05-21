@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 APP_NAME = "Tellur"
 
 
@@ -2374,6 +2374,12 @@ class Overlay(QWidget):
             return QColor(96, 200, 138), 2.6
         if self._state == "error":
             return QColor(230, 160, 80), 2.6
+        # "empty" — Whisper returned no text (silent / too-short / VAD-rejected).
+        # Distinct orange so the user can tell "we tried, got nothing" apart
+        # from "pasted successfully into a window you're not looking at".
+        # Purely a render state — no audio-pipeline side effects.
+        if self._state == "empty":
+            return QColor(255, 165, 0), 2.8
         return QColor(140, 144, 156, 170), 1.8
 
 
@@ -5954,8 +5960,11 @@ class App(QObject):
                     self._schedule_reset(gen)
                 return
         if not raw:
+            # Empty transcribe — flash orange so a too-short / silent press is
+            # visually distinct from a successful paste landing off-screen.
             if self._is_latest(gen):
-                self.ui_state.emit("idle")
+                self.ui_state.emit("empty")
+                self._schedule_reset(gen)
             return
         text = self.replacements.apply(raw, context=app)
         if self.settings.voice_commands:
@@ -6060,8 +6069,11 @@ class App(QObject):
                 return
 
         if not raw:
+            # Empty transcribe — flash orange so a too-short / silent press is
+            # visually distinct from a successful paste landing off-screen.
             if self._is_latest(gen):
-                self.ui_state.emit("idle")
+                self.ui_state.emit("empty")
+                self._schedule_reset(gen)
             return
 
         text = self.replacements.apply(raw, context=self._current_context)

@@ -9,6 +9,13 @@ rem On first run, creates a Python 3.11 venv at %TELLUR_HOME%\.venv and
 rem installs dependencies. On subsequent runs, just launches the app via
 rem pythonw (no console window).
 rem
+rem Auto-elevation: if not already running as Administrator, re-launches
+rem itself via PowerShell's Start-Process -Verb RunAs so Tellur can paste
+rem into elevated apps (admin terminals, some games). Triggers one UAC
+rem prompt per launch. Opt out by setting TELLUR_NO_ELEVATE=1 before
+rem running this script (useful if elevation correlates with a problem
+rem and you need to bisect).
+rem
 rem TELLUR_HOME resolution order:
 rem   1. The process env var (if set in this shell or inherited).
 rem   2. The user-level Windows env var (where `setx TELLUR_HOME ...` writes).
@@ -16,6 +23,15 @@ rem   3. Default: %LOCALAPPDATA%\Tellur
 rem
 rem TELLUR_VENV defaults to %TELLUR_HOME%\.venv.
 rem ----------------------------------------------------------------------
+
+rem --- self-elevate so paste isn't blocked by Windows UIPI ---
+if not defined TELLUR_NO_ELEVATE (
+    net session >nul 2>&1
+    if errorlevel 1 (
+        powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+        exit /b
+    )
+)
 
 if not defined TELLUR_HOME (
     for /f "skip=2 tokens=2,*" %%a in ('reg query "HKCU\Environment" /v TELLUR_HOME 2^>nul') do set "TELLUR_HOME=%%b"
