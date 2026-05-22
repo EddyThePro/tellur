@@ -2,6 +2,25 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [2.2.2] — 2026-05-21
+
+Adds **start Tellur on Windows login** as an opt-in Settings toggle.
+
+### Start on login
+
+- New **Settings → General → Start Tellur when I log into Windows** checkbox.
+- Backed by an `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Tellur` entry pointing at this install's `run.bat`. Per-user — no admin needed to enable.
+- `App.start()` reconciles the registry against the saved setting on every boot, so a moved install or an externally-cleared registry entry re-registers itself.
+- Each `Settings.save()` calls `apply_start_on_login()` to keep the registry consistent with what's persisted in `settings.json`.
+- Triggers one UAC prompt at login (because `run.bat` self-elevates). Skip by setting `TELLUR_NO_ELEVATE=1` before launch.
+
+### Under the hood
+
+- New module-level helpers: `is_start_on_login_enabled()`, `apply_start_on_login()`, `_start_on_login_command()`. All `winreg`-only, Windows-guarded, fail-soft.
+- New `Settings.start_on_login: bool` field; round-trips through `_load` / `save`.
+
+---
+
 ## [2.2.1] — 2026-05-20
 
 Two narrowly-scoped additions on top of v2.2.0. An earlier `v2.2.1 → v2.2.3` fix-pack was reverted because part of it correlated with empty-transcribe bugs we couldn't fully isolate; this release re-introduces only the two pieces that are clearly safe and useful.

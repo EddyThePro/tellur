@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "2.2.1"
+__version__ = "2.2.2"
 APP_NAME = "Tellur"
 
 
@@ -478,6 +478,69 @@ class Replacements:
                 seen.add(v)
                 out.append(v)
         return out
+
+
+def _start_on_login_command() -> str:
+    """Command to register in HKCU\\...\\Run for auto-start at login. Points
+    at this install's run.bat so the same self-elevation + venv discovery
+    + env-var resolution path runs regardless of how Tellur was launched
+    historically. Quoted in case the install path contains spaces."""
+    bat = Path(__file__).resolve().parent / "run.bat"
+    return f'"{bat}"'
+
+
+def is_start_on_login_enabled() -> bool:
+    """True if Tellur is registered for auto-start at user login. Reads the
+    per-user Run key — never touches HKLM, never requires admin to read.
+    Compares against the command we'd write, so a stale value from a moved
+    install or a different launcher reads as 'not really us'."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+        ) as k:
+            try:
+                value, _ = winreg.QueryValueEx(k, APP_NAME)
+            except FileNotFoundError:
+                return False
+        return value == _start_on_login_command()
+    except Exception:
+        log_app.debug("is_start_on_login_enabled check failed", exc_info=True)
+        return False
+
+
+def apply_start_on_login(enabled: bool) -> bool:
+    """Add or remove the per-user Run-key entry for Tellur. Returns True on
+    success, False if the registry write fails. Idempotent: enabling when
+    already enabled (or disabling when already disabled) is a no-op."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        if enabled:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE,
+            ) as k:
+                winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ,
+                                  _start_on_login_command())
+            log_app.info("start-on-login: enabled (Run key set)")
+        else:
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE,
+                ) as k:
+                    winreg.DeleteValue(k, APP_NAME)
+                log_app.info("start-on-login: disabled (Run key removed)")
+            except FileNotFoundError:
+                pass  # already absent
+        return True
+    except Exception:
+        log_app.exception("apply_start_on_login failed (enabled=%s)", enabled)
+        return False
 
 
 def get_foreground_process_basename() -> str | None:
@@ -1140,6 +1203,11 @@ class Settings(QObject):
         self.hotkey_repaste: str = "ctrl+windows+b"
         self.hotkey_llm: str = "ctrl+windows+l"
         self.hotkey_note: str = "ctrl+windows+z"
+        # Start on Windows login (v2.2.2) — backed by an HKCU\...\Run entry
+        # that points at this install's run.bat. App reconciles the registry
+        # with this value on every save() so a manual registry edit (or a
+        # moved install) is fixed up the next time the user touches Settings.
+        self.start_on_login: bool = False
         self._load()
 
     def _load(self) -> None:
@@ -1198,6 +1266,9 @@ class Settings(QObject):
                         v = data.get(name)
                         if isinstance(v, str) and v.strip():
                             setattr(self, name, v.strip().lower())
+                    self.start_on_login = bool(data.get(
+                        "start_on_login", self.start_on_login,
+                    ))
                     requested = str(data.get("model_name", self.model_name))
                     valid_names = {m["name"] for m in KNOWN_MODELS}
                     if requested not in valid_names:
@@ -1247,6 +1318,7 @@ class Settings(QObject):
             "hotkey_repaste": self.hotkey_repaste,
             "hotkey_llm": self.hotkey_llm,
             "hotkey_note": self.hotkey_note,
+            "start_on_login": self.start_on_login,
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1255,6 +1327,11 @@ class Settings(QObject):
             tmp.replace(self.path)
         except Exception:
             log_app.exception("failed to save settings")
+        # Reconcile the HKCU\...\Run registry entry with the saved setting.
+        # Done here (not in __init__) so a manual edit to settings.json picks
+        # up only on the next user-driven Settings change, not on startup —
+        # but each Settings save makes the registry match what's persisted.
+        apply_start_on_login(self.start_on_login)
         self.changed.emit()
 
 
@@ -4207,6 +4284,18 @@ class MainPanel(QWidget):
             "\"close quote\" become actual punctuation. \"Scratch that\" / \"delete that\" "
             "drops the previous sentence. First letter of each sentence is auto-capitalized."
         ))
+
+        # Start-on-login (v2.2.2) — writes an HKCU\...\Run entry pointing
+        # at this install's run.bat.
+        self._start_on_login_cb = QCheckBox("Start Tellur when I log into Windows")
+        self._start_on_login_cb.setChecked(self._settings.start_on_login)
+        self._start_on_login_cb.toggled.connect(self._on_start_on_login_toggled)
+        gen_box.addWidget(self._start_on_login_cb)
+        gen_box.addWidget(self._section_hint(
+            "Adds Tellur to your user-level Run registry key. Triggers one UAC "
+            "prompt at login (because <code>run.bat</code> self-elevates). "
+            "Set <code>TELLUR_NO_ELEVATE=1</code> to skip the prompt and run unelevated."
+        ))
         layout.addLayout(gen_box)
 
         # --- hotkey mode section ---
@@ -4716,6 +4805,11 @@ class MainPanel(QWidget):
         self._settings.voice_commands = bool(checked)
         self._settings.save()
         log_app.info("voice commands %s", "enabled" if checked else "disabled")
+
+    def _on_start_on_login_toggled(self, checked: bool) -> None:
+        # Settings.save() reconciles the registry entry — see apply_start_on_login.
+        self._settings.start_on_login = bool(checked)
+        self._settings.save()
 
     def _on_hk_mode_changed(self, _idx: int) -> None:
         mode = self._hk_mode_combo.currentData() or "hold"
@@ -5421,6 +5515,12 @@ class App(QObject):
         days = self.settings.history_retention_days
         if days > 0:
             self.log.purge_older_than(days * 86400)
+        # Reconcile start-on-login registry entry with the saved setting.
+        # Handles two cases: (1) install dir was moved, so the prior Run
+        # value points at a stale path; (2) registry entry was cleared by
+        # another tool. Cheap idempotent — only writes when state differs.
+        if self.settings.start_on_login != is_start_on_login_enabled():
+            apply_start_on_login(self.settings.start_on_login)
         log_app.info("started — tray icon visible")
 
     def quit(self) -> None:
