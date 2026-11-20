@@ -9,8 +9,11 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "2.2.2"
+__version__ = "2.7.4"
 APP_NAME = "Tellur"
+# Windows Task Scheduler task that launches Tellur elevated (no UAC prompt).
+# Optional: installs that never created the task keep the legacy Run-key path.
+TELLUR_TASK_NAME = "Tellur"
 
 
 # ===========================================================================
@@ -94,8 +97,8 @@ from faster_whisper import WhisperModel
 
 from PyQt6.QtCore import Qt, QSize, QTimer, QObject, QRectF, pyqtSignal
 from PyQt6.QtGui import (
-    QAction, QColor, QGuiApplication, QIcon, QKeySequence, QPainter,
-    QPainterPath, QPixmap,
+    QAction, QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter,
+    QPainterPath, QPixmap, QPen,
 )
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QInputDialog,
@@ -109,7 +112,7 @@ from PyQt6.QtWidgets import (
 # configuration
 # ===========================================================================
 # whisper
-DEFAULT_MODEL = "large-v3-turbo"
+DEFAULT_MODEL = "distil-large-v3.5"
 PREFERRED_DEVICE = "cuda"
 CUDA_COMPUTE_TYPE = "float16"
 CPU_COMPUTE_TYPE = "int8"
@@ -124,19 +127,63 @@ KNOWN_MODELS: list[dict] = [
      "summary": "balanced for modest hardware"},
     {"name": "distil-large-v3",  "label": "Distil-Large v3", "size_mb": 1500,
      "summary": "fast, English only"},
+    {"name": "distil-large-v3.5", "label": "Distil-Large v3.5", "size_mb": 1500,
+     "summary": "recommended — best short-form accuracy, ~1.5× faster than "
+                "turbo, English only"},
     {"name": "large-v3-turbo",   "label": "Large v3 turbo",  "size_mb": 1620,
-     "summary": "recommended — near-large-v3 quality, ~6× faster"},
+     "summary": "near-large-v3 quality, multilingual, best for long clips"},
     {"name": "large-v3",         "label": "Large v3",        "size_mb": 3094,
      "summary": "highest accuracy, slower on weaker GPUs"},
 ]
 
+# Auto backend routing ("auto" stt_backend): local Whisper when the GPU is
+# free, ElevenLabs when it's under load (a game, a render, a big LLM decode).
+# Utilization is NVML's rolling sample — an idle desktop reads 0-15%, any real
+# game reads 80%+, so the threshold has a wide safe band. The VRAM floor is
+# the fp16 model (~1.6 GB) plus decode workspace; below it a local load would
+# either fail or evict someone else's allocations mid-game.
+AUTO_GPU_BUSY_UTIL_PCT = 50.0
+AUTO_GPU_MIN_FREE_VRAM_MB = 2600
+# Routing to cloud this many times in a row (GPU busy each time) drops the
+# loaded local model to give its VRAM back to whatever is keeping the GPU
+# busy. It reloads automatically (~1-2 s) on the next local decode.
+AUTO_RELEASE_AFTER_BUSY = 3
+# ...but only when VRAM is actually scarce. An idle model costs no GPU time,
+# just memory, so unloading it while the card has room to spare buys the busy
+# app nothing and charges the next local clip a ~1.7 s reload (100 clips paid
+# that between Sep and Nov 2026, most with 20+ GB free). Below this much free
+# VRAM the release still happens.
+AUTO_RELEASE_BELOW_FREE_VRAM_MB = 6000
+# One GPU sample answers both the record-start badge and the decode that
+# follows a few seconds later; caching keeps those two decisions identical.
+AUTO_GPU_CACHE_SEC = 2.0
+
 # audio
 SAMPLE_RATE = 16000
 MIN_AUDIO_SECONDS = 0.25
+# Local-decode rescue for quiet recordings (see WhisperEngine.transcribe):
+# below SILENCE the buffer is a dead/muted mic and is decoded as-is (boosting
+# pure noise 1000x just hallucinates text); below NORMALIZE it's linearly
+# scaled so its peak hits TARGET before the decode.
+QUIET_PEAK_SILENCE = 0.003
+QUIET_PEAK_NORMALIZE = 0.30
+QUIET_PEAK_TARGET = 0.70
 MAX_RECORDING_SECONDS = 300   # 5 minutes — hard cap to prevent unbounded RAM
+
+# Mic passthrough ("hear-through") — a live mic -> speakers monitor so the room
+# stays audible without pulling an IEM out. Runs at 48 kHz rather than
+# SAMPLE_RATE: 16 kHz is a Whisper *input* rate and sounds muffled played back.
+# The block size sets the delay you hear yourself at; much above ~20 ms starts
+# to disrupt speech (delayed auditory feedback), so it is kept small.
+PASSTHROUGH_SAMPLE_RATE = 48000
+PASSTHROUGH_BLOCK = 240              # 5 ms at 48 kHz
+PASSTHROUGH_QUEUE_BLOCKS = 8         # ~40 ms ceiling on buffered audio
+PASSTHROUGH_RATE_FALLBACKS = (48000, 44100)
 
 # hotkey
 HOTKEY_POLL_MS = 20
+HOOK_HEALTH_POLL_MS = 5000   # cadence of the LL-hook death probe (HotkeyWatcher)
+REHOOK_MIN_GAP_SEC = 30.0    # min spacing between hook reinstalls, anti-thrash
 
 # overlay
 OVERLAY_WIDTH = 64
@@ -149,26 +196,109 @@ BAR_MIN_HEIGHT = 2
 BAR_LEVEL_SCALE = 120.0      # RMS multiplier — full bar at ~0.008 RMS
 LEVEL_PUSH_HZ = 24
 RESET_AFTER_DONE_SEC = 1.0
+# Engine badge (v2.4): when dictation is being served by LOCAL Whisper instead
+# of the cloud engine the user selected, the pill grows upward and paints a
+# label under the bars. Silent degradation to local Whisper was invisible
+# before this — the only clue was a transcript that read slightly worse.
+OVERLAY_BADGE_HEIGHT = 11    # extra pill height when the badge is showing
+OVERLAY_BADGE_WIDTH = 78     # pill widens to fit the label text
+OVERLAY_BADGE_FONT_PT = 7
+OVERLAY_BADGE_TEXT = "WHISPER"
+OVERLAY_BADGE_COLOR = (255, 176, 64)   # amber — matches the "error" dot family
 
 # behavior
 PASTE_AFTER_TRANSCRIBE = True
 PASTE_KEYSTROKE_DELAY_SEC = 0.06
 CLIPBOARD_RESTORE_DELAY_SEC = 0.8
 
+# Terminal-aware paste (v2.3). A simulated Ctrl+V only pastes if the focused
+# window translates it into a paste — and console hosts often don't:
+#   - Legacy conhost (a bare cmd.exe / PowerShell window): when a TUI app
+#     (Claude Code, vim, etc.) holds the console in raw mode, conhost's
+#     Ctrl+V / Shift+Insert paste shortcuts are disabled entirely
+#     (they're gated on ENABLE_PROCESSED_INPUT, which raw mode clears).
+#     No paste chord works; the only reliable injection is typing the
+#     characters, which conhost turns into input records in any mode.
+#   - A few terminal emulators reserve a different paste chord entirely
+#     (mintty: Shift+Insert; Alacritty/WezTerm: Ctrl+Shift+V).
+#   - Windows Terminal and the VS Code family bind Ctrl+V themselves
+#     (delivered to the app as a bracketed paste), so the default path
+#     already works there.
+# Strategy is chosen per-paste from the foreground window's class/process.
+TERMINAL_TYPE_KEY_DELAY_SEC = 0.002   # per-char gap when typing into consoles
+
+# Legacy console host window class (cmd.exe / powershell.exe when NOT hosted
+# by Windows Terminal, whose class is CASCADIA_HOSTING_WINDOW_CLASS).
+CONSOLE_WINDOW_CLASS = "ConsoleWindowClass"
+
+# Foreground process basename → paste chord overrides. mintty pastes on
+# Shift+Insert; Alacritty and WezTerm reserve Ctrl+Shift+V. Anything
+# unlisted keeps plain Ctrl+V — including the VS Code family (VS Code /
+# Cursor / Windsurf), where Ctrl+V is bound everywhere that matters
+# (editor, chat panels, AND the integrated terminal on Windows); a
+# Shift+Insert override there broke chat-panel paste in practice (v2.3.1).
+PASTE_CHORD_BY_PROCESS: dict[str, str] = {
+    "mintty": "shift+insert",
+    "alacritty": "ctrl+shift+v",
+    "wezterm-gui": "ctrl+shift+v",
+}
+
+# Electron-based editors share one top-level window class, so we can't route by
+# window/process alone (a Shift+Insert override for the whole app breaks the
+# chat panel — see the v2.3.1 revert). Instead we inspect the focused element's
+# class via UIA: an xterm.js integrated terminal focuses a textarea whose class
+# contains this marker. Only then do we switch off plain Ctrl+V. Substring match
+# keeps it robust to xterm.js markup changes.
+XTERM_FOCUS_CLASS_MARKER = "xterm"
+# Processes whose windows are Electron editors worth probing with UIA. Keeps the
+# (small) UIA cost off the hot path for everything else.
+ELECTRON_EDITOR_PROCS = frozenset({"cursor", "code", "windsurf", "codium", "vscodium"})
+
 # personalization
 REPLACEMENTS_FILE = "replacements.json"
 HISTORY_SIZE = 1                  # transcripts fed back as Whisper context
 PROMPT_MAX_CHARS = 900
 
+# A paste must not start while Ctrl+Win is physically held: `keyboard.send`
+# presses AND releases Ctrl, the PTT poll reads the same key state, so a paste
+# landing mid-hold cut the user's NEXT recording short (14 cases in the logs,
+# text landing in Windows shell windows). paste() waits for the release, up
+# to this long, before touching the keyboard.
+PASTE_WAIT_FOR_KEYS_SEC = 30.0
+# ElevenLabs Scribe labels non-speech as `[pause]`, `[clicking]`, `[silence]`
+# … — dictation wants those gone, not pasted (~40 pasted across the logs).
+AUDIO_EVENT_TAG_RE = re.compile(r"\s*\[[^\[\]\n]{1,40}\]\s*")
+
 # decoder robustness — guards against repetition loops on the user's own audio.
 BEAM_SIZE = 5
 NO_REPEAT_NGRAM_SIZE = 3
 REPETITION_PENALTY = 1.05
+# Models whose decoder is too shallow to survive a prompt. Distil-Whisper keeps
+# 2 of large-v3's 32 decoder layers; anything placed in the <|startofprev|>
+# context — the previous transcript via `initial_prompt`, or the dictionary via
+# `hotwords` (faster-whisper puts both there) — makes it stop early or emit
+# function-word salad ("I we , the to do and a , you know, it, I is").
+# Measured 2026-08-23 on distil-large-v3.5 against 8 synthesized + 5 real
+# clips: the prompted decode lost >70% of the words on 4 of them; the plain
+# decode was near-verbatim on all 13. For these models the local decode sends
+# nothing but the audio, and the repetition penalties (band-aids for loops the
+# prompt itself induced) are dropped too.
+PROMPT_FRAGILE_MODEL_PREFIXES = ("distil",)
+# Truncation guard: a local decode that yields fewer than this many words per
+# second of audio on a clip at least LOCAL_GUARD_MIN_SECONDS long is
+# re-decoded once with the plain config and no VAD; the longer result wins.
+# Conversational dictation runs ~2.8 words/s (median over 2,000 clips); 1.2 is
+# below anything but long-pause speech, and the retry costs ~0.3 s.
+LOCAL_GUARD_MIN_SECONDS = 5.0
+LOCAL_GUARD_MIN_WORDS_PER_SEC = 1.2
 
 # auto-update — checks GitHub releases on startup, offers one-click install.
 UPDATE_REPO = "EddyThePro/tellur"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_TIMEOUT_SEC = 6
+# Per-read socket timeout while streaming the release zip (a stalled CDN
+# must fail, not hang the install thread forever).
+UPDATE_DOWNLOAD_TIMEOUT_SEC = 30
 UPDATE_HELPER_PARENT_WAIT_SEC = 30
 UPDATE_MAX_ZIP_BYTES = 250 * 1024 * 1024   # refuse any release zip > 250 MB
 
@@ -219,6 +349,10 @@ NOTES_FILE = DATA_DIR / "notes.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_MARKDOWN_DIR = DATA_DIR / "transcripts"   # one .md per day
 PER_CONTEXT_DICT_DIR = DATA_DIR / "replacements.d"  # v2.0 per-app overlays
+# Rolling buffer of raw dictation recordings (16-bit WAV), newest
+# `Settings.keep_recordings` kept. Off by default; turn it on when a clip
+# transcribes wrong so the exact audio can be replayed through the decoder.
+DEBUG_RECORDINGS_DIR = DATA_DIR / "debug_recordings"
 MAX_HISTORY_ENTRIES = 500
 MAX_NOTES_ENTRIES = 2000
 
@@ -290,9 +424,16 @@ def setup_logging(debug: bool) -> logging.handlers.QueueListener:
     root.addHandler(queue_handler)
 
     # noisy third-party libs — silence at WARNING+
+    # comtypes logs an interface Release() at DEBUG for every COM pointer the
+    # audio ducker touches: measured at 71% of all log lines, which shrank the
+    # useful history in a 2 MB rotation to roughly a third of its span.
     for noisy in (
         "urllib3", "huggingface_hub", "filelock", "httpcore", "httpx",
-        "faster_whisper",
+        # huggingface_hub 2.x moved to httpx2/httpcore2, which narrate every
+        # request phase at DEBUG (34 lines per model load).
+        "httpcore2", "httpx2", "hpack", "h2", "hf_xet", "fsspec",
+        "faster_whisper", "comtypes", "comtypes.client", "comtypes._comobject",
+        "comtypes._post_coinit", "comtypes._post_coinit.unknwn",
     ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -368,18 +509,57 @@ class Replacements:
         self.reload_if_changed()
 
     @staticmethod
-    def _compile_rules(raw: dict) -> tuple[list[tuple[re.Pattern, str]], list[str]]:
+    def _compile_rules(raw: dict) -> tuple[list[tuple[re.Pattern, object]], list[str]]:
+        """Compile the dictionary into ONE alternation regex applied in a
+        single pass. Keys are matched longest-first, case-insensitively, with
+        any whitespace between words; the replacement is looked up by the
+        normalized matched text.
+
+        Single pass matters: the old per-rule loop fed each rule the output
+        of the previous ones, so the shipped pair `"dot html": ".html"` +
+        `"html": "HTML"` turned `dashboard.html` into `dashboard.HTML` (three
+        real entries in the user's history). It also passed the user's value
+        to `re.sub` as a template, so a backslash in a value (a Windows path)
+        raised at substitution time and killed the transcribe thread. A
+        lookup callback has neither problem."""
         items = sorted(raw.items(), key=lambda kv: -len(kv[0]))
-        compiled: list[tuple[re.Pattern, str]] = []
+        lookup: dict[str, str] = {}
+        bodies: list[str] = []
+        values: list[str] = []
         for key, val in items:
             if not isinstance(key, str) or not isinstance(val, str) or not key:
                 continue
             parts = key.split()
-            body = r"\s+".join(re.escape(p) for p in parts)
-            pat = re.compile(rf"(?<!\w){body}(?!\w)", re.IGNORECASE)
-            compiled.append((pat, val))
-        values = [v for _, v in compiled if v.strip()]
-        return compiled, values
+            if not parts:
+                continue
+            norm = " ".join(parts).lower()
+            if norm in lookup:
+                continue
+            lookup[norm] = val
+            bodies.append(r"\s+".join(re.escape(p) for p in parts))
+            if val.strip():
+                values.append(val)
+        if not bodies:
+            return [], values
+        # `(?<![\w.])`: a key glued to a preceding dot is part of a file name
+        # or identifier (`dashboard.html`, `package.json`) — the bare
+        # `"html": "HTML"` rule must not rewrite it. Group 1 captures the
+        # whitespace before the key so a value that starts with "." can
+        # attach to the previous word (`main dot pi` → `main.py`).
+        pat = re.compile(
+            r"(\s*)(?<![\w.])(?:" + "|".join(bodies) + r")(?!\w)", re.IGNORECASE)
+
+        def _sub(m: "re.Match[str]") -> str:
+            lead = m.group(1)
+            key = " ".join(m.group(0)[len(lead):].split()).lower()
+            val = lookup.get(key)
+            if val is None:
+                return m.group(0)
+            if val.startswith(".") and lead:
+                return val
+            return lead + val
+
+        return [(pat, _sub)], values
 
     def reload_if_changed(self) -> bool:
         try:
@@ -408,7 +588,7 @@ class Replacements:
         self._compiled, self._values = self._compile_rules(self._raw)
         self._mtime = m
         log_repl.info("loaded %d replacement(s) from %s",
-                      len(self._compiled), self.path.name)
+                      len(self._raw), self.path.name)
         return True
 
     def _load_context(self, context: str) -> tuple[list[tuple[re.Pattern, str]], list[str]] | None:
@@ -442,7 +622,7 @@ class Replacements:
         compiled, values = self._compile_rules(merged)
         self._ctx_cache[context] = (m, compiled, values)
         log_repl.info("loaded %d replacement(s) from %s (context=%s, %d total after merge)",
-                      len(ctx_raw), path.name, context, len(compiled))
+                      len(ctx_raw), path.name, context, len(merged))
         return compiled, values
 
     def apply(self, text: str, context: str | None = None) -> str:
@@ -489,13 +669,71 @@ def _start_on_login_command() -> str:
     return f'"{bat}"'
 
 
+def _schtasks(*args: str) -> "subprocess.CompletedProcess":
+    """Run schtasks.exe silently (CREATE_NO_WINDOW — we may be pythonw)."""
+    return subprocess.run(
+        ["schtasks", *args], capture_output=True,
+        creationflags=0x08000000,
+    )
+
+
+def _tellur_task_xml() -> str | None:
+    """XML of the elevated 'Tellur' scheduled task, or None if it doesn't
+    exist (or schtasks failed). Existence of this task means the task owns
+    autostart + elevation and the legacy Run-key path is retired."""
+    if sys.platform != "win32":
+        return None
+    try:
+        p = _schtasks("/query", "/tn", TELLUR_TASK_NAME, "/xml")
+        if p.returncode != 0:
+            return None
+        return p.stdout.decode("utf-8", errors="replace")
+    except Exception:
+        log_app.debug("schtasks query failed", exc_info=True)
+        return None
+
+
+def _delete_legacy_run_key() -> None:
+    """Remove the old HKCU\\...\\Run entry so login can't double-launch once
+    the scheduled task owns autostart. Idempotent, best-effort."""
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0, winreg.KEY_SET_VALUE,
+        ) as k:
+            winreg.DeleteValue(k, APP_NAME)
+        log_app.info("start-on-login: removed legacy Run key (task owns autostart)")
+    except FileNotFoundError:
+        pass  # already absent
+    except Exception:
+        log_app.debug("legacy Run key cleanup failed", exc_info=True)
+
+
 def is_start_on_login_enabled() -> bool:
-    """True if Tellur is registered for auto-start at user login. Reads the
-    per-user Run key — never touches HKLM, never requires admin to read.
-    Compares against the command we'd write, so a stale value from a moved
-    install or a different launcher reads as 'not really us'."""
+    """True if Tellur is registered for auto-start at user login.
+
+    Preferred source of truth is the elevated 'Tellur' scheduled task
+    (v2.3.3): enabled unless its XML carries an explicit <Enabled>false</>
+    (which is what `schtasks /change /disable` writes). Without the task,
+    falls back to reading the per-user Run key — never touches HKLM, never
+    requires admin. Compares against the command we'd write, so a stale
+    value from a moved install reads as 'not really us'."""
     if sys.platform != "win32":
         return False
+    xml = _tellur_task_xml()
+    if xml is not None:
+        # Only the task-level switch under <Settings> is what /disable and
+        # /enable flip. Each trigger carries its own <Enabled> too; reading
+        # those as well (the old behaviour) reported a task with one disabled
+        # trigger as "off" forever, which /enable can never fix — so every
+        # settings save re-ran schtasks trying.
+        block = re.search(r"<Settings>(.*?)</Settings>", xml, re.S | re.I)
+        scope = block.group(1) if block else xml
+        return "false" not in [
+            m.lower() for m in re.findall(r"<Enabled>\s*(\w+)\s*</Enabled>", scope)
+        ]
     try:
         import winreg
         with winreg.OpenKey(
@@ -513,11 +751,34 @@ def is_start_on_login_enabled() -> bool:
 
 
 def apply_start_on_login(enabled: bool) -> bool:
-    """Add or remove the per-user Run-key entry for Tellur. Returns True on
-    success, False if the registry write fails. Idempotent: enabling when
-    already enabled (or disabling when already disabled) is a no-op."""
+    """Reconcile the autostart mechanism with the saved setting. Returns True
+    on success. Idempotent.
+
+    When the elevated 'Tellur' scheduled task exists it owns autostart:
+    enable/disable the task (silent start at login, no UAC, paste into admin
+    windows works) and keep the legacy Run key deleted so login can't launch
+    twice. Toggling the task needs the elevated token Tellur normally runs
+    with; a failure is logged and reported, never silently swallowed.
+    Without the task, the v2.2.2 per-user Run-key behavior is unchanged."""
     if sys.platform != "win32":
         return False
+    if _tellur_task_xml() is not None:
+        try:
+            p = _schtasks("/change", "/tn", TELLUR_TASK_NAME,
+                          "/enable" if enabled else "/disable")
+            if p.returncode == 0:
+                _delete_legacy_run_key()
+                log_app.info("start-on-login: scheduled task %s",
+                             "enabled" if enabled else "disabled")
+                return True
+            log_app.warning(
+                "start-on-login: schtasks /change failed (rc=%s): %s",
+                p.returncode, p.stderr.decode(errors="replace").strip(),
+            )
+            return False
+        except Exception:
+            log_app.exception("start-on-login: task toggle failed")
+            return False
     try:
         import winreg
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -543,14 +804,14 @@ def apply_start_on_login(enabled: bool) -> bool:
         return False
 
 
-def get_foreground_process_basename() -> str | None:
-    """Return the basename (without extension, lowercase) of the executable
-    that owns the current foreground window. Used for per-context vocabulary
-    selection. Windows-only — relies on ctypes Win32 calls. Returns None on
-    any failure rather than raising; callers should treat None as "no
-    context override available"."""
+def get_foreground_window_info() -> tuple[str | None, str | None]:
+    """Return (window_class, process_basename) for the current foreground
+    window — e.g. ("ConsoleWindowClass", "cmd"). The basename is lowercase,
+    without extension. Windows-only — relies on ctypes Win32 calls. Either
+    element is None on failure rather than raising; callers should treat
+    None as "no context available"."""
     if sys.platform != "win32":
-        return None
+        return None, None
     try:
         import ctypes
         from ctypes import wintypes
@@ -559,17 +820,21 @@ def get_foreground_process_basename() -> str | None:
 
         hwnd = user32.GetForegroundWindow()
         if not hwnd:
-            return None
+            return None, None
+        cls_buf = ctypes.create_unicode_buffer(256)
+        cls_name: str | None = None
+        if user32.GetClassNameW(hwnd, cls_buf, len(cls_buf)):
+            cls_name = cls_buf.value or None
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         if not pid.value:
-            return None
+            return cls_name, None
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         handle = kernel32.OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value,
         )
         if not handle:
-            return None
+            return cls_name, None
         try:
             buf = ctypes.create_unicode_buffer(1024)
             size = wintypes.DWORD(len(buf))
@@ -577,14 +842,73 @@ def get_foreground_process_basename() -> str | None:
                 handle, 0, buf, ctypes.byref(size),
             )
             if not ok:
-                return None
+                return cls_name, None
             path = Path(buf.value)
-            return path.stem.lower() or None
+            return cls_name, (path.stem.lower() or None)
         finally:
             kernel32.CloseHandle(handle)
     except Exception:
-        log_app.debug("foreground-process detection failed", exc_info=True)
+        log_app.debug("foreground-window detection failed", exc_info=True)
+        return None, None
+
+
+def get_foreground_process_basename() -> str | None:
+    """Return the basename (without extension, lowercase) of the executable
+    that owns the current foreground window. Used for per-context vocabulary
+    selection. Returns None on any failure rather than raising."""
+    return get_foreground_window_info()[1]
+
+
+# Cached UI Automation object. Building it is expensive (COM + typelib), so we
+# create it once, lazily, on the first paste into an Electron-class window. None
+# means "not yet built"; False means "build failed, don't retry".
+_uia_automation: object | None | bool = None
+
+
+def get_focused_element_class() -> str | None:
+    """Return the focused UI element's class name via UI Automation, or None.
+
+    Electron apps (VS Code / Cursor / Windsurf) all share one opaque top-level
+    window class (`Chrome_WidgetWin_1`), so the foreground *window* can't tell a
+    terminal apart from the editor or a chat box. But UIA exposes the focused
+    control's underlying CSS/DOM class, which IS distinct:
+      - integrated terminal → 'xterm-helper-textarea' (xterm.js)
+      - Cursor chat input    → 'messageInput_<hash>'
+      - editor               → Monaco classes ('monaco-list', 'View', …)
+
+    Windows-only. Best-effort: any failure (COM error, timeout, no focus)
+    returns None so the caller falls back to window-class/process heuristics.
+    This is called per-paste, so it must stay cheap and never raise."""
+    global _uia_automation
+    if sys.platform != "win32" or _uia_automation is False:
         return None
+    try:
+        if _uia_automation is None:
+            import comtypes.client
+            comtypes.client.GetModule("UIAutomationCore.dll")
+            from comtypes.gen import UIAutomationClient as _U
+            _uia_automation = comtypes.client.CreateObject(
+                _U.CUIAutomation, interface=_U.IUIAutomation,
+            )
+        el = _uia_automation.GetFocusedElement()  # type: ignore[union-attr]
+        return el.CurrentClassName or None
+    except Exception:
+        # First-time build failure → disable permanently; transient failure
+        # (no focused element) → just return None and try again next paste.
+        if _uia_automation is None:
+            _uia_automation = False
+            log_app.debug("UIA focused-element detection unavailable", exc_info=True)
+        return None
+
+
+def strip_audio_event_tags(text: str) -> str:
+    """Remove Scribe-style `[pause]` / `[clicking]` tags; collapse the gaps
+    they leave. A transcript that was ONLY tags comes back empty, which the
+    callers already treat as 'nothing said'."""
+    if not text or "[" not in text:
+        return text
+    out = AUDIO_EVENT_TAG_RE.sub(" ", text)
+    return re.sub(r"\s{2,}", " ", out).strip()
 
 
 def apply_smart_defaults(text: str) -> str:
@@ -610,8 +934,11 @@ def apply_smart_defaults(text: str) -> str:
         text = text[0].upper() + text[1:]
     # Strip trailing weak punctuation & whitespace.
     text = re.sub(r"[,;:\s]+$", "", text)
-    # Ensure terminal punctuation.
-    if text and text[-1] not in ".!?":
+    # Ensure terminal punctuation — judged on the last character BEFORE any
+    # closing quote/bracket, so `He said "hello."` and `(see above.)` don't
+    # get a second period tacked on after the closer.
+    core = text.rstrip("\"'’”»)]}")
+    if core and core[-1] not in ".!?…":
         text = text + "."
     return text
 
@@ -828,7 +1155,8 @@ class TranscriptLog(QObject):
         while True:
             snap = self._save_queue.get()
             if snap is None:
-                return  # shutdown signal (currently unused; daemon dies with proc)
+                return  # shutdown signal (flush() at quit)
+            stop = False
             # Coalesce: drain any newer snapshots that landed while waiting.
             while True:
                 try:
@@ -836,7 +1164,8 @@ class TranscriptLog(QObject):
                 except queue.Empty:
                     break
                 if newer is None:
-                    return
+                    stop = True
+                    break
                 snap = newer
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -848,12 +1177,20 @@ class TranscriptLog(QObject):
                 tmp.replace(self.path)
             except Exception:
                 log_app.exception("failed to save history")
+            if stop:
+                return
 
     def _save_async(self) -> None:
         # Snapshot under the lock so we can't race a concurrent mutation.
         with self._lock:
             snapshot = list(self._entries)
         self._save_queue.put(snapshot)
+
+    def flush(self, timeout: float = 2.0) -> None:
+        """Write anything still queued and stop the saver. Called at quit so
+        a dictation finished milliseconds before Ctrl+Win+Q isn't lost."""
+        self._save_queue.put(None)
+        self._saver_thread.join(timeout)
 
     def add(self, text: str, raw: str | None = None) -> dict | None:
         text = (text or "").strip()
@@ -1009,13 +1346,15 @@ class NotesLog(QObject):
             snap = self._save_queue.get()
             if snap is None:
                 return
+            stop = False
             while True:
                 try:
                     newer = self._save_queue.get_nowait()
                 except queue.Empty:
                     break
                 if newer is None:
-                    return
+                    stop = True
+                    break
                 snap = newer
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1027,11 +1366,19 @@ class NotesLog(QObject):
                 tmp.replace(self.path)
             except Exception:
                 log_app.exception("failed to save notes")
+            if stop:
+                return
 
     def _save_async(self) -> None:
         with self._lock:
             snapshot = list(self._entries)
         self._save_queue.put(snapshot)
+
+    def flush(self, timeout: float = 2.0) -> None:
+        """Write anything still queued and stop the saver (see
+        TranscriptLog.flush)."""
+        self._save_queue.put(None)
+        self._saver_thread.join(timeout)
 
     def add(self, text: str, *, app: str | None = None,
             flag: str = "", raw: str | None = None) -> dict | None:
@@ -1173,11 +1520,30 @@ class Settings(QObject):
         self.llm_api_key: str = ""
         self.llm_default_prompt: str = "cleanup"
         self.llm_auto_apply: bool = False  # if True, every transcript runs through the LLM
+        # Cloud transcription (v2.3) — opt-in alternative to local Whisper.
+        # When stt_backend == "elevenlabs" and a key is set, dictation is sent
+        # to ElevenLabs' /v1/speech-to-text (Scribe) instead of the on-device
+        # model. This is NOT offline; default stays "local".
+        self.stt_backend: str = "local"          # "local" | "elevenlabs"
+        self.eleven_api_key: str = ""
+        self.eleven_api_key_backup: str = ""     # auto-used when the primary key is out of credits
+        self.eleven_model_id: str = "scribe_v3"
+        # Ask Scribe to drop filler words and false starts ("um", "l- to
+        # as--") instead of transcribing them literally. On by default: local
+        # Whisper already writes that way, so both engines read the same.
+        self.eleven_clean_transcript: bool = True
+        # One-time move of a saved pre-v3 model id onto Scribe v3 (2.7.4).
+        self._eleven_model_migrated: bool = False
         # Integration & automation (v1.8):
         # - send_after_paste: auto-press Enter after each paste (chat-app mode)
         # - markdown_save_enabled / markdown_folder: write each transcript to a daily .md file
         # - webhook_enabled / webhook_url / webhook_template: POST each transcript
         self.send_after_paste: bool = False
+        # Terminal-aware paste (v2.3): pick the injection strategy from the
+        # focused window — type into legacy console windows (no paste chord
+        # works there under raw-mode TUIs like Claude Code), per-emulator
+        # chords for mintty/Alacritty/WezTerm, plain Ctrl+V everywhere else.
+        self.terminal_aware_paste: bool = True
         self.markdown_save_enabled: bool = False
         self.markdown_folder: str = ""        # empty → default under DATA_DIR
         self.webhook_enabled: bool = False
@@ -1194,6 +1560,19 @@ class Settings(QObject):
         # every other app's volume so background audio doesn't distract.
         self.duck_enabled: bool = False
         self.duck_level_pct: int = 5    # 0..100; level other apps drop to
+        # Mic passthrough (v2.7) — echo the mic into the speakers at a level
+        # that is independent of the Windows mic volume, so the room stays
+        # audible through closed IEMs without making you quieter to everyone
+        # else. passthrough_output_name is a device NAME (None = system
+        # default) for the same reason input_device_name is: indexes reshuffle.
+        self.passthrough_enabled: bool = False
+        self.passthrough_level_pct: int = 25
+        self.passthrough_output_name: str | None = None
+        self.passthrough_mute_while_dictating: bool = True
+        # Diagnostics (v2.7.1): keep the newest N raw recordings on disk
+        # (DEBUG_RECORDINGS_DIR) so a mis-transcribed clip can be replayed.
+        # 0 = off.
+        self.keep_recordings: int = 0
         # Customizable hotkeys (v2.2) — secondary hotkeys are user-editable
         # via Settings; stored in the `keyboard` library's combo format
         # (e.g. "ctrl+windows+z"). The primary Ctrl+Win push-to-talk and the
@@ -1208,7 +1587,164 @@ class Settings(QObject):
         # with this value on every save() so a manual registry edit (or a
         # moved install) is fixed up the next time the user touches Settings.
         self.start_on_login: bool = False
+        # ElevenLabs failover (persisted): keys proven out of credits / invalid.
+        # The active key is the first eleven_keys() entry NOT in this list, so the
+        # choice survives restarts and marches forward as each key is used up.
+        self.eleven_exhausted: list[str] = []
+        # When each key was marked exhausted (unix ts). After
+        # ELEVEN_EXHAUSTED_RETRY_SEC the pool probes the key again, so a
+        # monthly quota reset brings it back without user action. Keys in
+        # eleven_exhausted with no timestamp count as due for retry now.
+        self.eleven_exhausted_at: dict[str, float] = {}
+        # Absolute unix time each key may be retried. Set per-key so a transient
+        # 429 costs ~a minute while a spent monthly quota costs hours. Missing
+        # entries fall back to eleven_exhausted_at + ELEVEN_EXHAUSTED_RETRY_SEC,
+        # which is how state written by <=v2.3.4 is interpreted.
+        self.eleven_retry_after: dict[str, float] = {}
+        # Last credit balance ElevenLabs reported when rejecting a key, and when
+        # we learned it. Lets the pool still send SHORT clips to a key with a few
+        # credits left instead of writing it off wholesale.
+        self.eleven_credits_left: dict[str, float] = {}
+        self.eleven_credits_at: dict[str, float] = {}
+        # Third and subsequent ElevenLabs keys, tried in order after the primary
+        # and backup. Unbounded because each key has its own monthly allowance.
+        self.eleven_api_keys_extra: list[str] = []
+        self._save_lock = threading.RLock()
         self._load()
+
+    def eleven_keys(self) -> list[str]:
+        """Ordered, de-duplicated ElevenLabs keys: primary, backup, then any
+        extras from `eleven_api_keys_extra`, in the order given.
+
+        The Scribe failover walks this list, so an out-of-credits key rotates
+        to the next one. Empty slots are skipped. Each key carries its own
+        monthly credit allowance (they can be on separate accounts), so adding
+        keys is the only way to raise the monthly ceiling short of a bigger
+        plan — hence an unbounded list rather than two fixed slots."""
+        keys: list[str] = []
+        for k in (self.eleven_api_key, self.eleven_api_key_backup,
+                  *self.eleven_api_keys_extra):
+            k = (k or "").strip()
+            if k and k not in keys:
+                keys.append(k)
+        return keys
+
+    def mark_eleven_exhausted(
+        self,
+        key: str,
+        retry_after_sec: float | None = None,
+        credits_left: float | None = None,
+    ) -> None:
+        """Record an ElevenLabs key as out of credits / invalid and persist it,
+        so the failover skips it now and after every future restart. Always
+        refreshes the timestamp so a failed retry re-arms the cooldown.
+
+        `retry_after_sec` overrides the default cooldown for THIS key — a
+        rate-limit (429) is transient and deserves ~a minute, while a spent
+        monthly quota deserves hours. Blanket-benching a rate-limited key for
+        6h was a real bug: one burst of dictation could cost a working key the
+        rest of the evening.
+
+        `credits_left` is the balance ElevenLabs reported in the rejection, so
+        the pool can still route SHORT clips to a partly-drained key instead of
+        writing it off entirely."""
+        key = (key or "").strip()
+        if not key:
+            return
+        now = time.time()
+        cooldown = (ELEVEN_EXHAUSTED_RETRY_SEC if retry_after_sec is None
+                    else max(0.0, float(retry_after_sec)))
+        with self._save_lock:
+            self.eleven_exhausted_at[key] = now
+            self.eleven_retry_after[key] = now + cooldown
+            if credits_left is None:
+                self.eleven_credits_left.pop(key, None)
+                self.eleven_credits_at.pop(key, None)
+            else:
+                self.eleven_credits_left[key] = float(credits_left)
+                self.eleven_credits_at[key] = now
+            if key not in self.eleven_exhausted:
+                self.eleven_exhausted.append(key)
+            self.save_quiet()
+
+    def eleven_credits_known(self, key: str) -> float | None:
+        """Last balance ElevenLabs reported for `key`, or None if unknown or
+        too stale to trust. Balances go out of date the moment the quota
+        resets, so anything older than ELEVEN_CREDITS_TTL_SEC is 'unknown'
+        and the pool simply tries the key and lets the API decide."""
+        key = (key or "").strip()
+        seen = self.eleven_credits_at.get(key)
+        if not key or seen is None:
+            return None
+        if time.time() - seen > ELEVEN_CREDITS_TTL_SEC:
+            return None
+        return self.eleven_credits_left.get(key)
+
+    def clear_eleven_exhausted(self, key: str) -> None:
+        """Re-enable a previously-exhausted key (e.g. after topping up credits)."""
+        key = (key or "").strip()
+        if not key:
+            return
+        with self._save_lock:
+            if (key in self.eleven_exhausted or key in self.eleven_exhausted_at
+                    or key in self.eleven_retry_after):
+                if key in self.eleven_exhausted:
+                    self.eleven_exhausted.remove(key)
+                self.eleven_exhausted_at.pop(key, None)
+                self.eleven_retry_after.pop(key, None)
+                self.eleven_credits_left.pop(key, None)
+                self.eleven_credits_at.pop(key, None)
+                self.save_quiet()
+
+    def eleven_exhausted_active(self) -> set[str]:
+        """Exhausted keys still inside the retry cooldown. Keys past the
+        cooldown (or with no recorded timestamp) are omitted, so the pool
+        gives them another chance and re-marks them if they still fail.
+
+        Honours the per-key expiry written by mark_eleven_exhausted() and falls
+        back to the flat cooldown for state persisted by older versions."""
+        now = time.time()
+        active: set[str] = set()
+        for k in self.eleven_exhausted:
+            until = self.eleven_retry_after.get(k)
+            if until is None:
+                until = self.eleven_exhausted_at.get(k, 0.0) + ELEVEN_EXHAUSTED_RETRY_SEC
+            if now < until:
+                active.add(k)
+        return active
+
+    def active_stt_engine(self) -> tuple[str, str]:
+        """Which engine will actually serve the next dictation, and why.
+
+        Returns ("local" | "elevenlabs", human-readable reason). This is the
+        same decision the pool makes at transcribe time, hoisted out so the
+        overlay can badge the recording BEFORE the audio is sent — the user
+        should know they're on local Whisper while they're still talking, not
+        infer it afterwards from a worse transcript."""
+        backend = (self.stt_backend or "local").lower()
+        if backend == "auto":
+            busy = GPU_MONITOR.busy_reason()
+            if busy is None:
+                return "local", "auto: GPU is free, local Whisper is fastest"
+            # GPU busy — fall through to the cloud-key checks below, keeping
+            # the reason so "cloud chosen but keys dead" still reads honestly.
+            auto_reason = busy
+        elif backend != "elevenlabs":
+            return "local", "Local Whisper selected in Settings"
+        else:
+            auto_reason = None
+        keys = self.eleven_keys()
+        if not keys:
+            return "local", "no ElevenLabs API key configured"
+        usable = [k for k in keys if k not in self.eleven_exhausted_active()]
+        if not usable:
+            return "local", (
+                "all %d ElevenLabs key(s) out of credits" % len(keys)
+            )
+        reason = "ElevenLabs Scribe (key #%d)" % (keys.index(usable[0]) + 1)
+        if auto_reason:
+            reason = f"auto: {auto_reason} — {reason}"
+        return "elevenlabs", reason
 
     def _load(self) -> None:
         try:
@@ -1235,7 +1771,62 @@ class Settings(QObject):
                     self.llm_api_key = str(data.get("llm_api_key", self.llm_api_key))
                     self.llm_default_prompt = str(data.get("llm_default_prompt", self.llm_default_prompt))
                     self.llm_auto_apply = bool(data.get("llm_auto_apply", self.llm_auto_apply))
+                    backend = str(data.get("stt_backend", self.stt_backend)).lower()
+                    if backend not in ("local", "elevenlabs", "auto"):
+                        backend = "local"
+                    self.stt_backend = backend
+                    self.eleven_api_key = str(data.get("eleven_api_key", self.eleven_api_key))
+                    self.eleven_api_key_backup = str(
+                        data.get("eleven_api_key_backup", self.eleven_api_key_backup)
+                    )
+                    extra = data.get("eleven_api_keys_extra", [])
+                    if isinstance(extra, list):
+                        self.eleven_api_keys_extra = [
+                            str(k).strip() for k in extra if str(k).strip()
+                        ]
+                    ex = data.get("eleven_exhausted", [])
+                    if isinstance(ex, list):
+                        self.eleven_exhausted = [
+                            str(k).strip() for k in ex if str(k).strip()
+                        ]
+                    ex_at = data.get("eleven_exhausted_at", {})
+                    if isinstance(ex_at, dict):
+                        self.eleven_exhausted_at = {}
+                        for k, ts in ex_at.items():
+                            try:
+                                self.eleven_exhausted_at[str(k).strip()] = float(ts)
+                            except (TypeError, ValueError):
+                                pass
+                    for field, target in (
+                        ("eleven_retry_after", "eleven_retry_after"),
+                        ("eleven_credits_left", "eleven_credits_left"),
+                        ("eleven_credits_at", "eleven_credits_at"),
+                    ):
+                        raw = data.get(field, {})
+                        if isinstance(raw, dict):
+                            parsed: dict[str, float] = {}
+                            for k, v in raw.items():
+                                try:
+                                    parsed[str(k).strip()] = float(v)
+                                except (TypeError, ValueError):
+                                    pass
+                            setattr(self, target, parsed)
+                    self.eleven_model_id = str(
+                        data.get("eleven_model_id", self.eleven_model_id)
+                    ) or ELEVEN_DEFAULT_MODEL
+                    # Settings saved before 2.7.4 carry the old default model
+                    # id. Move them to the current one once; after that a
+                    # hand-edited id (pinning an older model) is respected.
+                    self._eleven_model_migrated = bool(
+                        data.get("eleven_model_migrated_v3", False))
+                    if (not self._eleven_model_migrated
+                            and self.eleven_model_id in ELEVEN_LEGACY_MODELS):
+                        self.eleven_model_id = ELEVEN_DEFAULT_MODEL
+                    self._eleven_model_migrated = True
+                    self.eleven_clean_transcript = bool(data.get(
+                        "eleven_clean_transcript", self.eleven_clean_transcript))
                     self.send_after_paste = bool(data.get("send_after_paste", self.send_after_paste))
+                    self.terminal_aware_paste = bool(data.get("terminal_aware_paste", self.terminal_aware_paste))
                     self.markdown_save_enabled = bool(data.get("markdown_save_enabled", self.markdown_save_enabled))
                     self.markdown_folder = str(data.get("markdown_folder", self.markdown_folder))
                     self.webhook_enabled = bool(data.get("webhook_enabled", self.webhook_enabled))
@@ -1258,6 +1849,28 @@ class Settings(QObject):
                     except (TypeError, ValueError):
                         self.duck_level_pct = 5
                     self.duck_level_pct = max(0, min(100, self.duck_level_pct))
+                    self.passthrough_enabled = bool(
+                        data.get("passthrough_enabled", self.passthrough_enabled)
+                    )
+                    try:
+                        self.passthrough_level_pct = int(
+                            data.get("passthrough_level_pct", self.passthrough_level_pct)
+                        )
+                    except (TypeError, ValueError):
+                        self.passthrough_level_pct = 25
+                    self.passthrough_level_pct = max(0, min(100, self.passthrough_level_pct))
+                    pt_out = data.get("passthrough_output_name", None)
+                    self.passthrough_output_name = str(pt_out) if pt_out else None
+                    self.passthrough_mute_while_dictating = bool(
+                        data.get("passthrough_mute_while_dictating",
+                                 self.passthrough_mute_while_dictating)
+                    )
+                    try:
+                        self.keep_recordings = int(
+                            data.get("keep_recordings", self.keep_recordings))
+                    except (TypeError, ValueError):
+                        self.keep_recordings = 0
+                    self.keep_recordings = max(0, min(500, self.keep_recordings))
                     # Hotkeys — accept any non-empty string; HotkeyWatcher
                     # validates via keyboard.add_hotkey at register time and
                     # logs (rather than crashes) on bad combos.
@@ -1289,6 +1902,45 @@ class Settings(QObject):
             log_app.exception("failed to load settings")
 
     def save(self) -> None:
+        """Persist, reconcile autostart, and broadcast `changed` (live-apply
+        of audio/hotkey/theme settings). For state that changes on its own in
+        the background — the ElevenLabs key pool — use save_quiet()."""
+        self._write()
+        # Reconcile the HKCU\...\Run registry entry with the saved setting.
+        # Done here (not in __init__) so a manual edit to settings.json picks
+        # up only on the next user-driven Settings change, not on startup —
+        # but each Settings save makes the registry match what's persisted.
+        #
+        # ONLY for the real settings file. apply_start_on_login() edits the
+        # machine-wide 'Tellur' scheduled task, which is not scoped to
+        # self.path — so a Settings built on any other path (tests, a scratch
+        # TELLUR_HOME, a one-off script) used to silently disable the user's
+        # autostart, because such instances default start_on_login to False.
+        # That cost a real autostart outage; a Settings pointed somewhere else
+        # must never reach out and touch global OS state.
+        if self.path == SETTINGS_FILE:
+            apply_start_on_login(self.start_on_login)
+        self.changed.emit()
+
+    def save_quiet(self) -> None:
+        """Persist only — no autostart reconcile, no `changed` broadcast.
+
+        The ElevenLabs pool persists key cooldowns/balances from the
+        transcribe worker thread on every rejected request; routing that
+        through save() meant two `schtasks` subprocesses, re-registering
+        every chord hotkey and re-resolving audio devices per rejection,
+        mid-paste (263 times across the logs). None of those consumers care
+        about pool state — the Settings status line polls it on a timer."""
+        self._write()
+
+    def _write(self) -> None:
+        # RLock: re-entrant from mark_eleven_exhausted(), and it keeps a
+        # UI-thread save() from snapshotting the eleven_* dicts while the
+        # worker thread is mutating them.
+        with self._save_lock:
+            self._write_locked()
+
+    def _write_locked(self) -> None:
         data = {
             "auto_paste": self.auto_paste,
             "sensitivity": self.sensitivity,
@@ -1303,7 +1955,20 @@ class Settings(QObject):
             "llm_api_key": self.llm_api_key,
             "llm_default_prompt": self.llm_default_prompt,
             "llm_auto_apply": self.llm_auto_apply,
+            "stt_backend": self.stt_backend,
+            "eleven_api_key": self.eleven_api_key,
+            "eleven_api_key_backup": self.eleven_api_key_backup,
+            "eleven_api_keys_extra": list(self.eleven_api_keys_extra),
+            "eleven_exhausted": list(self.eleven_exhausted),
+            "eleven_exhausted_at": dict(self.eleven_exhausted_at),
+            "eleven_retry_after": dict(self.eleven_retry_after),
+            "eleven_credits_left": dict(self.eleven_credits_left),
+            "eleven_credits_at": dict(self.eleven_credits_at),
+            "eleven_model_id": self.eleven_model_id,
+            "eleven_model_migrated_v3": True,
+            "eleven_clean_transcript": self.eleven_clean_transcript,
             "send_after_paste": self.send_after_paste,
+            "terminal_aware_paste": self.terminal_aware_paste,
             "markdown_save_enabled": self.markdown_save_enabled,
             "markdown_folder": self.markdown_folder,
             "webhook_enabled": self.webhook_enabled,
@@ -1314,6 +1979,11 @@ class Settings(QObject):
             "theme": self.theme,
             "duck_enabled": self.duck_enabled,
             "duck_level_pct": self.duck_level_pct,
+            "passthrough_enabled": self.passthrough_enabled,
+            "passthrough_level_pct": self.passthrough_level_pct,
+            "passthrough_output_name": self.passthrough_output_name,
+            "passthrough_mute_while_dictating": self.passthrough_mute_while_dictating,
+            "keep_recordings": self.keep_recordings,
             "hotkey_quit": self.hotkey_quit,
             "hotkey_repaste": self.hotkey_repaste,
             "hotkey_llm": self.hotkey_llm,
@@ -1327,12 +1997,6 @@ class Settings(QObject):
             tmp.replace(self.path)
         except Exception:
             log_app.exception("failed to save settings")
-        # Reconcile the HKCU\...\Run registry entry with the saved setting.
-        # Done here (not in __init__) so a manual edit to settings.json picks
-        # up only on the next user-driven Settings change, not on startup —
-        # but each Settings save makes the registry match what's persisted.
-        apply_start_on_login(self.start_on_login)
-        self.changed.emit()
 
 
 def _format_size_mb(mb: int) -> str:
@@ -1352,11 +2016,12 @@ def _build_model_repo_map() -> dict[str, str]:
     except Exception:
         # Hard-coded fallback (correct as of faster-whisper 1.2.x).
         return {
-            "tiny":            "Systran/faster-whisper-tiny",
-            "small":           "Systran/faster-whisper-small",
-            "distil-large-v3": "Systran/faster-distil-whisper-large-v3",
-            "large-v3-turbo":  "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
-            "large-v3":        "Systran/faster-whisper-large-v3",
+            "tiny":              "Systran/faster-whisper-tiny",
+            "small":             "Systran/faster-whisper-small",
+            "distil-large-v3":   "Systran/faster-distil-whisper-large-v3",
+            "distil-large-v3.5": "distil-whisper/distil-large-v3.5-ct2",
+            "large-v3-turbo":    "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+            "large-v3":          "Systran/faster-whisper-large-v3",
         }
 
 
@@ -1483,6 +2148,81 @@ def list_input_devices() -> list[dict]:
         return []
 
 
+def list_output_devices() -> list[dict]:
+    """Playback devices, in the same shape as list_input_devices() plus the host
+    API name. Used by the passthrough monitor to pick where the mic is echoed to.
+
+    The same speakers appear once per host API (MME, DirectSound, WASAPI,
+    WDM-KS) with near-identical names, so the API is carried through and shown
+    in the picker. It is not cosmetic: MME buffers ~80 ms while WASAPI is closer
+    to ~15 ms, and for a monitor you hear yourself through that is the
+    difference between "present" and "echo"."""
+    try:
+        devices = sd.query_devices()
+        try:
+            default_out_idx = sd.default.device[1]
+        except Exception:
+            default_out_idx = None
+        out = []
+        for i, d in enumerate(devices):
+            if d.get("max_output_channels", 0) <= 0:
+                continue
+            try:
+                api = str(sd.query_hostapis(d["hostapi"])["name"])
+            except Exception:
+                api = ""
+            out.append({
+                "index": i,
+                "name": str(d.get("name", f"Device {i}")),
+                "api": api,
+                "default": (i == default_out_idx),
+                "channels": int(d.get("max_output_channels", 0)),
+            })
+        return out
+    except Exception:
+        log_audio.exception("failed to enumerate output devices")
+        return []
+
+
+def output_device_keys(devices: list[dict]) -> list[str]:
+    """Stable identities for a device list: "<API>::<name>", plus an occurrence
+    ordinal on any duplicates.
+
+    Every host API enumerates the same hardware under (nearly) the same name, so
+    a bare name is ambiguous — matching one would always pick whichever host API
+    came first. The API is part of the choice anyway, since it decides the
+    monitor's latency. A few devices (the NVIDIA HDMI outputs under WDM-KS) then
+    still collide on name *and* API, so the second and later ones get "::2",
+    "::3" and so on. Indexes are deliberately not used: they reshuffle between
+    sessions, which is why these keys exist at all."""
+    seen: dict[str, int] = {}
+    keys: list[str] = []
+    for d in devices:
+        api = (d.get("api") or "").strip()
+        base = f"{api}::{d['name']}" if api else d["name"]
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        keys.append(base if n == 1 else f"{base}::{n}")
+    return keys
+
+
+def find_output_device(key: str | None) -> int | None:
+    """Resolve a stored output key back to a PortAudio index, or None for the
+    system default. Falls back to a name-only match so keys written before the
+    API qualifier existed still resolve."""
+    if not key:
+        return None
+    devices = list_output_devices()
+    for d, k in zip(devices, output_device_keys(devices)):
+        if k == key:
+            return d["index"]
+    bare = key.split("::")[1] if "::" in key else key
+    for d in devices:
+        if d["name"] == bare:
+            return d["index"]
+    return None
+
+
 class AudioRecorder:
     """Captures mono float32 audio at SAMPLE_RATE while held. Audio callback is
     kept lean — no logging or heavy computation — so it doesn't stall.
@@ -1507,6 +2247,11 @@ class AudioRecorder:
         # only while Settings is visible and never feeds the recorder.
         self._monitor_stream: sd.InputStream | None = None
         self._monitor_level: float = 0.0
+        self._monitor_wanted: bool = False
+        # PortAudio status flags seen during the current recording (input
+        # overflow = the driver dropped samples because our callback was
+        # late). Counted in the callback, reported once at stop().
+        self._overflows = 0
 
     def set_device(self, idx: int | None) -> None:
         if idx == self._device:
@@ -1525,7 +2270,9 @@ class AudioRecorder:
         self._gain = g
         log_audio.info("input gain -> %.2fx", g)
 
-    def _callback(self, indata, _frames, _time_info, _status) -> None:
+    def _callback(self, indata, _frames, _time_info, status) -> None:
+        if status:
+            self._overflows += 1
         chunk = indata.copy().reshape(-1).astype(np.float32)
         if self._gain != 1.0:
             np.multiply(chunk, self._gain, out=chunk)
@@ -1541,42 +2288,70 @@ class AudioRecorder:
         self._frames = []
         self._sample_count = 0
         self._level = 0.0
+        self._overflows = 0
         # Tear down the monitor stream so the device is exclusively available
         # for the recording — important for drivers that don't support shared
-        # mode. We remember it was on so stop() can bring it back.
-        self._monitor_was_running = self._monitor_stream is not None
-        if self._monitor_was_running:
-            self.stop_monitor()
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype="float32",
-            callback=self._callback,
-            blocksize=0,
-            device=self._device,
-        )
-        self._stream.start()
+        # mode. `_monitor_wanted` (set by the panel's start/stop_monitor)
+        # tells stop() whether to bring it back.
+        if self._monitor_stream is not None:
+            self.stop_monitor(_internal=True)
+        stream = None
+        try:
+            stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="float32",
+                callback=self._callback,
+                blocksize=0,
+                device=self._device,
+            )
+            stream.start()
+        except Exception:
+            # Never leave a half-opened PortAudio stream behind, and give the
+            # Settings meter its stream back — the old code left the meter
+            # dead after one failed start (unplugged mic) until the panel was
+            # hidden and re-shown.
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            self._stream = None
+            if self._monitor_wanted:
+                self.start_monitor(_internal=True)
+            raise
+        self._stream = stream
         log_audio.debug("recording started (device=%s gain=%.2f)",
                         self._device, self._gain)
 
     def stop(self) -> np.ndarray:
         if self._stream is None:
+            # Nothing recording — but the panel may have asked for its meter
+            # while we were busy; honour that now.
+            if self._monitor_wanted and self._monitor_stream is None:
+                self.start_monitor(_internal=True)
             return np.zeros(0, dtype=np.float32)
         try:
             self._stream.stop()
             self._stream.close()
         finally:
             self._stream = None
-        # Bring the monitor back if it was running before this recording.
-        if getattr(self, "_monitor_was_running", False):
-            self._monitor_was_running = False
-            self.start_monitor()
+        # Bring the monitor back if the panel still wants it.
+        if self._monitor_wanted:
+            self.start_monitor(_internal=True)
         if not self._frames:
             log_audio.debug("recording stopped — no frames captured")
             return np.zeros(0, dtype=np.float32)
         audio = np.concatenate(self._frames).astype(np.float32)
-        log_audio.debug("recording stopped — %d samples (%.2fs)",
-                        audio.size, audio.size / self.sample_rate)
+        rms  = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        log_audio.info("recording stopped — %d samples (%.2fs) RMS=%.5f peak=%.5f",
+                       audio.size, audio.size / self.sample_rate, rms, peak)
+        if self._overflows:
+            log_audio.warning(
+                "audio driver reported %d dropped/late buffer(s) during this "
+                "recording — words may be missing", self._overflows,
+            )
         return audio
 
     @property
@@ -1592,10 +2367,15 @@ class AudioRecorder:
             np.clip(chunk, -1.0, 1.0, out=chunk)
         self._monitor_level = float(np.sqrt(np.mean(chunk * chunk)))
 
-    def start_monitor(self) -> bool:
+    def start_monitor(self, *, _internal: bool = False) -> bool:
         """Start a passive monitor stream for the Settings meter. Returns
         True on success, False if the stream couldn't be opened (e.g. the
-        recorder is currently active or the device is unavailable)."""
+        recorder is currently active or the device is unavailable). A call
+        made while recording is remembered: the stream comes up when the
+        recording stops. `_internal` marks the recorder's own start/stop
+        juggling, which must not change what the panel asked for."""
+        if not _internal:
+            self._monitor_wanted = True
         if self._stream is not None:
             return False
         if self._monitor_stream is not None:
@@ -1616,7 +2396,9 @@ class AudioRecorder:
             self._monitor_stream = None
             return False
 
-    def stop_monitor(self) -> None:
+    def stop_monitor(self, *, _internal: bool = False) -> None:
+        if not _internal:
+            self._monitor_wanted = False
         if self._monitor_stream is None:
             return
         try:
@@ -1631,6 +2413,167 @@ class AudioRecorder:
     @property
     def monitor_level(self) -> float:
         return self._monitor_level
+
+
+# ===========================================================================
+# mic passthrough — echo the mic into the speakers so the room stays audible
+# ===========================================================================
+class PassthroughMonitor:
+    """Live mic -> speakers monitor, with a volume independent of the Windows
+    mic level.
+
+    Windows can already do this ("Listen to this device") with no process at
+    all, but its only volume control is the mic's capture level — turning the
+    passthrough down would also make you quieter to everyone in Discord. Mixing
+    it here costs a running process (Tellur is already one) and buys a level
+    that is genuinely separate.
+
+    Input and output are two independent streams joined by a bounded deque
+    rather than one duplex stream: they are usually different devices with
+    free-running clocks, which PortAudio will not open as a duplex pair. The
+    deque's maxlen is the latency ceiling — if the output side ever falls
+    behind, the oldest blocks are dropped instead of letting the delay grow.
+
+    Gain and mute are read live inside the callbacks, so changing the level or
+    ducking for a dictation never restarts a stream.
+    """
+
+    def __init__(self) -> None:
+        self._input_device: int | None = None
+        self._output_device: int | None = None
+        self._gain = 0.0
+        self._muted = False
+        self._level = 0.0
+        self._rate = PASSTHROUGH_SAMPLE_RATE
+        self._queue: deque = deque(maxlen=PASSTHROUGH_QUEUE_BLOCKS)
+        self._in = None
+        self._out = None
+        self._lock = threading.RLock()
+
+    # --- configuration ---------------------------------------------------
+
+    @staticmethod
+    def level_to_gain(pct: int) -> float:
+        """0 % is silent, 100 % is the mic at full level. Squared so the useful
+        quiet end of the range gets most of the slider travel."""
+        pct = max(0, min(100, int(pct)))
+        return 0.0 if pct == 0 else (pct / 100.0) ** 2
+
+    def set_level_pct(self, pct: int) -> None:
+        self._gain = self.level_to_gain(pct)
+
+    def set_muted(self, muted: bool) -> None:
+        """Silence the monitor without tearing the streams down, so unmuting is
+        instant and never fights the recorder for the device."""
+        self._muted = bool(muted)
+
+    def set_devices(self, input_device, output_device) -> None:
+        """Repoint the monitor. Restarts the streams only if something actually
+        changed and it is currently running."""
+        if input_device == self._input_device and output_device == self._output_device:
+            return
+        self._input_device = input_device
+        self._output_device = output_device
+        log_audio.info("passthrough devices -> in=%s out=%s",
+                       input_device if input_device is not None else "default",
+                       output_device if output_device is not None else "default")
+        with self._lock:
+            if self.running:
+                self.stop()
+                self.start()
+
+    @property
+    def running(self) -> bool:
+        return self._in is not None and self._out is not None
+
+    @property
+    def level(self) -> float:
+        return self._level
+
+    # --- audio callbacks -------------------------------------------------
+
+    def _in_cb(self, indata, _frames, _time_info, _status) -> None:
+        gain = 0.0 if self._muted else self._gain
+        if gain <= 0.0:
+            self._level = 0.0
+            return  # queue starves, output plays silence — a free mute
+        chunk = indata[:, :1].astype(np.float32) * gain
+        np.clip(chunk, -1.0, 1.0, out=chunk)
+        self._queue.append(chunk)
+        self._level = float(np.sqrt(np.mean(chunk * chunk)))
+
+    def _out_cb(self, outdata, frames, _time_info, _status) -> None:
+        try:
+            block = self._queue.popleft()
+        except IndexError:
+            outdata.fill(0.0)
+            return
+        n = min(len(block), frames)
+        outdata[:n] = block[:n]      # mono column broadcasts across channels
+        if n < frames:
+            outdata[n:] = 0.0
+
+    # --- lifecycle -------------------------------------------------------
+
+    def _output_channels(self) -> int:
+        try:
+            info = sd.query_devices(self._output_device, "output")
+            return max(1, min(2, int(info.get("max_output_channels", 2))))
+        except Exception:
+            return 2
+
+    def start(self) -> bool:
+        """Open both streams. Returns False (and logs) if the devices can't be
+        opened, so the caller can turn the setting back off."""
+        with self._lock:
+            if self.running:
+                return True
+            channels = self._output_channels()
+            for rate in PASSTHROUGH_RATE_FALLBACKS:
+                try:
+                    self._out = sd.OutputStream(
+                        samplerate=rate, channels=channels, dtype="float32",
+                        callback=self._out_cb, blocksize=PASSTHROUGH_BLOCK,
+                        device=self._output_device, latency="low",
+                    )
+                    self._in = sd.InputStream(
+                        samplerate=rate, channels=1, dtype="float32",
+                        callback=self._in_cb, blocksize=PASSTHROUGH_BLOCK,
+                        device=self._input_device, latency="low",
+                    )
+                    self._out.start()
+                    self._in.start()
+                    self._rate = rate
+                    log_audio.info(
+                        "passthrough started (%d Hz, %d ch, %.1f ms blocks)",
+                        rate, channels, PASSTHROUGH_BLOCK * 1000.0 / rate,
+                    )
+                    return True
+                except Exception:
+                    log_audio.debug("passthrough failed at %d Hz", rate, exc_info=True)
+                    self._teardown()
+            log_audio.warning("passthrough could not open the selected devices")
+            return False
+
+    def stop(self) -> None:
+        with self._lock:
+            if self.running:
+                log_audio.info("passthrough stopped")
+            self._teardown()
+
+    def _teardown(self) -> None:
+        for stream in (self._in, self._out):
+            if stream is None:
+                continue
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                log_audio.debug("passthrough stream teardown failed", exc_info=True)
+        self._in = None
+        self._out = None
+        self._queue.clear()
+        self._level = 0.0
 
 
 # ===========================================================================
@@ -1650,12 +2593,18 @@ class AudioDucker:
     no-op, a restore-without-duck is a no-op.
     """
 
-    def __init__(self):
+    def __init__(self, ledger_path: Path | None = None):
         self._our_pid = os.getpid()
         self._lock = threading.Lock()
         self._active = False
-        # List of (ISimpleAudioVolume, prior_level) tuples captured at duck time.
+        # In-memory fast path for the normal duck -> restore cycle.
         self._saved: list[tuple[object, float]] = []
+        # Crash-safety ledger: pre-duck levels are persisted here so a kill /
+        # hang / crash mid-duck can be undone by the next launch (recover()).
+        self._ledger_path = ledger_path or (DATA_DIR / "duck_state.json")
+        self._watchdog: threading.Timer | None = None
+        # Backstop: auto-restore if a release somehow never arrives in one run.
+        self._max_active_sec = float(MAX_RECORDING_SECONDS) + 10.0
 
     @staticmethod
     def available() -> bool:
@@ -1666,9 +2615,9 @@ class AudioDucker:
             return False
 
     def duck(self, level: float = 0.05) -> None:
-        """Lower every other app's master volume to `level` (0.0–1.0).
-        Snapshots prior levels for restore(). Cheap (~10ms on a typical
-        machine); safe to call from the hotkey thread."""
+        """Lower every other app's master volume to `level` (0.0 to 1.0),
+        recording prior levels both in memory and in the on-disk ledger for
+        crash-safe restore. Safe to call from the hotkey thread."""
         level = max(0.0, min(1.0, float(level)))
         with self._lock:
             if self._active:
@@ -1679,32 +2628,57 @@ class AudioDucker:
             except Exception:
                 log_audio.exception("ducker: failed to enumerate audio sessions")
                 return
-            saved: list[tuple[object, float]] = []
+
+            # Pass 1: read & capture originals WITHOUT changing anything yet, so
+            # a crash before the ledger is persisted can't strand a ducked
+            # session that has no recovery record.
+            captured: list[tuple] = []  # (vol_com, prev, iid, pid, name)
             for s in sessions:
                 try:
                     if s.Process and s.Process.pid == self._our_pid:
                         continue
                     vol = s.SimpleAudioVolume
                     prev = vol.GetMasterVolume()
-                    # Don't bother saving + clobbering sessions already below
-                    # the duck level — restore would only push them back up to
-                    # where they already were.
+                    # Skip sessions already at/below target — nothing to undo,
+                    # and we must never capture a (possibly stuck) low value as
+                    # an "original" to restore to.
                     if prev <= level:
                         continue
+                    pid = s.Process.pid if s.Process else None
+                    try:
+                        name = s.Process.name() if s.Process else None
+                    except Exception:
+                        name = None
+                    captured.append((vol, prev, self._session_iid(s), pid, name))
+                except Exception:
+                    log_audio.debug("ducker: per-session read failed", exc_info=True)
+
+            # Pass 2: persist the ledger BEFORE touching any volume (crash safety).
+            self._write_ledger(level, captured)
+
+            # Pass 3: apply the duck.
+            saved: list[tuple[object, float]] = []
+            for vol, prev, _iid, _pid, _name in captured:
+                try:
                     vol.SetMasterVolume(level, None)
                     saved.append((vol, prev))
                 except Exception:
                     log_audio.debug("ducker: per-session duck failed", exc_info=True)
+
             self._saved = saved
             self._active = True
+            self._arm_watchdog()
             log_audio.info(
                 "ducked %d audio sessions to %.0f%%", len(saved), level * 100
             )
 
     def restore(self) -> None:
-        """Restore every ducked session to its pre-duck level. Idempotent."""
+        """Restore every ducked session to its pre-duck level, then clear the
+        ledger. Idempotent."""
         with self._lock:
+            self._cancel_watchdog()
             if not self._active:
+                self._delete_ledger()   # clear any stale ledger, just in case
                 return
             for vol, prev in self._saved:
                 try:
@@ -1714,17 +2688,714 @@ class AudioDucker:
             count = len(self._saved)
             self._saved = []
             self._active = False
+            self._delete_ledger()
             log_audio.info("restored volume on %d sessions", count)
+
+    @staticmethod
+    def _session_iid(s) -> str | None:
+        # Stable per-session id; unchanged across a Tellur restart while the
+        # other app's session lives. The key we match on during recovery.
+        try:
+            return s._ctl.GetSessionInstanceIdentifier()
+        except Exception:
+            return None
+
+    def recover(self) -> int:
+        """Run once at startup. If a ledger exists, a previous run was killed /
+        hung / crashed mid-duck: restore each recorded session to its original
+        level — but only if it STILL looks ducked (current <= recorded level +
+        eps), so an app the user already turned back up is left untouched.
+        Returns the number of sessions restored."""
+        path = self._ledger_path
+        try:
+            if not path.exists():
+                return 0
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            log_audio.debug("ducker: unreadable ledger — discarding", exc_info=True)
+            self._delete_ledger()
+            return 0
+
+        level = max(0.0, min(1.0, float(data.get("level", 0.05))))
+        eps = 0.02
+        by_iid: dict = {}
+        by_pid: dict = {}
+        for e in data.get("sessions", []):
+            orig = e.get("original")
+            if orig is None:
+                continue
+            orig = max(0.0, min(1.0, float(orig)))
+            if e.get("iid"):
+                by_iid[e["iid"]] = orig
+            if e.get("pid") is not None:
+                by_pid.setdefault(e["pid"], orig)
+
+        try:
+            from pycaw.pycaw import AudioUtilities
+            sessions = AudioUtilities.GetAllSessions()
+        except Exception:
+            log_audio.exception("ducker: recovery could not enumerate sessions")
+            return 0  # keep the ledger; a later launch can retry
+
+        restored = 0
+        for s in sessions:
+            try:
+                iid = self._session_iid(s)
+                pid = s.Process.pid if s.Process else None
+                target = by_iid.get(iid) if iid is not None else None
+                if target is None and pid is not None:
+                    target = by_pid.get(pid)
+                if target is None:
+                    continue
+                vol = s.SimpleAudioVolume
+                if vol.GetMasterVolume() <= level + eps:
+                    vol.SetMasterVolume(target, None)
+                    restored += 1
+            except Exception:
+                log_audio.debug("ducker: per-session recovery failed", exc_info=True)
+
+        self._delete_ledger()
+        if restored:
+            log_audio.info(
+                "ducker: recovered %d session(s) left quiet by a previous unclean exit",
+                restored,
+            )
+        return restored
+
+    # --- watchdog: auto-restore if a release never arrives within one run ---
+    def _arm_watchdog(self) -> None:
+        self._cancel_watchdog()
+        try:
+            t = threading.Timer(self._max_active_sec, self._on_watchdog)
+            t.daemon = True
+            t.start()
+            self._watchdog = t
+        except Exception:
+            self._watchdog = None
+
+    def _cancel_watchdog(self) -> None:
+        t, self._watchdog = self._watchdog, None
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def _on_watchdog(self) -> None:
+        log_audio.warning("ducker: watchdog fired — auto-restoring (no release seen)")
+        self.restore()
+
+    # --- ledger persistence -------------------------------------------------
+    def _write_ledger(self, level: float, captured: list) -> None:
+        try:
+            payload = {
+                "level": level,
+                "ts": time.time(),
+                "pid": self._our_pid,
+                "sessions": [
+                    {"iid": iid, "pid": pid, "name": name, "original": prev}
+                    for (_vol, prev, iid, pid, name) in captured
+                ],
+            }
+            self._ledger_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._ledger_path.with_suffix(self._ledger_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(self._ledger_path)
+        except Exception:
+            log_audio.debug("ducker: failed to write ledger", exc_info=True)
+
+    def _delete_ledger(self) -> None:
+        try:
+            self._ledger_path.unlink(missing_ok=True)
+        except Exception:
+            log_audio.debug("ducker: failed to delete ledger", exc_info=True)
 
 
 # ===========================================================================
 # whisper engine
 # ===========================================================================
+# ===========================================================================
+# Cloud transcription backend (optional) — ElevenLabs Scribe Speech-to-Text.
+# Opt-in alternative to the on-device Whisper engine. Uses only stdlib urllib,
+# matching the project's no-extra-deps style. The recorded mono 16 kHz clip is
+# packed into a WAV and POSTed to /v1/speech-to-text; we return the text.
+# NOTE: this sends audio to ElevenLabs' servers — it is NOT offline. Tellur
+# stays fully local by default; this path runs only when the user opts in.
+# ===========================================================================
+ELEVEN_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+# Scribe v3 (released 2026-11-10) replaced v2 as the batch model: same
+# endpoint, same request, same credit cost and — measured on this app's own
+# recordings — the same latency, with ~27% fewer word errors per ElevenLabs.
+ELEVEN_DEFAULT_MODEL = "scribe_v3"
+# Model ids that were once this app's default; a saved one is upgraded once.
+ELEVEN_LEGACY_MODELS = frozenset({"scribe_v1", "scribe_v2"})
+# How long an exhausted key stays benched before the pool probes it again.
+# Quota errors clear on ElevenLabs' monthly reset, so without a retry an
+# exhausted key stayed dead forever unless the user re-typed it in Settings.
+ELEVEN_EXHAUSTED_RETRY_SEC = 6 * 3600
+# A 429 is back-pressure, not a spent quota — bench the key for a minute, not
+# six hours. (v2.3.4 treated both the same, so one burst of dictation could
+# take a perfectly good key offline for the rest of the evening.)
+ELEVEN_RATELIMIT_RETRY_SEC = 60.0
+# How long a reported credit balance is trusted before we go back to just
+# trying the key. Balances are invalidated by the monthly quota reset.
+ELEVEN_CREDITS_TTL_SEC = 30 * 60
+# Observed Scribe billing: 133 credits for a 120 s clip => ~1.108 credits/sec.
+# Used only to skip a key we KNOW cannot cover the clip; when the estimate is
+# wrong the API simply rejects the request, which costs no credits.
+ELEVEN_CREDITS_PER_SEC = 1.11
+# Time budget for one cloud transcription, scaled to the clip. Scribe answers
+# in ~0.6 s + 0.022 s per second of audio (1,127 clips, Sep-Nov 2026; the
+# slowest healthy one was 9.5 s for a 5-minute clip) — but now and then a
+# request simply stalls: twice on 2026-11-12 a short clip sat for 52 s and
+# 61 s behind the old flat 60 s timeout, with the next dictation queued up
+# behind it. So:
+#   * past the HEDGE mark (~1% of healthy requests get this far) a second
+#     request is raced against the first on a fresh connection;
+#   * past the DEADLINE the cloud is abandoned for this clip and local
+#     Whisper decodes it instead.
+# A 10 s clip hedges at 2.9 s and gives up at 6.8 s; a 5-minute one at 14.5 s
+# and 30 s.
+ELEVEN_HEDGE_BASE_SEC = 2.5
+ELEVEN_HEDGE_PER_AUDIO_SEC = 0.04
+ELEVEN_DEADLINE_BASE_SEC = 6.0
+ELEVEN_DEADLINE_PER_AUDIO_SEC = 0.08
+
+
+def eleven_time_budget(clip_sec: float) -> tuple[float, float]:
+    """(hedge_after, deadline) in seconds for a clip of `clip_sec`."""
+    clip_sec = max(0.0, float(clip_sec))
+    return (
+        ELEVEN_HEDGE_BASE_SEC + ELEVEN_HEDGE_PER_AUDIO_SEC * clip_sec,
+        ELEVEN_DEADLINE_BASE_SEC + ELEVEN_DEADLINE_PER_AUDIO_SEC * clip_sec,
+    )
+
+
+def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> bytes:
+    """Pack a mono float32 [-1, 1] array into 16-bit PCM WAV bytes (stdlib)."""
+    import wave
+    pcm = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+    pcm16 = (pcm * 32767.0).astype("<i2")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(int(sample_rate))
+        w.writeframes(pcm16.tobytes())
+    return buf.getvalue()
+
+
+def save_debug_recording(audio: np.ndarray, keep: int,
+                         sample_rate: int = SAMPLE_RATE) -> None:
+    """Write `audio` to DEBUG_RECORDINGS_DIR and prune to the newest `keep`.
+
+    Runs on a daemon thread so the paste path never waits on disk. File names
+    carry sample count and RMS (rec_YYYYmmdd_HHMMSS_<n>smp_rms<x>.wav) so a
+    clip can be matched to its "recording stopped" log line.
+    """
+    if keep <= 0 or audio.size < sample_rate:   # ignore sub-second blips
+        return
+    rms = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    name = f"rec_{stamp}_{audio.size}smp_rms{rms:.4f}.wav"
+    data = _audio_to_wav_bytes(audio, sample_rate)
+
+    def _write() -> None:
+        try:
+            DEBUG_RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+            (DEBUG_RECORDINGS_DIR / name).write_bytes(data)
+            files = sorted(DEBUG_RECORDINGS_DIR.glob("rec_*.wav"))
+            for old in files[:-keep]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        except Exception:
+            log_audio.exception("debug recording save failed")
+
+    threading.Thread(target=_write, daemon=True, name="debug-rec-save").start()
+
+
+def _encode_multipart(
+    fields: dict[str, str],
+    file_field: str,
+    filename: str,
+    file_bytes: bytes,
+    file_content_type: str = "application/octet-stream",
+) -> tuple[bytes, str]:
+    """Build a multipart/form-data body with stdlib only.
+    Returns (body_bytes, content_type_header)."""
+    boundary = "----TellurForm" + os.urandom(16).hex()
+    b = boundary.encode()
+    crlf = b"\r\n"
+    parts: list[bytes] = []
+    for name, value in fields.items():
+        parts += [
+            b"--" + b,
+            f'Content-Disposition: form-data; name="{name}"'.encode(),
+            b"",
+            str(value).encode("utf-8"),
+        ]
+    parts += [
+        b"--" + b,
+        f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"'.encode(),
+        f"Content-Type: {file_content_type}".encode(),
+        b"",
+        file_bytes,
+        b"--" + b + b"--",
+        b"",
+    ]
+    return crlf.join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+class ElevenAuthError(Exception):
+    """ElevenLabs returned 401/402/429 for a key — invalid key, out of credits,
+    or rate-limited. The Scribe failover treats this as 'skip this key and try
+    the next one', and puts the key on a short cooldown."""
+
+    def __init__(self, code: int, status: str = "", message: str = ""):
+        self.code = code
+        self.status = status          # e.g. "quota_exceeded", "detected_unusual_activity"
+        super().__init__(message or f"HTTP {code} {status}".strip())
+
+
+class ElevenAllKeysFailed(Exception):
+    """Every configured ElevenLabs key failed (exhausted / invalid / on cooldown)."""
+
+
+class ElevenTimeout(ElevenAllKeysFailed):
+    """The cloud did not answer inside the clip's time budget (see
+    eleven_time_budget). Says nothing about the keys — the caller falls back
+    to local Whisper for this one clip and tries the cloud again next time."""
+
+
+def _eleven_error_detail(err: "urllib.error.HTTPError") -> tuple[str, str]:
+    """Extract ElevenLabs' {"detail": {"status": ..., "message": ...}} from an
+    error response body. Returns (status, message); best-effort, never raises."""
+    try:
+        body = err.read().decode("utf-8", errors="replace")
+    except Exception:
+        return "", ""
+    try:
+        detail = (json.loads(body) or {}).get("detail")
+    except Exception:
+        return "", body[:200].strip()
+    if isinstance(detail, dict):
+        return str(detail.get("status") or ""), str(detail.get("message") or "")
+    if isinstance(detail, str):
+        return "", detail
+    return "", body[:200].strip()
+
+
+def _eleven_credits_remaining(message: str) -> float | None:
+    """Pull the balance out of a quota rejection, or None if it isn't there.
+
+    ElevenLabs spells it out for us:
+      "This request exceeds your quota of 10000. You have 20 credits
+       remaining, while 133 credits are required for this request."
+    A key reporting >0 remaining is only out of room for THIS clip, so it gets
+    a zero-length cooldown and stays eligible for shorter ones."""
+    if not message:
+        return None
+    m = re.search(r"have\s+([\d,]+(?:\.\d+)?)\s+credits?\s+remaining", message, re.I)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+class ElevenLabsScribeClient:
+    """ElevenLabs Speech-to-Text (Scribe) over stdlib urllib.
+
+    Batch-transcribes a recorded clip via POST /v1/speech-to-text. Auth is the
+    `xi-api-key` header (NOT Bearer). Returns the transcript text. Synchronous —
+    call from a worker thread so the Qt event loop never blocks."""
+
+    def __init__(
+        self,
+        api_key: str,
+        model_id: str = ELEVEN_DEFAULT_MODEL,
+        timeout: float = 60.0,
+        clean: bool = True,
+    ):
+        self.api_key = api_key
+        self.model_id = model_id or ELEVEN_DEFAULT_MODEL
+        self.timeout = timeout
+        self.clean = clean
+
+    def transcribe(self, audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> str:
+        return self.transcribe_wav(_audio_to_wav_bytes(audio, sample_rate))
+
+    def _fields(self) -> dict[str, str]:
+        """Form fields for the request. Scribe v3 is far more literal than v2
+        about disfluencies ("I want you to l- to as-- act like…"), so
+        `no_verbatim` is what keeps dictation readable; it in turn spells
+        numbers out ("version two"), which `numbers_format` puts back. None of
+        these change what a request costs (checked against the credit quote
+        in a quota rejection)."""
+        fields = {"model_id": self.model_id, "tag_audio_events": "false"}
+        if self.clean:
+            fields["no_verbatim"] = "true"
+        if not self.model_id.startswith(("scribe_v1", "scribe_v2")):
+            fields["numbers_format"] = "digits"      # v3+ only
+        return fields
+
+    def transcribe_wav(self, wav: bytes) -> str:
+        """POST an already-encoded WAV. Split out so the pool can encode a
+        clip once and hand the same bytes to a raced second request."""
+        body, content_type = _encode_multipart(
+            fields=self._fields(),
+            file_field="file",
+            filename="audio.wav",
+            file_bytes=wav,
+            file_content_type="audio/wav",
+        )
+        headers = {
+            "xi-api-key": self.api_key,
+            "Content-Type": content_type,
+            "User-Agent": f"Tellur/{__version__}",
+        }
+        req = urllib.request.Request(
+            ELEVEN_STT_URL, data=body, headers=headers, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 402, 429):
+                status, message = _eleven_error_detail(e)
+                raise ElevenAuthError(e.code, status, message) from None
+            raise
+        data = json.loads(raw)
+        # Scribe responds with {"text": "...", "language_code": ..., "words": [...]}.
+        return (data.get("text") or "").strip()
+
+
+class ElevenLabsScribePool:
+    """Persistent failover across the configured ElevenLabs keys.
+
+    The active key is the first Settings.eleven_keys() entry that is NOT marked
+    exhausted. When a key returns 401/402/429 (out of credits / invalid / rate-
+    limited) it's recorded in Settings.eleven_exhausted and persisted to disk, so
+    the switch survives restarts and cascades forward as each key is used up.
+    Exhausted keys are re-probed after ELEVEN_EXHAUSTED_RETRY_SEC (quotas reset
+    monthly); a successful probe re-enables the key, a failed one re-arms the
+    cooldown — so a refilled key comes back on its own within one dictation.
+    Transient errors (network / 5xx) move to the next key for THIS request only,
+    without marking anything exhausted. Reads keys + exhausted state live from
+    Settings on every call, so it never goes stale when the user edits keys.
+    Raises ElevenAllKeysFailed when no usable key remains.
+
+    Every clip also runs against a time budget (eleven_time_budget): a request
+    that is slow to answer gets a second one raced against it, and past the
+    deadline ElevenTimeout is raised so the caller can decode locally instead
+    of leaving the user staring at a "transcribing" pill for a minute."""
+
+    def __init__(self, settings: "Settings", timeout: float | None = None):
+        self._settings = settings
+        # None → the deadline scales with the clip. A number pins it (tests).
+        self.timeout = timeout
+
+    def transcribe(
+        self, audio: np.ndarray, sample_rate: int = SAMPLE_RATE,
+    ) -> tuple[str, str, int]:
+        """Returns (text, key_used, index_in_eleven_keys)."""
+        if not self._settings.eleven_keys():
+            raise ElevenAllKeysFailed("no ElevenLabs API key configured")
+        clip_sec = audio.size / float(sample_rate or SAMPLE_RATE)
+        hedge_after, deadline = eleven_time_budget(clip_sec)
+        if self.timeout is not None:
+            deadline = float(self.timeout)
+            hedge_after = min(hedge_after, deadline / 2.0)
+        wav = _audio_to_wav_bytes(audio, sample_rate)
+        results: "queue.Queue[tuple[str, bool, object]]" = queue.Queue()
+        # Set once this call has returned (answer in hand, or given up): a
+        # request still in flight then discards whatever it eventually gets.
+        abandoned = threading.Event()
+
+        def run(tag: str) -> None:
+            try:
+                results.put((tag, True, self._run_chain(
+                    wav, clip_sec, deadline, abandoned)))
+            except BaseException as e:   # noqa: BLE001 — relayed to the waiter
+                results.put((tag, False, e))
+
+        def launch(tag: str) -> None:
+            threading.Thread(
+                target=run, args=(tag,), daemon=True, name=f"scribe-{tag}",
+            ).start()
+
+        t0 = time.monotonic()
+        launch("first")
+        in_flight, hedged = 1, False
+        last_err: BaseException | None = None
+        try:
+            while in_flight:
+                limit = deadline if hedged else hedge_after
+                try:
+                    tag, ok, value = results.get(
+                        timeout=max(0.0, limit - (time.monotonic() - t0)))
+                except queue.Empty:
+                    if not hedged:
+                        hedged = True
+                        log_engine.warning(
+                            "ElevenLabs slow: no answer %.1fs into a %.1fs clip "
+                            "— racing a second request (gives up at %.1fs)",
+                            time.monotonic() - t0, clip_sec, deadline,
+                        )
+                        launch("hedge")
+                        in_flight += 1
+                        continue
+                    raise ElevenTimeout(
+                        "no answer within %.1fs for a %.1fs clip"
+                        % (deadline, clip_sec)
+                    ) from None
+                in_flight -= 1
+                if ok:
+                    if hedged:
+                        log_engine.info(
+                            "ElevenLabs %s request answered after %.1fs",
+                            "second (hedge)" if tag == "hedge" else "original",
+                            time.monotonic() - t0,
+                        )
+                    return value   # type: ignore[return-value]
+                # That request failed outright (keys spent, network down). If
+                # its twin is still out, its answer can still save the clip.
+                last_err = value   # type: ignore[assignment]
+            assert last_err is not None
+            raise last_err
+        finally:
+            abandoned.set()
+
+    def _run_chain(
+        self, wav: bytes, clip_sec: float, sock_timeout: float,
+        abandoned: threading.Event,
+    ) -> tuple[str, str, int]:
+        """One pass over the keys: first usable key that answers wins.
+        Returns (text, key_used, index_in_eleven_keys) or raises
+        ElevenAllKeysFailed. Runs on a worker thread; `abandoned` means the
+        caller has stopped waiting, so stop spending requests."""
+        s = self._settings
+        keys = s.eleven_keys()
+        if not keys:
+            raise ElevenAllKeysFailed("no ElevenLabs API key configured")
+        model_id = s.eleven_model_id or ELEVEN_DEFAULT_MODEL
+        # Only keys still inside the retry cooldown are skipped; ones past it
+        # get probed again below and re-enabled if the quota came back.
+        exhausted = s.eleven_exhausted_active()
+        marked = set(s.eleven_exhausted)
+        last_err: Exception | None = None
+        skipped = 0
+        need_credits = max(1.0, clip_sec * ELEVEN_CREDITS_PER_SEC)
+        for i, key in enumerate(keys):
+            if abandoned.is_set():
+                break
+            if key in exhausted:
+                skipped += 1
+                continue
+            # A key we know is nearly empty can still take a short clip. Skip it
+            # only when the balance we were told about cannot possibly cover
+            # this one — that saves a guaranteed-failed round trip without ever
+            # writing off capacity we could have used.
+            known = s.eleven_credits_known(key)
+            if known is not None and known < need_credits:
+                skipped += 1
+                log_engine.debug(
+                    "ElevenLabs key #%d (…%s) skipped: ~%.0f credits needed for "
+                    "%.1fs, only %.0f known remaining.",
+                    i + 1, key[-4:], need_credits, clip_sec, known,
+                )
+                continue
+            try:
+                # The socket timeout only reaps a request the waiter has long
+                # since given up on; the waiter enforces the real deadline.
+                text = ElevenLabsScribeClient(
+                    key, model_id=model_id, timeout=sock_timeout,
+                    clean=bool(getattr(s, "eleven_clean_transcript", True)),
+                ).transcribe_wav(wav)
+                if abandoned.is_set():
+                    log_engine.debug(
+                        "ElevenLabs key #%d (…%s) answered after the clip "
+                        "was already served; discarded.", i + 1, key[-4:],
+                    )
+                    return text, key, i
+                if key in marked:
+                    s.clear_eleven_exhausted(key)
+                    log_engine.info(
+                        "ElevenLabs key #%d (…%s) works again after cooldown; "
+                        "re-enabled.", i + 1, key[-4:],
+                    )
+                return text, key, i
+            except ElevenAuthError as e:
+                last_err = e
+                left = _eleven_credits_remaining(str(e))
+                if e.code == 429:
+                    # Back-pressure, not exhaustion: brief cooldown only.
+                    cooldown: float | None = ELEVEN_RATELIMIT_RETRY_SEC
+                    why = "rate-limited"
+                elif left is not None and left > 0:
+                    # Has credits, just not enough for this clip. Stay eligible
+                    # for shorter ones; the recorded balance does the gating.
+                    cooldown = 0.0
+                    why = "%.0f credits left, ~%.0f needed" % (left, need_credits)
+                else:
+                    cooldown = None                  # default long cooldown
+                    why = "out of credits/invalid"
+                s.mark_eleven_exhausted(              # persisted → survives restart
+                    key, retry_after_sec=cooldown, credits_left=left,
+                )
+                if cooldown != 0.0:
+                    exhausted.add(key)
+                log_engine.warning(
+                    "ElevenLabs key #%d (…%s) %s (HTTP %s %s); "
+                    "cooldown %s, switching to the next key.",
+                    i + 1, key[-4:], why, e.code, e.status or "",
+                    "default" if cooldown is None else ("%.0fs" % cooldown),
+                )
+            except urllib.error.HTTPError as e:        # non-quota HTTP status
+                last_err = e
+                if abandoned.is_set():
+                    break
+                if 400 <= e.code < 500:
+                    # 400/413/422…: the request itself is bad for THIS clip
+                    # (too long, malformed). Every key would reject it the
+                    # same way — don't re-upload it N times.
+                    log_engine.warning(
+                        "ElevenLabs key #%d (…%s) rejected the request (HTTP %s); "
+                        "not retrying other keys.", i + 1, key[-4:], e.code,
+                    )
+                    break
+                log_engine.warning(
+                    "ElevenLabs key #%d (…%s) server error (HTTP %s); trying next key.",
+                    i + 1, key[-4:], e.code,
+                )
+            except urllib.error.URLError as e:          # DNS / connect / TLS / timeout
+                last_err = e
+                if abandoned.is_set():
+                    break
+                # Connection-level failures are about the network, not the
+                # key: the next key would hit the same wall. One try, then
+                # fall back to local for this clip.
+                log_engine.warning(
+                    "ElevenLabs key #%d (…%s) connection error (%s); "
+                    "not retrying other keys.", i + 1, key[-4:], e.reason,
+                )
+                break
+            except Exception as e:                     # parse / unexpected — transient
+                last_err = e
+                if abandoned.is_set():
+                    break
+                log_engine.warning(
+                    "ElevenLabs key #%d (…%s) transient error (%s); trying next key.",
+                    i + 1, key[-4:], e,
+                )
+        raise ElevenAllKeysFailed(
+            f"all {len(keys)} ElevenLabs key(s) unavailable"
+            + (f" ({skipped} already exhausted)" if skipped else "")
+        ) from last_err
+
+
+class GpuLoadMonitor:
+    """Answers one question for the auto backend: is the GPU too busy for a
+    local decode right now?
+
+    NVML (the nvidia-smi library) is queried lazily and the verdict cached for
+    AUTO_GPU_CACHE_SEC so the record-start badge and the decode a few seconds
+    later act on the same sample. NVML calls are microseconds and thread-safe;
+    the lock here only guards our own init/cache state. If NVML is missing or
+    the GPU isn't NVIDIA, busy_reason() reports busy with a reason — on such a
+    machine local Whisper runs on CPU, which is exactly the slow path "auto"
+    exists to avoid."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._handle = None
+        self._init_failed: str | None = None
+        self._cached_at = 0.0
+        self._cached: tuple[str | None, str | None] = (None, None)
+        self._free_mb: float | None = None
+
+    def free_vram_mb(self) -> float | None:
+        """Free VRAM in MB as of the current (cached) sample, or None when
+        NVML can't say."""
+        self.busy_reason()          # refreshes the sample if it has gone stale
+        with self._lock:
+            return self._free_mb
+
+    def _ensure_handle(self):
+        if self._handle is not None or self._init_failed is not None:
+            return
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            self._pynvml = pynvml
+        except Exception as e:
+            self._init_failed = f"NVML unavailable ({e.__class__.__name__})"
+            log_engine.warning(
+                "auto backend: %s — treating the GPU as busy, so cloud STT "
+                "is preferred on this machine", self._init_failed,
+            )
+
+    def busy_reason(self, need_vram: bool = True) -> str | None:
+        """None if the GPU is free enough for a local decode, else a short
+        human-readable reason ('GPU 87% busy', 'only 1.2 GB VRAM free').
+
+        need_vram=False skips the free-VRAM floor: an already-loaded model
+        needs no new allocation, so only raw utilization matters. The floor
+        only guards fresh loads (warm-up, first decode, post-release)."""
+        with self._lock:
+            now = time.monotonic()
+            if now - self._cached_at >= AUTO_GPU_CACHE_SEC:
+                self._cached = self._sample()
+                self._cached_at = now
+            util_reason, vram_reason = self._cached
+            return util_reason or (vram_reason if need_vram else None)
+
+    def _sample(self) -> tuple[str | None, str | None]:
+        """(utilization-verdict, vram-verdict) — cached as a pair so callers
+        with different need_vram get answers from the same sample."""
+        self._ensure_handle()
+        self._free_mb = None
+        if self._init_failed is not None:
+            return self._init_failed, None
+        try:
+            util = self._pynvml.nvmlDeviceGetUtilizationRates(self._handle).gpu
+            free_mb = self._pynvml.nvmlDeviceGetMemoryInfo(
+                self._handle).free / (1024 * 1024)
+            self._free_mb = float(free_mb)
+        except Exception as e:
+            # Driver hiccup mid-session (sleep/resume, driver update). Fail
+            # toward cloud for this sample and drop the handle so the next
+            # sample re-runs nvmlInit instead of re-using a stale handle
+            # forever (which would report "busy" for the rest of the session).
+            self._handle = None
+            self._init_failed = None
+            try:
+                self._pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            return f"GPU query failed ({e.__class__.__name__})", None
+        util_reason = (f"GPU {util:.0f}% busy"
+                       if util >= AUTO_GPU_BUSY_UTIL_PCT else None)
+        vram_reason = (f"only {free_mb / 1024:.1f} GB VRAM free"
+                       if free_mb < AUTO_GPU_MIN_FREE_VRAM_MB else None)
+        return util_reason, vram_reason
+
+
+GPU_MONITOR = GpuLoadMonitor()
+
+
 class WhisperEngine:
     """Wraps faster-whisper. Single-threaded transcribe; callers serialize."""
 
-    def __init__(self, name: str = DEFAULT_MODEL):
+    def __init__(self, name: str = DEFAULT_MODEL, settings: "Settings | None" = None):
         self.name = name
+        # Optional Settings ref so transcribe() can route to a cloud backend
+        # (ElevenLabs Scribe) when the user opts in. None → always local.
+        self.settings = settings
         self.device = PREFERRED_DEVICE
         self.compute_type = CUDA_COMPUTE_TYPE
         self._model: WhisperModel | None = None
@@ -1739,18 +3410,60 @@ class WhisperEngine:
         self._state_lock = threading.Lock()
         self._build_lock = threading.Lock()
         self._supports_hotwords = False
+        # ElevenLabs failover pool (created lazily; reads keys + exhausted state
+        # live from Settings on each call, so it never goes stale).
+        self._eleven_pool: "ElevenLabsScribePool | None" = None
+        # Backend that served the most recent transcribe(): "local" |
+        # "elevenlabs". Written by the worker thread, read by the UI thread to
+        # badge the overlay; a lone str assignment so no lock is needed.
+        self.last_backend: str = "local"
+        # Consecutive auto-mode clips routed to cloud because the GPU was
+        # busy. At AUTO_RELEASE_AFTER_BUSY the local model's VRAM is released.
+        self._auto_busy_streak = 0
+        # Graveyard for replaced/released models. NEVER let a CUDA-resident
+        # WhisperModel be garbage-collected mid-session: CTranslate2's C++
+        # destructor frees device memory in a noexcept context, so if the CUDA
+        # context has died (e.g. a WDDM reset while a game had the GPU pinned)
+        # the error escalates to std::terminate -> uncatchable 0xc0000409
+        # process abort. That killed Tellur on 2026-08-16 the first time
+        # release_local_model() ever fired. Instead we unload_model() (a normal
+        # bound method — CUDA errors surface as catchable Python exceptions)
+        # and park the husk here; the handful of retained host-side objects is
+        # a few MB per model per session.
+        self._released_husks: list = []
 
     def _build_model(self, name: str) -> tuple["WhisperModel", str, str]:
         """Build a WhisperModel, trying CUDA first and falling back to CPU.
         Does NOT mutate engine state — caller is responsible for installing it.
         May download the model on first use (via faster-whisper / HF Hub)."""
+        # A model already on disk is opened straight from the cache. Without
+        # this, every load first asked huggingface.co whether the repo had
+        # changed: 50-250 ms when the site answers, its full network timeout
+        # when it doesn't — on an app whose pitch is that it works offline.
+        cached = False
         try:
-            m = WhisperModel(name, device="cuda", compute_type=CUDA_COMPUTE_TYPE)
-            return m, "cuda", CUDA_COMPUTE_TYPE
+            cached = is_model_cached(name)
+        except Exception:
+            log_engine.debug("model cache probe failed", exc_info=True)
+
+        def make(device: str, compute: str) -> "WhisperModel":
+            if cached:
+                try:
+                    return WhisperModel(name, device=device, compute_type=compute,
+                                        local_files_only=True)
+                except Exception:
+                    # Incomplete cache entry (or a real device failure): let
+                    # the normal path sort it out, downloading if needed.
+                    log_engine.debug(
+                        "cache-only load of %s on %s failed; retrying online",
+                        name, device, exc_info=True)
+            return WhisperModel(name, device=device, compute_type=compute)
+
+        try:
+            return make("cuda", CUDA_COMPUTE_TYPE), "cuda", CUDA_COMPUTE_TYPE
         except Exception:
             log_engine.exception("CUDA load failed for %s — falling back to CPU", name)
-            m = WhisperModel(name, device="cpu", compute_type=CPU_COMPUTE_TYPE)
-            return m, "cpu", CPU_COMPUTE_TYPE
+            return make("cpu", CPU_COMPUTE_TYPE), "cpu", CPU_COMPUTE_TYPE
 
     def _detect_hotwords_support(self, model: "WhisperModel") -> bool:
         try:
@@ -1803,13 +3516,56 @@ class WhisperEngine:
             new_model, dev, ct = self._build_model(name)
             supports = self._detect_hotwords_support(new_model)
             with self._state_lock:
+                old_model = self._model
                 self._model = new_model
                 self.name = name
                 self.device = dev
                 self.compute_type = ct
                 self._supports_hotwords = supports
+            # Same destructor hazard as release_local_model: retire the old
+            # model explicitly instead of letting the swap GC it.
+            if old_model is not None:
+                self._retire_model(old_model, "model switch")
         log_engine.info("model switched to %s (%s/%s) in %.2fs",
                         name, dev, ct, time.monotonic() - t0)
+
+    def _retire_model(self, husk: "WhisperModel", why: str) -> None:
+        """Free a model's device memory WITHOUT ever running its destructor.
+
+        unload_model() raises a normal Python exception if the CUDA context is
+        broken (in which case the driver already reclaimed the memory during
+        the device reset, so there is nothing left to free anyway). The husk is
+        parked so GC can't trigger the noexcept C++ destructor mid-session."""
+        try:
+            husk.model.unload_model()
+            log_engine.info("%s — released the local model's VRAM", why)
+        except Exception as exc:
+            log_engine.warning(
+                "%s — unload_model failed (%s); CUDA context likely died "
+                "(device reset under load), so its VRAM is already gone. "
+                "Parking the dead model object.", why, exc,
+            )
+        self._released_husks.append(husk)
+
+    @property
+    def model_resident(self) -> bool:
+        """True while a local model is loaded (a lone reference read)."""
+        return self._model is not None
+
+    def release_local_model(self) -> None:
+        """Unload the model to give its VRAM back (auto mode, sustained GPU
+        load). load() rebuilds it transparently on the next local decode.
+        Takes _state_lock, so it cannot tear the model down mid-transcribe."""
+        with self._state_lock:
+            if self._model is None:
+                return
+            husk = self._model
+            self._model = None
+        self._retire_model(
+            husk,
+            "auto backend: GPU busy for %d clips in a row"
+            % AUTO_RELEASE_AFTER_BUSY,
+        )
 
     def transcribe(
         self,
@@ -1820,6 +3576,102 @@ class WhisperEngine:
         if audio.size < int(SAMPLE_RATE * MIN_AUDIO_SECONDS):
             log_engine.debug("audio too short (%d samples); skipping", audio.size)
             return ""
+        # Optional cloud backend: route to ElevenLabs Scribe when selected. Keys
+        # fail over automatically (primary → backup → …); an exhausted key is
+        # persisted so the switch sticks across restarts. Only if EVERY key is
+        # exhausted do we fall back to local Whisper, so dictation never fully
+        # breaks even though the user chose the cloud engine.
+        #
+        # "auto" routes per-clip on GPU load: a free GPU decodes locally
+        # (faster than the network round-trip and costs no credits); a busy
+        # GPU (game, render, LLM decode) sends the clip to the cloud instead
+        # of contending for it. Sustained busy also releases the local model's
+        # VRAM back to whatever is using the GPU.
+        s = self.settings
+        backend = getattr(s, "stt_backend", "local") if s is not None else "local"
+        if backend == "auto":
+            busy = GPU_MONITOR.busy_reason(need_vram=self._model is None)
+            if busy is None:
+                self._auto_busy_streak = 0
+                backend = "local"
+                log_engine.info("auto backend: GPU free — decoding locally")
+            else:
+                self._auto_busy_streak += 1
+                backend = "elevenlabs"
+                log_engine.info(
+                    "auto backend: %s — routing to ElevenLabs (streak %d)",
+                    busy, self._auto_busy_streak,
+                )
+        auto_routed = (backend == "elevenlabs"
+                       and getattr(s, "stt_backend", "local") == "auto")
+        if backend == "elevenlabs":
+            if s.eleven_keys():
+                if self._eleven_pool is None:
+                    self._eleven_pool = ElevenLabsScribePool(s)
+                t0 = time.monotonic()
+                try:
+                    text, used_key, idx = self._eleven_pool.transcribe(audio, SAMPLE_RATE)
+                    self.last_backend = "elevenlabs"
+                    log_engine.info(
+                        "scribe transcribed via key #%d (…%s) audio=%.2fs in %.0fms text=%r",
+                        idx + 1, used_key[-4:], audio.size / SAMPLE_RATE,
+                        (time.monotonic() - t0) * 1000, text,
+                    )
+                    # Release the local model's VRAM only now — once the
+                    # cloud has actually served the Nth busy clip in a row.
+                    # Releasing on routing alone (the old behaviour) meant a
+                    # clip whose cloud call then failed fell through to a
+                    # full model reload on the busy GPU it was avoiding.
+                    if (auto_routed
+                            and self._auto_busy_streak >= AUTO_RELEASE_AFTER_BUSY
+                            and self._model is not None):
+                        # ...and only if the card is actually short on
+                        # memory; see AUTO_RELEASE_BELOW_FREE_VRAM_MB.
+                        free_mb = GPU_MONITOR.free_vram_mb()
+                        if (free_mb is None
+                                or free_mb < AUTO_RELEASE_BELOW_FREE_VRAM_MB):
+                            self.release_local_model()
+                    return text
+                except ElevenTimeout as e:
+                    log_engine.warning(
+                        "ElevenLabs gave no answer in time (%s); decoding "
+                        "this clip with local Whisper instead.", e,
+                    )
+                    self._auto_busy_streak = 0
+                    # fall through to the local decode below
+                except ElevenAllKeysFailed as e:
+                    log_engine.error(
+                        "all ElevenLabs keys exhausted/failed (%s); "
+                        "falling back to local Whisper.", e,
+                    )
+                    # The cloud didn't serve; the streak measures "cloud is
+                    # carrying the load", so it restarts from here.
+                    self._auto_busy_streak = 0
+                    # fall through to the local decode below
+            else:
+                log_engine.warning(
+                    "elevenlabs backend selected but no API key set; using local Whisper",
+                )
+                self._auto_busy_streak = 0
+        # Everything below this point is the local decode.
+        self.last_backend = "local"
+        # Rescue quiet recordings before the local decode. Whisper's VAD and
+        # decoder give up on speech recorded well below full scale (headset
+        # mic drifted from the mouth), returning '' even though the words are
+        # audible. Peak-normalizing is a plain linear gain and fixes that
+        # class of empties. Scribe never needed this — only the local path.
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak < QUIET_PEAK_SILENCE:
+            log_engine.warning(
+                "recording is near-silent (peak=%.5f) — mic muted or wrong "
+                "input device? Transcription will likely be empty.", peak,
+            )
+        elif peak < QUIET_PEAK_NORMALIZE:
+            audio = audio * (QUIET_PEAK_TARGET / peak)
+            log_engine.debug(
+                "quiet recording normalized (peak %.4f → %.2f)",
+                peak, QUIET_PEAK_TARGET,
+            )
         # Ensure a model is loaded (may take minutes on first run).
         self.load()
         # Hold _state_lock for the entire decode so a switch_to() can't tear
@@ -1830,26 +3682,73 @@ class WhisperEngine:
             supports_hotwords = self._supports_hotwords
             if model is None:
                 return ""
-            kwargs = dict(
+            fragile = self.prompt_fragile()
+            # Plain decode: audio only, faster-whisper defaults for the
+            # decoder. This is the whole config for prompt-fragile (distil)
+            # models and the rescue config for everything else.
+            plain = dict(
                 language=LANGUAGE,
                 beam_size=BEAM_SIZE,
-                no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
-                repetition_penalty=REPETITION_PENALTY,
                 vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 250},
+                # threshold 0.35 (Silero default 0.5): quiet-but-real speech
+                # was getting classified as silence and dropped wholesale.
+                vad_parameters={"min_silence_duration_ms": 250,
+                                "threshold": 0.35},
                 condition_on_previous_text=False,
-                initial_prompt=initial_prompt,
             )
-            if supports_hotwords and hotwords:
-                kwargs["hotwords"] = hotwords
+            if fragile:
+                kwargs = dict(plain)
+            else:
+                kwargs = dict(
+                    plain,
+                    no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
+                    repetition_penalty=REPETITION_PENALTY,
+                    initial_prompt=initial_prompt,
+                )
+                if supports_hotwords and hotwords:
+                    kwargs["hotwords"] = hotwords
             t0 = time.monotonic()
             segments, _info = model.transcribe(audio, **kwargs)
             text = " ".join(seg.text.strip() for seg in segments).strip()
+            dur = audio.size / SAMPLE_RATE
             log_engine.info(
-                "transcribed audio=%.2fs in %.0fms text=%r",
-                audio.size / SAMPLE_RATE, (time.monotonic() - t0) * 1000, text,
+                "transcribed audio=%.2fs in %.0fms%s text=%r",
+                dur, (time.monotonic() - t0) * 1000,
+                " (plain)" if fragile else "", text,
             )
+            if self._looks_truncated(text, dur, peak):
+                # Early end-of-text or a VAD that swallowed the speech. One
+                # retry with the plain config and no VAD; keep whichever
+                # decode found more words.
+                t1 = time.monotonic()
+                rescue = dict(plain, vad_filter=False)
+                rescue.pop("vad_parameters", None)
+                segments, _info = model.transcribe(audio, **rescue)
+                text2 = " ".join(seg.text.strip() for seg in segments).strip()
+                n1, n2 = len(text.split()), len(text2.split())
+                log_engine.warning(
+                    "local decode looks truncated (%d words in %.1fs) — "
+                    "re-decoded plain/no-VAD in %.0fms: %d words%s",
+                    n1, dur, (time.monotonic() - t1) * 1000, n2,
+                    " (kept retry)" if n2 > n1 else " (kept original)",
+                )
+                if n2 > n1:
+                    log_engine.info("rescued text=%r", text2)
+                    text = text2
             return text
+
+    def prompt_fragile(self) -> bool:
+        """True when the loaded model must be decoded without any prompt
+        context (see PROMPT_FRAGILE_MODEL_PREFIXES)."""
+        base = (self.name or "").rsplit("/", 1)[-1].lower()
+        return base.startswith(PROMPT_FRAGILE_MODEL_PREFIXES)
+
+    @staticmethod
+    def _looks_truncated(text: str, dur: float, peak: float) -> bool:
+        if peak < QUIET_PEAK_SILENCE or dur < LOCAL_GUARD_MIN_SECONDS:
+            return False
+        words = len(text.split())
+        return words / dur < LOCAL_GUARD_MIN_WORDS_PER_SEC
 
 
 # ===========================================================================
@@ -2089,21 +3988,118 @@ class WebhookSink:
 
 
 # ===========================================================================
-# text injection (clipboard + simulated Ctrl+V, race-safe restore)
+# text injection (terminal-aware: clipboard + paste chord, or typed unicode)
 # ===========================================================================
-class TextInjector:
-    """Pastes via clipboard + Ctrl+V. The previous clipboard contents are
-    captured on the FIRST paste in a rapid-fire session and only restored
-    after CLIPBOARD_RESTORE_DELAY_SEC of quiet, so consecutive dictations
-    never lose the user's original clipboard."""
+def pick_paste_strategy() -> str:
+    """Decide how to inject text into the focused window, from the foreground
+    window's class and process (see the terminal-aware paste constants for
+    the why). Returns "type" for character-by-character unicode typing, or a
+    chord for `keyboard.send` ("ctrl+v", "shift+insert", "ctrl+shift+v")."""
+    cls_name, proc = get_foreground_window_info()
+    el_class: str | None = None
+    if cls_name == CONSOLE_WINDOW_CLASS:
+        # Bare cmd/PowerShell window — chords disabled in raw mode; type instead.
+        strategy = "type"
+    elif proc in ELECTRON_EDITOR_PROCS:
+        # Editor, chat panel, and integrated terminal all share this window
+        # class; only the focused element distinguishes them. An xterm.js
+        # terminal (incl. a raw-mode TUI like Claude Code) can't be relied on to
+        # accept a synthetic Ctrl+V, so type the characters — the one path that
+        # always lands. Everything else in the editor (chat box included) keeps
+        # Ctrl+V, which the v2.3.1 revert established as the working default.
+        el_class = get_focused_element_class()
+        if el_class and XTERM_FOCUS_CLASS_MARKER in el_class.lower():
+            strategy = "type"
+        else:
+            strategy = "ctrl+v"
+    else:
+        strategy = PASTE_CHORD_BY_PROCESS.get(proc or "", "ctrl+v")
+    log_paste.debug(
+        "paste target class=%s proc=%s el=%s → strategy=%s",
+        cls_name, proc, el_class, strategy,
+    )
+    return strategy
 
-    def __init__(self):
+
+class TextInjector:
+    """Injects text into the focused window. Default path is clipboard +
+    paste chord (Ctrl+V for most apps; per-app overrides for IDE terminals
+    that only paste on Shift+Insert). Legacy console windows get the text
+    *typed* as unicode key events instead — no paste chord works there once
+    a TUI app holds the console in raw mode.
+
+    For chord pastes, the previous clipboard contents are captured on the
+    FIRST paste in a rapid-fire session and only restored after
+    CLIPBOARD_RESTORE_DELAY_SEC of quiet, so consecutive dictations never
+    lose the user's original clipboard. The typing path never touches the
+    clipboard at all."""
+
+    def __init__(self, settings: Settings | None = None):
         self._lock = threading.Lock()
+        self._paste_serial = threading.Lock()
         self._saved: str | None = None
         self._gen = 0
+        self._settings = settings
+
+    def _type_into_console(self, text: str, *, press_enter: bool) -> None:
+        """Type `text` as synthetic unicode key events (the keyboard lib's
+        KEYEVENTF_UNICODE path — layout-independent, accepted by conhost in
+        both cooked and raw input modes). Newlines/tabs are flattened to
+        spaces so we can never press Enter into a shell (which would execute
+        a partial command line) or submit a TUI prompt mid-transcript."""
+        cleaned = re.sub(r"[\r\n\t]+", " ", text).strip()
+        if not cleaned:
+            return
+        try:
+            keyboard.write(cleaned, delay=TERMINAL_TYPE_KEY_DELAY_SEC)
+        except Exception:
+            log_paste.exception("console typing failed")
+            return
+        log_paste.debug("typed %d chars into console window", len(cleaned))
+        if press_enter:
+            try:
+                time.sleep(PASTE_KEYSTROKE_DELAY_SEC)
+                keyboard.send("enter")
+                log_paste.debug("send-and-enter: pressed Enter")
+            except Exception:
+                log_paste.exception("send-and-enter keystroke failed")
+
+    def _wait_for_keys_released(self) -> None:
+        """Block (bounded) while Ctrl+Win is physically held. See
+        PASTE_WAIT_FOR_KEYS_SEC. Called off the GUI thread."""
+        try:
+            if not _ctrl_win_held():
+                return
+        except Exception:
+            return
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < PASTE_WAIT_FOR_KEYS_SEC:
+            time.sleep(0.02)
+            try:
+                if not _ctrl_win_held():
+                    break
+            except Exception:
+                break
+        log_paste.debug("paste waited %.2fs for Ctrl+Win release",
+                        time.monotonic() - t0)
 
     def paste(self, text: str, *, press_enter: bool = False) -> None:
         if not text:
+            return
+        # Serialize whole pastes: two transcripts can finish while the user
+        # holds Ctrl+Win for a third; they must go out in the order they
+        # arrived here, and never interleave clipboard/keystroke sequences.
+        with self._paste_serial:
+            self._wait_for_keys_released()
+            self._paste_now(text, press_enter=press_enter)
+
+    def _paste_now(self, text: str, *, press_enter: bool = False) -> None:
+        terminal_aware = (
+            self._settings is None or self._settings.terminal_aware_paste
+        )
+        strategy = pick_paste_strategy() if terminal_aware else "ctrl+v"
+        if strategy == "type":
+            self._type_into_console(text, press_enter=press_enter)
             return
         # Track whether THIS call was the one that populated _saved, so that if
         # we abort early we can roll it back (otherwise the user's clipboard
@@ -2119,27 +4115,37 @@ class TextInjector:
             self._gen += 1
             my_gen = self._gen
 
-        def _abort_clear() -> None:
-            if we_set_saved:
-                with self._lock:
-                    # Only clear if no newer paste has populated it.
-                    if self._gen == my_gen:
-                        self._saved = None
+        def _abort_clear(restore: bool) -> None:
+            if not we_set_saved:
+                return
+            with self._lock:
+                # Only clear if no newer paste has populated it.
+                if self._gen != my_gen:
+                    return
+                saved, self._saved = self._saved, None
+            if restore and saved is not None:
+                # The clipboard already holds our text; put the user's
+                # content back rather than leaving it replaced.
+                try:
+                    pyperclip.copy(saved)
+                except Exception:
+                    log_paste.debug("clipboard restore after abort failed",
+                                    exc_info=True)
 
         try:
             pyperclip.copy(text)
         except Exception:
             log_paste.exception("clipboard copy failed")
-            _abort_clear()
+            _abort_clear(restore=False)
             return
         time.sleep(PASTE_KEYSTROKE_DELAY_SEC)
         try:
-            keyboard.send("ctrl+v")
+            keyboard.send(strategy)
         except Exception:
             log_paste.exception("paste keystroke failed")
-            _abort_clear()
+            _abort_clear(restore=True)
             return
-        log_paste.debug("pasted %d chars", len(text))
+        log_paste.debug("pasted %d chars (%s)", len(text), strategy)
 
         # Optional "send & enter" mode (v1.8): some chat apps want a press of
         # Enter to submit the freshly-pasted message. We add a tiny gap so the
@@ -2170,6 +4176,206 @@ class TextInjector:
 
 
 # ===========================================================================
+# input resilience — hook-free key polling, hook watchdog, input priority
+#
+# The push-to-talk poll used to read keyboard.is_pressed(), which consults a
+# table maintained by the keyboard lib's WH_KEYBOARD_LL hook. Windows
+# silently REMOVES such a hook when its callback misses the
+# LowLevelHooksTimeout deadline — which reliably happens while a heavy game
+# (GTA V Enhanced, 2026-07-23) launches and starves this process. No error is
+# raised anywhere; dictation is simply dead until restart. So:
+#   * the primary Ctrl+Win poll now asks the input system directly via
+#     GetAsyncKeyState, which needs no hook and cannot be revoked;
+#   * the chord hotkeys (quit/cancel/repaste/llm/note) still ride the hook,
+#     so HotkeyWatcher probes for hook death and reinstalls a fresh hook on a
+#     new pump thread (registered handlers hang off keyboard._listener and
+#     survive — only the OS-level hook is replaced);
+#   * raise_input_priority() makes the whole failure less likely by keeping
+#     the hook callback schedulable under full-core load.
+# ===========================================================================
+_WIN32 = sys.platform == "win32"
+if _WIN32:
+    import ctypes as _ctypes
+    # Private WinDLL instances (not ctypes.windll.*) so our argtypes can't
+    # leak onto the shared cached function objects other libs use.
+    _user32 = _ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = _ctypes.WinDLL("kernel32", use_last_error=True)
+    _user32.GetAsyncKeyState.argtypes = (_ctypes.c_int,)
+    _user32.GetAsyncKeyState.restype = _ctypes.c_short
+    _user32.VkKeyScanW.argtypes = (_ctypes.c_wchar,)
+    _user32.VkKeyScanW.restype = _ctypes.c_short
+    _user32.SetWindowPos.argtypes = (
+        _ctypes.c_void_p, _ctypes.c_void_p, _ctypes.c_int, _ctypes.c_int,
+        _ctypes.c_int, _ctypes.c_int, _ctypes.c_uint)
+    _kernel32.SetPriorityClass.argtypes = (_ctypes.c_void_p, _ctypes.c_uint)
+    _kernel32.SetThreadPriority.argtypes = (_ctypes.c_void_p, _ctypes.c_int)
+    _kernel32.OpenThread.argtypes = (
+        _ctypes.c_uint, _ctypes.c_int, _ctypes.c_uint)
+    _kernel32.OpenThread.restype = _ctypes.c_void_p
+    _kernel32.CloseHandle.argtypes = (_ctypes.c_void_p,)
+    # Pseudo-handles are pointer-sized -1/-2. Passing a bare Python -1
+    # through untyped ctypes truncates to 32 bits and the call fails with an
+    # invalid handle (bit us in 2.3.4 testing) — hence c_void_p here.
+    _CURRENT_PROCESS = _ctypes.c_void_p(-1)
+    _CURRENT_THREAD = _ctypes.c_void_p(-2)
+
+_VK_CONTROL, _VK_LWIN, _VK_RWIN = 0x11, 0x5B, 0x5C
+_VK_KEYBOARD_FIRST = 0x08   # skip mouse-button VKs (0x01-0x06): keyboard hook
+                            # health must not be judged by mouse activity
+
+
+# Chord hotkeys (quit / repaste / llm / note / Esc-cancel) are polled with
+# GetAsyncKeyState exactly like the Ctrl+Win push-to-talk, so they no longer
+# depend on the `keyboard` lib's WH_KEYBOARD_LL hook at all. Two real bugs
+# went away with the hook: (1) the lib re-fired a chord on every keyboard
+# auto-repeat, so holding Ctrl+Win+Z for a second toggled note mode ~12
+# times (69 toggles in one minute on 2026-08-08) and holding Ctrl+Win+B
+# re-pasted repeatedly; (2) Windows silently revokes the LL hook under load,
+# which the watchdog below papered over with a fresh pump thread ~hourly
+# (57 replacements in one 8-day session, each leaking a message-pump thread).
+# Edge detection on physical key state fires once per press, period.
+_VK_BY_NAME = {
+    "esc": 0x1B, "escape": 0x1B, "space": 0x20, "spacebar": 0x20,
+    "enter": 0x0D, "return": 0x0D, "tab": 0x09, "backspace": 0x08,
+    "delete": 0x2E, "del": 0x2E, "insert": 0x2D, "ins": 0x2D,
+    "home": 0x24, "end": 0x23, "page up": 0x21, "pageup": 0x21,
+    "page down": 0x22, "pagedown": 0x22, "up": 0x26, "down": 0x28,
+    "left": 0x25, "right": 0x27, "pause": 0x13, "print screen": 0x2C,
+    "caps lock": 0x14, "num lock": 0x90, "scroll lock": 0x91,
+    "menu": 0x5D, "apps": 0x5D,
+}
+for _i in range(1, 25):
+    _VK_BY_NAME[f"f{_i}"] = 0x6F + _i
+# Modifier tokens → the VKs that satisfy them (any one of the tuple).
+_MOD_VKS = {
+    "ctrl": (0x11,), "control": (0x11,), "left ctrl": (0xA2,),
+    "right ctrl": (0xA3,),
+    "windows": (0x5B, 0x5C), "win": (0x5B, 0x5C), "left windows": (0x5B,),
+    "right windows": (0x5C,), "cmd": (0x5B, 0x5C), "super": (0x5B, 0x5C),
+    "alt": (0x12,), "left alt": (0xA4,), "right alt": (0xA5,), "alt gr": (0xA5,),
+    "shift": (0x10,), "left shift": (0xA0,), "right shift": (0xA1,),
+}
+
+
+def parse_chord(combo: str) -> tuple[tuple[tuple[int, ...], ...], int] | None:
+    """Turn a keyboard-lib combo string ("ctrl+windows+z", "escape") into
+    (modifier groups, final VK) for GetAsyncKeyState polling. Each modifier
+    group is a tuple of VKs of which any one must be down; the final key is a
+    single VK. Returns None if the string has no single non-modifier key or
+    names something this table can't map (caller falls back to the hook)."""
+    if not combo:
+        return None
+    tokens = [t.strip().lower() for t in combo.split("+")]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return None
+    mods: list[tuple[int, ...]] = []
+    final: int | None = None
+    for t in tokens:
+        if t in _MOD_VKS:
+            mods.append(_MOD_VKS[t])
+            continue
+        if final is not None:
+            return None          # two non-modifier keys — not a chord we poll
+        if t in _VK_BY_NAME:
+            final = _VK_BY_NAME[t]
+        elif len(t) == 1 and (t.isalnum() and t.isascii()):
+            final = ord(t.upper())
+        elif len(t) == 1 and _WIN32:
+            # Punctuation: VkKeyScanW gives VK in the low byte, shift state
+            # in the high byte (ignored — the chord's own modifiers rule).
+            r = _user32.VkKeyScanW(t)
+            if r == -1:
+                return None
+            final = r & 0xFF
+        else:
+            return None
+    if final is None:
+        return None
+    return tuple(mods), final
+
+
+def _chord_held(chord: tuple[tuple[tuple[int, ...], ...], int]) -> bool:
+    """True while every modifier group has a key down AND the final key is
+    down, per GetAsyncKeyState."""
+    down = _user32.GetAsyncKeyState
+    mods, final = chord
+    if not down(final) & 0x8000:
+        return False
+    for group in mods:
+        if not any(down(vk) & 0x8000 for vk in group):
+            return False
+    return True
+
+
+def _ctrl_win_held() -> bool:
+    """True while Ctrl and a Win key are physically held, per GetAsyncKeyState
+    (hook-free). Non-Windows falls back to the keyboard lib."""
+    if not _WIN32:
+        return keyboard.is_pressed("ctrl") and (
+            keyboard.is_pressed("left windows")
+            or keyboard.is_pressed("right windows"))
+    down = _user32.GetAsyncKeyState
+    return bool(down(_VK_CONTROL) & 0x8000) and (
+        bool(down(_VK_LWIN) & 0x8000) or bool(down(_VK_RWIN) & 0x8000))
+
+
+def _keyboard_down_bitmap() -> int:
+    """Bitmap of currently-down keyboard VKs via GetAsyncKeyState. A key held
+    across two probe ticks that the LL hook never reported is proof the hook
+    is gone. Tap-and-release between ticks can slip by — fine, the point is
+    catching sustained activity (WASD in a game) with a silent hook."""
+    if not _WIN32:
+        return 0
+    down = _user32.GetAsyncKeyState
+    bits = 0
+    for vk in range(_VK_KEYBOARD_FIRST, 256):
+        if down(vk) & 0x8000:
+            bits |= 1 << vk
+    return bits
+
+
+def _bump_current_thread_priority() -> None:
+    """THREAD_PRIORITY_HIGHEST for the calling thread (hook pump threads)."""
+    if _WIN32:
+        try:
+            _kernel32.SetThreadPriority(_CURRENT_THREAD, 2)
+        except Exception:
+            pass
+
+
+def raise_input_priority() -> None:
+    """Above-normal process priority plus highest thread priority for the
+    keyboard lib's hook pump thread. The LL hook callback must answer within
+    the OS deadline even while a AAA game launch saturates every core, or
+    Windows revokes the hook without notice. Call once after startup (the
+    keyboard listener thread must already exist)."""
+    if not _WIN32:
+        return
+    try:
+        ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+        ok = _kernel32.SetPriorityClass(
+            _CURRENT_PROCESS, ABOVE_NORMAL_PRIORITY_CLASS)
+        log_app.info("process priority -> above normal (%s)",
+                     "ok" if ok else "failed")
+    except Exception:
+        log_app.exception("failed to raise process priority")
+    try:
+        t = getattr(keyboard._listener, "listening_thread", None)
+        tid = getattr(t, "native_id", None)
+        if tid:
+            THREAD_SET_INFORMATION, THREAD_QUERY_INFORMATION = 0x0020, 0x0040
+            h = _kernel32.OpenThread(
+                THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, False, tid)
+            if h:
+                _kernel32.SetThreadPriority(h, 2)  # THREAD_PRIORITY_HIGHEST
+                _kernel32.CloseHandle(h)
+                log_hotkey.info("hook thread priority -> highest (tid=%s)", tid)
+    except Exception:
+        log_hotkey.exception("failed to raise hook thread priority")
+
+
+# ===========================================================================
 # hotkey watcher — polls Ctrl + Win held; emits press / release transitions
 # ===========================================================================
 class HotkeyWatcher(QObject):
@@ -2178,8 +4384,11 @@ class HotkeyWatcher(QObject):
     - "toggle" — first press starts recording (pressed); next press ends
                  it (released). Ignores release events in between.
 
-    Also registers global hotkeys for quit, cancel-recording, and
-    re-paste-last via the `keyboard` library's low-level Windows hook.
+    Both the Ctrl+Win poll AND the quit / cancel / re-paste / llm / note
+    chords are hook-free (GetAsyncKeyState edge detection, 20 ms poll — see
+    the input resilience section above). The `keyboard` lib's low-level hook
+    is only installed as a fallback for a chord string `parse_chord` can't
+    map; only then does the hook-death watchdog run.
     """
 
     pressed = pyqtSignal()
@@ -2208,10 +4417,31 @@ class HotkeyWatcher(QObject):
         self._settings = settings
         # Track add_hotkey handles per slot so we can remove a stale binding
         # before installing a new one (user changes a hotkey in Settings).
+        # Only populated for slots that fell back to the keyboard-lib hook.
         self._hotkey_handles: dict[str, int] = {}
+        # Polled chords: slot -> parsed (modifier groups, final VK), plus the
+        # per-slot "was held last tick" flag for edge detection.
+        self._chords: dict[str, tuple] = {}
+        self._chord_down: dict[str, bool] = {}
         self._timer = QTimer(self)
         self._timer.setInterval(poll_ms)
         self._timer.timeout.connect(self._poll)
+
+        # --- hook-death watchdog (fallback slots only) ---------------------
+        # A chord that couldn't be parsed for polling lives on the keyboard
+        # lib's WH_KEYBOARD_LL hook, which Windows silently revokes under
+        # load (see input resilience section). Track every event the hook
+        # DOES deliver; if fresh key activity shows up via GetAsyncKeyState
+        # while the hook stays silent, install a replacement hook. None of
+        # this is armed while every slot polls natively.
+        self._hook_last_event = time.monotonic()
+        self._hook_down_bitmap = 0
+        self._last_rehook = 0.0
+        self._rehook_count = 0
+        self._hook_probe_installed = False
+        self._hook_timer = QTimer(self)
+        self._hook_timer.setInterval(HOOK_HEALTH_POLL_MS)
+        self._hook_timer.timeout.connect(self._check_hook_health)
         for slot in self._ALL_SLOTS:
             self._register_slot(slot)
 
@@ -2244,7 +4474,8 @@ class HotkeyWatcher(QObject):
 
     def _register_slot(self, slot: str) -> None:
         """Bind (or rebind) one slot. Removes any prior binding first so a
-        Settings edit doesn't leave the old combo wired up."""
+        Settings edit doesn't leave the old combo wired up. Polled when the
+        combo parses; the keyboard-lib hook is the fallback."""
         combo = self._slot_combo(slot)
         if slot in self._hotkey_handles:
             try:
@@ -2254,13 +4485,56 @@ class HotkeyWatcher(QObject):
             except Exception:
                 log_hotkey.exception("failed to remove prior %s hotkey", slot)
             self._hotkey_handles.pop(slot, None)
+        self._chords.pop(slot, None)
+        self._chord_down.pop(slot, None)
+        chord = parse_chord(combo) if _WIN32 else None
+        if chord is not None:
+            self._chords[slot] = chord
+            self._chord_down[slot] = False
+            log_hotkey.info("registered %s hotkey: %s (polled)", slot, combo)
+            return
         try:
             kwargs = {"suppress": False} if slot == "cancel" else {}
             handle = keyboard.add_hotkey(combo, self._slot_emit(slot), **kwargs)
             self._hotkey_handles[slot] = handle
-            log_hotkey.info("registered %s hotkey: %s", slot, combo)
+            log_hotkey.info("registered %s hotkey: %s (hook fallback)", slot, combo)
+            self._ensure_hook_watchdog()
         except Exception:
             log_hotkey.exception("failed to register %s hotkey (%r)", slot, combo)
+
+    def _ensure_hook_watchdog(self) -> None:
+        """Arm the LL-hook health probe — only needed once a slot has fallen
+        back to keyboard.add_hotkey."""
+        if self._hook_probe_installed:
+            return
+        try:
+            keyboard.hook(self._note_hook_event)
+            self._hook_probe_installed = True
+        except Exception:
+            log_hotkey.exception("failed to register hook-health probe")
+        if self._timer.isActive() and not self._hook_timer.isActive():
+            self._hook_timer.start()
+
+    @property
+    def _hook_in_use(self) -> bool:
+        return bool(self._hotkey_handles)
+
+    def _poll_chords(self) -> None:
+        """Edge-detect every polled chord; fire once per physical press."""
+        for slot, chord in self._chords.items():
+            try:
+                held = _chord_held(chord)
+            except Exception:
+                log_hotkey.exception("chord poll failed for %s", slot)
+                held = False
+            if held and not self._chord_down.get(slot, False):
+                self._chord_down[slot] = True
+                try:
+                    self._slot_emit(slot)()
+                except Exception:
+                    log_hotkey.exception("chord %s handler raised", slot)
+            elif not held:
+                self._chord_down[slot] = False
 
     def apply_settings(self) -> None:
         """Re-bind every configurable hotkey from current Settings. Call
@@ -2284,16 +4558,69 @@ class HotkeyWatcher(QObject):
 
     def start(self) -> None:
         self._timer.start()
-        log_hotkey.info("watching ctrl+win in %s mode", self._mode)
+        if self._hook_in_use:
+            self._hook_timer.start()
+        log_hotkey.info(
+            "watching ctrl+win in %s mode (async key poll; %d chord(s) polled, "
+            "%d on keyboard hook%s)", self._mode, len(self._chords),
+            len(self._hotkey_handles),
+            " + hook watchdog" if self._hook_in_use else "")
 
     def _all_held(self) -> bool:
         try:
-            ctrl = keyboard.is_pressed("ctrl")
-            win = keyboard.is_pressed("left windows") or keyboard.is_pressed("right windows")
-            return bool(ctrl and win)
+            return _ctrl_win_held()
         except Exception:
-            log_hotkey.exception("keyboard poll failed")
+            log_hotkey.exception("key state poll failed")
             return False
+
+    # --- hook-death watchdog ----------------------------------------------
+    def _note_hook_event(self, _event) -> None:
+        # Runs on the hook pump thread for every key event — keep it tiny.
+        self._hook_last_event = time.monotonic()
+
+    def _check_hook_health(self) -> None:
+        """Periodic probe: a key went down (per GetAsyncKeyState) since last
+        tick, yet the LL hook reported nothing for 1.5+ ticks → hook is dead.
+        Held gaming keys (WASD) trip this within a tick or two."""
+        bitmap = _keyboard_down_bitmap()
+        fresh = bitmap & ~self._hook_down_bitmap
+        self._hook_down_bitmap = bitmap
+        if not fresh:
+            return
+        quiet = time.monotonic() - self._hook_last_event
+        if quiet > (self._hook_timer.interval() / 1000.0) * 1.5:
+            self._rehook(f"key activity while hook silent {quiet:.1f}s")
+
+    def _verify_hook_saw_press(self, t_press: float) -> None:
+        """Scheduled 1s after each PTT press (detected hook-free): a live
+        hook must have seen those same Ctrl/Win keydowns. Dictation itself
+        already started — this only resurrects the chord hotkeys sooner."""
+        if self._hook_last_event < t_press - 0.05:
+            self._rehook("push-to-talk press invisible to hook")
+
+    def _rehook(self, reason: str) -> None:
+        now = time.monotonic()
+        if now - self._last_rehook < REHOOK_MIN_GAP_SEC:
+            return
+        self._last_rehook = now
+        self._rehook_count += 1
+        log_hotkey.warning(
+            "keyboard hook dead (%s) — installing replacement #%d "
+            "(chord hotkeys were offline; dictation itself is hook-free)",
+            reason, self._rehook_count)
+        try:
+            # Fresh SetWindowsHookEx + message pump on a new thread, feeding
+            # the same keyboard._listener — all registered handlers/hotkeys
+            # carry over. The old pump thread keeps running harmlessly; its
+            # hook is the thing that died. Private API, pinned lib version.
+            def _pump():
+                _bump_current_thread_priority()
+                keyboard._os_keyboard.listen(keyboard._listener.direct_callback)
+            threading.Thread(target=_pump, daemon=True,
+                             name=f"kb-hook-{self._rehook_count}").start()
+            self._hook_last_event = time.monotonic()  # grace for the new hook
+        except Exception:
+            log_hotkey.exception("hook reinstall failed")
 
     @property
     def recording(self) -> bool:
@@ -2317,6 +4644,10 @@ class HotkeyWatcher(QObject):
             self._recording = False
 
     def _poll(self) -> None:
+        # Chords first: a note-toggle / Esc press must still be seen while a
+        # note is in progress (the dictation poll below stands down then).
+        if self._chords:
+            self._poll_chords()
         if self._note_in_progress:
             # Stand down so the note recording isn't fighting a dictation
             # press/release in parallel. Treat keys as not-held so when the
@@ -2329,6 +4660,13 @@ class HotkeyWatcher(QObject):
         key_press = held and not self._held_keys
         key_release = not held and self._held_keys
         self._held_keys = held
+
+        if key_press and self._hook_in_use:
+            # Cross-check the LL hook against this hook-free press detection
+            # (fires once per hold — key_press is an edge, not a level).
+            t_press = time.monotonic()
+            QTimer.singleShot(
+                1000, lambda: self._verify_hook_saw_press(t_press))
 
         if self._mode == "hold":
             # Recording follows key state 1:1
@@ -2354,8 +4692,73 @@ class HotkeyWatcher(QObject):
 # ===========================================================================
 # overlay — tiny indicator at bottom-center of the primary monitor
 # ===========================================================================
+def read_communications_mic_mute() -> tuple[bool | None, str]:
+    """Read the same Windows input endpoint controlled by IEM Control.
+
+    Never infer mute from silence or a saved button press. Re-resolve the
+    endpoint on each check to follow device changes and USB reconnects.
+    Caller must initialize COM on its thread.
+    """
+    try:
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities
+        from pycaw.api.endpointvolume import IAudioEndpointVolume
+        endpoint = AudioUtilities.GetDeviceEnumerator().GetDefaultAudioEndpoint(1, 2)
+        device = AudioUtilities.CreateDevice(endpoint)
+        volume = endpoint.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        return bool(volume.QueryInterface(IAudioEndpointVolume).GetMute()), device.FriendlyName
+    except Exception:
+        return None, "Default communications microphone unavailable"
+
+
+class CommsMicProbe:
+    """Cheap repeated reads of the communications mic's mute state.
+
+    read_communications_mic_mute() walks the device enumerator and opens the
+    endpoint's property store on every call — ~10 ms of CPU. The overlay polls
+    2.5×/s for the life of the process, which made this the bulk of Tellur's
+    idle CPU (and 10 ms GIL holds next to the 20 ms hotkey poll). GetMute()
+    on a held IAudioEndpointVolume is microseconds, so keep the interface and
+    re-resolve the default endpoint only every RESOLVE_EVERY_SEC (to follow a
+    changed default device / USB reconnect) or after any failure.
+    Single-threaded: create and use on one COM-initialized thread."""
+
+    RESOLVE_EVERY_SEC = 3.0
+
+    def __init__(self) -> None:
+        self._volume = None
+        self._name = "Default communications microphone unavailable"
+        self._resolved_at = 0.0
+
+    def _resolve(self) -> None:
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities
+        from pycaw.api.endpointvolume import IAudioEndpointVolume
+        endpoint = AudioUtilities.GetDeviceEnumerator().GetDefaultAudioEndpoint(1, 2)
+        name = AudioUtilities.CreateDevice(endpoint).FriendlyName
+        volume = endpoint.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        self._volume = volume.QueryInterface(IAudioEndpointVolume)
+        self._name = name
+
+    def read(self) -> tuple[bool | None, str]:
+        now = time.monotonic()
+        try:
+            if (self._volume is None
+                    or now - self._resolved_at >= self.RESOLVE_EVERY_SEC):
+                self._resolved_at = now
+                self._resolve()
+            return bool(self._volume.GetMute()), self._name
+        except Exception:
+            self._volume = None
+            return None, "Default communications microphone unavailable"
+
+
 class Overlay(QWidget):
-    def __init__(self):
+    mic_status_changed = pyqtSignal(object, str)
+    MIC_STATUS_HEIGHT = 16
+    MIC_STATUS_WIDTH = 16
+
+    def __init__(self, monitor_microphone: bool = True):
         super().__init__()
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -2366,12 +4769,50 @@ class Overlay(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.resize(OVERLAY_WIDTH, OVERLAY_HEIGHT)
+        self.resize(max(OVERLAY_WIDTH, self.MIC_STATUS_WIDTH), OVERLAY_HEIGHT + self.MIC_STATUS_HEIGHT)
+        self._mic_muted: bool | None = None
+        self._mic_name = "Checking default communications microphone"
+        self.mic_status_changed.connect(self._set_mic_status)
+        if monitor_microphone:
+            # Core Audio calls stay off the GUI thread. Qt queues the result.
+            stop = threading.Event()
+            self.destroyed.connect(lambda: stop.set())
+            signal = self.mic_status_changed
+            def watch_mic():
+                import comtypes
+                comtypes.CoInitialize()
+                try:
+                    probe = CommsMicProbe()
+                    last = None
+                    while not stop.is_set():
+                        status = probe.read()
+                        # Emit on change only: the slot ignored repeats
+                        # anyway, and each emit is a queued cross-thread
+                        # event on the GUI loop.
+                        if status != last:
+                            last = status
+                            try:
+                                signal.emit(*status)
+                            except RuntimeError:
+                                break  # widget was deleted during the query
+                        stop.wait(0.4)
+                    probe = None    # drop the COM pointer before CoUninitialize
+                finally:
+                    comtypes.CoUninitialize()
+            threading.Thread(target=watch_mic, name="mic-mute-status", daemon=True).start()
 
         self._state = "idle"
         self._pulse_t = 0.0
         self._history: deque[float] = deque([0.0] * BAR_COUNT, maxlen=BAR_COUNT)
         self._scale = float(BAR_LEVEL_SCALE)
+        # Engine badge: True while dictation is being served by local Whisper.
+        # The pill grows upward and paints a label under the bars, so a silent
+        # fallback from the cloud engine is visible while you're still talking.
+        self._badge = False
+        self._badge_font = QFont()
+        self._badge_font.setPointSize(OVERLAY_BADGE_FONT_PT)
+        self._badge_font.setBold(True)
+        self._badge_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.6)
 
         self._anim = QTimer(self)
         self._anim.timeout.connect(self._tick)
@@ -2383,7 +4824,14 @@ class Overlay(QWidget):
         # no longer exists.
         guiapp = QGuiApplication.instance()
         if guiapp is not None:
-            guiapp.primaryScreenChanged.connect(lambda _s: self._position())
+            # Bound method of this QObject (NOT a lambda): Qt drops the
+            # connection when the overlay is destroyed. A lambda survived
+            # "Refresh UI" and then called _position() on the deleted widget
+            # at the next monitor change.
+            guiapp.primaryScreenChanged.connect(self._on_primary_screen_changed)
+
+    def _on_primary_screen_changed(self, _screen) -> None:
+        self._position()
 
     def set_scale(self, scale: float) -> None:
         self._scale = max(1.0, float(scale))
@@ -2396,12 +4844,68 @@ class Overlay(QWidget):
         y = screen.bottom() - self.height() - OVERLAY_BOTTOM_MARGIN
         self.move(x, y)
 
+    def _content_height(self) -> int:
+        """Height available to the bars/dot — the badge row is carved off the
+        bottom, so the indicator sits directly under the level bars."""
+        return self.height() - self.MIC_STATUS_HEIGHT - (OVERLAY_BADGE_HEIGHT if self._badge else 0)
+
+    def _set_mic_status(self, muted: bool | None, name: str) -> None:
+        if (muted, name) == (self._mic_muted, self._mic_name):
+            return
+        self._mic_muted, self._mic_name = muted, name
+        state = "muted" if muted is True else "unmuted" if muted is False else "status unknown"
+        self.setAccessibleName(f"{name}: {state}")
+        self.setToolTip(f"Windows communications microphone: {name}\n{state}")
+        self._reassert_topmost()
+        self.update()
+
+    def set_engine(self, engine: str) -> None:
+        """Show/hide the local-Whisper badge. Only the literal "local" shows it;
+        "elevenlabs", "pending", and anything else hide it.
+
+        The badge is **confirmatory, never predictive**. It is cleared at record
+        start ("pending") and only raised once the transcribe has returned and
+        reported that local Whisper is what actually ran. Guessing up front from
+        key state would raise it in cases where a key turns out to work — the
+        badge would then be claiming something untrue. It stays up after a local
+        dictation, as a notification, until the next time you press the hotkey.
+
+        Live *before-you-talk* engine state lives in Settings → Transcription
+        engine instead, where being wrong for a moment costs nothing."""
+        badge = (engine or "").lower() == "local"
+        if badge == self._badge:
+            return
+        self._badge = badge
+        # Bottom edge stays put: _position() derives y from the new height, so
+        # the pill grows upward and the bars shift up by the badge row.
+        self.resize(
+            max(self.MIC_STATUS_WIDTH, OVERLAY_BADGE_WIDTH if badge else OVERLAY_WIDTH),
+            OVERLAY_HEIGHT + self.MIC_STATUS_HEIGHT + (OVERLAY_BADGE_HEIGHT if badge else 0),
+        )
+        self._position()
+        self.update()
+
     def set_state(self, state: str) -> None:
         if state != self._state:
             self._state = state
             if state == "recording":
                 self._history = deque([0.0] * BAR_COUNT, maxlen=BAR_COUNT)
+                self._reassert_topmost()
             self.update()
+
+    def _reassert_topmost(self) -> None:
+        """Games re-claim the top of the z-order when they launch; shove the
+        pill back above borderless-fullscreen windows each time recording
+        starts. (Exclusive fullscreen still covers everything — no cure.)"""
+        if not _WIN32:
+            return
+        try:
+            HWND_TOPMOST = -1
+            flags = 0x0001 | 0x0002 | 0x0010  # NOSIZE | NOMOVE | NOACTIVATE
+            _user32.SetWindowPos(
+                int(self.winId()), HWND_TOPMOST, 0, 0, 0, 0, flags)
+        except Exception:
+            pass
 
     def push_level(self, level: float) -> None:
         self._history.append(level)
@@ -2420,14 +4924,34 @@ class Overlay(QWidget):
             self._draw_bars(p)
         else:
             self._draw_dot(p)
+        if self._badge:
+            self._draw_badge(p)
+        self._draw_mic_status(p)
+
+    def _draw_mic_status(self, p: QPainter) -> None:
+        top = self.height() - self.MIC_STATUS_HEIGHT
+        muted = self._mic_muted
+        color = QColor("#ff6b6b" if muted is True else "#62d98b" if muted is False else "#e9bc72")
+        p.save()
+        p.translate(self.width() / 2, top)
+        p.setPen(QPen(color, 1.5))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        # A compact, centered icon only; the window remains fully transparent.
+        p.drawRoundedRect(QRectF(-2.5, 1, 5, 8), 2.5, 2.5)
+        p.drawArc(QRectF(-5, 4, 10, 8), 180 * 16, 180 * 16)
+        p.drawLine(0, 12, 0, 14)
+        p.drawLine(-3, 14, 3, 14)
+        if muted is True:
+            p.drawLine(-6, 1, 6, 14)
+        p.restore()
 
     def _draw_bars(self, p: QPainter) -> None:
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(240, 90, 90))
         total_w = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP
         x0 = (self.width() - total_w) // 2
-        max_h = self.height()
-        cy = self.height() / 2
+        max_h = self._content_height()
+        cy = max_h / 2
         for i, level in enumerate(self._history):
             scaled = min(level * self._scale, 1.0)
             h = max(BAR_MIN_HEIGHT, scaled * max_h)
@@ -2438,10 +4962,21 @@ class Overlay(QWidget):
     def _draw_dot(self, p: QPainter) -> None:
         color, radius = self._dot_style()
         cx = self.width() / 2
-        cy = self.height() / 2
+        cy = self._content_height() / 2
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(color)
         p.drawEllipse(QRectF(cx - radius, cy - radius, radius * 2, radius * 2))
+
+    def _draw_badge(self, p: QPainter) -> None:
+        """"WHISPER" in amber directly beneath the level bars — the tell that
+        this dictation is NOT going through the cloud engine."""
+        p.setFont(self._badge_font)
+        p.setPen(QColor(*OVERLAY_BADGE_COLOR))
+        p.drawText(
+            QRectF(0, self._content_height(), self.width(), OVERLAY_BADGE_HEIGHT),
+            int(Qt.AlignmentFlag.AlignCenter),
+            OVERLAY_BADGE_TEXT,
+        )
 
     def _dot_style(self) -> tuple[QColor, float]:
         if self._state == "transcribing":
@@ -2571,6 +5106,25 @@ def check_for_update() -> dict | None:
         "notes": body[:1500],
         "html_url": data.get("html_url") or "",
     }
+
+
+def _download_file(url: str, dest: Path, *, timeout: float,
+                   max_bytes: int) -> None:
+    """Stream `url` to `dest` with a per-read socket timeout and a hard size
+    cap (enforced WHILE downloading, so a mis-published asset can't fill the
+    disk before the post-download check)."""
+    req = urllib.request.Request(url, headers={"User-Agent": f"Tellur/{__version__}"})
+    total = 0
+    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as out:
+        while True:
+            chunk = resp.read(1024 * 256)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise OSError(
+                    f"archive exceeds the {max_bytes // (1024 * 1024)} MB cap")
+            out.write(chunk)
 
 
 def _spawn_update_helper(zip_path: Path, install_dir: Path) -> None:
@@ -2733,6 +5287,7 @@ class Updater(QObject):
     update_found = pyqtSignal(dict)        # info dict from check_for_update
     install_started = pyqtSignal()
     install_failed = pyqtSignal(str)
+    quit_requested = pyqtSignal()      # post-install restart → App.quit
 
     def __init__(self, install_dir: Path):
         super().__init__()
@@ -2779,7 +5334,9 @@ class Updater(QObject):
         self.install_started.emit()
         threading.Thread(
             target=self._install_worker, args=(info,),
-            daemon=False, name="update-install",
+            # daemon: a stalled download must not pin the process open after
+            # Quit (no tray, no hotkeys, still running).
+            daemon=True, name="update-install",
         ).start()
 
     def _install_worker(self, info: dict) -> None:
@@ -2800,18 +5357,13 @@ class Updater(QObject):
             tmpdir = Path(tempfile.mkdtemp(prefix="tellur_dl_"))
             zip_path = tmpdir / f"Tellur-{info['version']}.zip"
             try:
-                urllib.request.urlretrieve(info["zip_url"], zip_path)
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                _download_file(info["zip_url"], zip_path,
+                               timeout=UPDATE_DOWNLOAD_TIMEOUT_SEC,
+                               max_bytes=UPDATE_MAX_ZIP_BYTES)
+            except Exception as e:
                 log_update.exception("download failed")
+                shutil.rmtree(tmpdir, ignore_errors=True)
                 self.install_failed.emit(f"Download failed: {e}")
-                return
-            # Post-download sanity: if the file on disk is way bigger than
-            # the API claimed, something's off — abort before we install it.
-            actual_bytes = zip_path.stat().st_size if zip_path.exists() else 0
-            if actual_bytes > UPDATE_MAX_ZIP_BYTES:
-                self.install_failed.emit(
-                    f"Downloaded archive is larger than the {UPDATE_MAX_ZIP_BYTES // (1024 * 1024)} MB cap; aborting."
-                )
                 return
 
             # quick integrity check
@@ -2819,9 +5371,11 @@ class Updater(QObject):
                 with zipfile.ZipFile(zip_path) as zf:
                     bad = zf.testzip()
                     if bad is not None:
+                        shutil.rmtree(tmpdir, ignore_errors=True)
                         self.install_failed.emit(f"Downloaded archive is corrupt ({bad})")
                         return
             except zipfile.BadZipFile:
+                shutil.rmtree(tmpdir, ignore_errors=True)
                 self.install_failed.emit("Downloaded file is not a valid zip")
                 return
 
@@ -2834,8 +5388,10 @@ class Updater(QObject):
                 return
 
             self.state_changed.emit("Restarting Tellur…")
-            # Give the helper a beat to start polling our PID, then quit.
-            QTimer.singleShot(400, QApplication.instance().quit)
+            # Give the helper a beat to start polling our PID, then quit —
+            # through App.quit (tray hidden, passthrough closed, volumes
+            # restored), not a bare QApplication.quit.
+            QTimer.singleShot(400, self.quit_requested.emit)
         finally:
             with self._lock:
                 self._busy = False
@@ -3576,6 +6132,11 @@ class MainPanel(QWidget):
 
     model_switch_requested = pyqtSignal(str)
     refresh_ui_requested = pyqtSignal()
+    # Test-button results are produced on worker threads; these deliver them to
+    # the GUI thread. (QTimer.singleShot does NOT fire from a thread that has no
+    # event loop, so a worker cannot update widgets directly or via singleShot.)
+    _eleven_test_done = pyqtSignal(bool, str)
+    _llm_test_done = pyqtSignal(bool, str)
 
     def __init__(
         self,
@@ -3584,6 +6145,7 @@ class MainPanel(QWidget):
         settings: Settings,
         updater: "Updater | None" = None,
         recorder: "AudioRecorder | None" = None,
+        passthrough: "PassthroughMonitor | None" = None,
         parent: QObject | None = None,
     ):
         super().__init__()
@@ -3592,6 +6154,11 @@ class MainPanel(QWidget):
         self._settings = settings
         self._updater = updater
         self._recorder = recorder
+        self._passthrough = passthrough
+        # Worker threads can't touch widgets directly — route test results here
+        # (cross-thread signal emit → queued slot on the GUI thread).
+        self._eleven_test_done.connect(self._set_eleven_test_result)
+        self._llm_test_done.connect(self._set_llm_test_result)
 
         self.setObjectName("mainPanel")
         self.setWindowTitle(APP_NAME)
@@ -4285,16 +6852,20 @@ class MainPanel(QWidget):
             "drops the previous sentence. First letter of each sentence is auto-capitalized."
         ))
 
-        # Start-on-login (v2.2.2) — writes an HKCU\...\Run entry pointing
-        # at this install's run.bat.
+        # Start-on-login (v2.2.2) — toggles the elevated "Tellur" scheduled
+        # task when it exists (v2.3.3), else writes an HKCU\...\Run entry
+        # pointing at this install's run.bat.
         self._start_on_login_cb = QCheckBox("Start Tellur when I log into Windows")
         self._start_on_login_cb.setChecked(self._settings.start_on_login)
         self._start_on_login_cb.toggled.connect(self._on_start_on_login_toggled)
         gen_box.addWidget(self._start_on_login_cb)
         gen_box.addWidget(self._section_hint(
-            "Adds Tellur to your user-level Run registry key. Triggers one UAC "
-            "prompt at login (because <code>run.bat</code> self-elevates). "
-            "Set <code>TELLUR_NO_ELEVATE=1</code> to skip the prompt and run unelevated."
+            "Uses the elevated \"Tellur\" scheduled task when present — starts "
+            "silently at login with no UAC prompt, and paste works in admin "
+            "windows. Without the task it falls back to a user-level Run "
+            "registry key (one UAC prompt at login because <code>run.bat</code> "
+            "self-elevates; set <code>TELLUR_NO_ELEVATE=1</code> to skip the "
+            "prompt and run unelevated)."
         ))
         layout.addLayout(gen_box)
 
@@ -4437,6 +7008,50 @@ class MainPanel(QWidget):
         ))
         layout.addLayout(audio_box)
 
+        # --- mic passthrough section (v2.7) ---
+        pt_box = QVBoxLayout()
+        pt_box.setSpacing(10)
+        pt_box.addWidget(self._section_header("Mic passthrough"))
+
+        self._pt_enabled_cb = QCheckBox("Enabled")
+        self._pt_enabled_cb.setChecked(self._settings.passthrough_enabled)
+        self._pt_enabled_cb.toggled.connect(self._on_pt_enabled_toggled)
+        pt_box.addLayout(self._form_row("Hear-through", self._pt_enabled_cb))
+
+        self._pt_slider = _NoWheelSlider(Qt.Orientation.Horizontal)
+        self._pt_slider.setRange(0, 100)
+        self._pt_slider.setValue(int(self._settings.passthrough_level_pct))
+        self._pt_slider.valueChanged.connect(self._on_pt_level_changed)
+        self._pt_label = QLabel(f"{int(self._settings.passthrough_level_pct)}%")
+        self._pt_label.setFixedWidth(56)
+        self._pt_label.setObjectName("valueDim")
+        pt_widget = QWidget()
+        pt_inner = QHBoxLayout(pt_widget)
+        pt_inner.setContentsMargins(0, 0, 0, 0)
+        pt_inner.setSpacing(8)
+        pt_inner.addWidget(self._pt_slider, stretch=1)
+        pt_inner.addWidget(self._pt_label)
+        pt_box.addLayout(self._form_row("Passthrough level", pt_widget))
+
+        pt_box.addLayout(self._form_row("Play into", self._make_pt_output_combo()))
+
+        self._pt_mute_cb = QCheckBox("Mute while dictating")
+        self._pt_mute_cb.setChecked(self._settings.passthrough_mute_while_dictating)
+        self._pt_mute_cb.toggled.connect(self._on_pt_mute_toggled)
+        pt_box.addLayout(self._form_row("While recording", self._pt_mute_cb))
+
+        pt_box.addWidget(self._section_hint(
+            "Mixes your mic into your headphones so you can hear the room without "
+            "taking them out. This level is separate from the Windows mic volume, "
+            "so turning it down does not make you quieter to anyone else. "
+            "Passthrough is played into the chosen output, so any system EQ on that "
+            "device (Equalizer APO and the like) applies to it too \u2014 start low. "
+            "On open-back headphones or speakers a high level can feed back. "
+            "If you hear yourself echoing, pick the same device's WASAPI entry \u2014 "
+            "it buffers far less than MME."
+        ))
+        layout.addLayout(pt_box)
+
         # --- overlay (visual-only) ---
         sens_box = QVBoxLayout()
         sens_box.setSpacing(10)
@@ -4488,6 +7103,100 @@ class MainPanel(QWidget):
         model_box.addWidget(self._model_progress)
 
         layout.addLayout(model_box)
+
+        # --- transcription engine section (v2.3) — local vs ElevenLabs cloud ---
+        stt_box = QVBoxLayout()
+        stt_box.setSpacing(10)
+        stt_box.addWidget(self._section_header("Transcription engine"))
+        stt_box.addWidget(self._section_hint(
+            "Local Whisper is fully offline and the default. ElevenLabs Scribe "
+            "sends your audio to ElevenLabs for transcription — it needs an internet "
+            "connection and an API key with Speech-to-Text access."
+        ))
+
+        self._stt_backend_combo = _NoWheelComboBox()
+        self._stt_backend_combo.addItem(
+            "Auto — local when GPU is free, cloud when it's busy",
+            userData="auto")
+        self._stt_backend_combo.addItem("Local Whisper (offline)", userData="local")
+        self._stt_backend_combo.addItem("ElevenLabs Scribe (cloud)", userData="elevenlabs")
+        idx = self._stt_backend_combo.findData(self._settings.stt_backend)
+        self._stt_backend_combo.setCurrentIndex(idx if idx >= 0 else 1)
+        self._stt_backend_combo.currentIndexChanged.connect(self._on_stt_backend_changed)
+        stt_box.addLayout(self._form_row("Engine", self._stt_backend_combo))
+
+        # Live truth about what will actually serve the next dictation. Before
+        # this, a drained key was only visible in the log: "Test key" passes on
+        # a 1-second probe even when the balance can't cover a real clip, so the
+        # UI said ✓ while every dictation quietly ran on local Whisper.
+        self._stt_engine_status = QLabel("")
+        self._stt_engine_status.setObjectName("valueDim")
+        self._stt_engine_status.setWordWrap(True)
+        stt_box.addWidget(self._stt_engine_status)
+        self._stt_status_timer = QTimer(self)
+        self._stt_status_timer.setInterval(5000)
+        self._stt_status_timer.timeout.connect(self._refresh_stt_status)
+        self._stt_status_timer.start()
+        self._refresh_stt_status()
+
+        self._eleven_clean_cb = QCheckBox(
+            "Clean up cloud transcripts (drop filler words and false starts)")
+        self._eleven_clean_cb.setToolTip(
+            "Asks ElevenLabs to leave out \"um\", \"uh\" and restarted words "
+            "instead of writing them down literally. Local Whisper already "
+            "writes this way. Turn off for word-for-word transcripts."
+        )
+        self._eleven_clean_cb.setChecked(self._settings.eleven_clean_transcript)
+        self._eleven_clean_cb.toggled.connect(self._on_eleven_clean_toggled)
+        stt_box.addWidget(self._eleven_clean_cb)
+
+        self._eleven_key_edit = QLineEdit(self._settings.eleven_api_key)
+        self._eleven_key_edit.setPlaceholderText("ElevenLabs API key (Speech-to-Text access)")
+        self._eleven_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._eleven_key_edit.editingFinished.connect(self._on_eleven_key_changed)
+        stt_box.addLayout(self._form_row("ElevenLabs API key", self._eleven_key_edit))
+
+        self._eleven_key2_edit = QLineEdit(self._settings.eleven_api_key_backup)
+        self._eleven_key2_edit.setPlaceholderText(
+            "Backup key — used automatically when the primary runs out of credits"
+        )
+        self._eleven_key2_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._eleven_key2_edit.editingFinished.connect(self._on_eleven_key2_changed)
+        stt_box.addLayout(self._form_row("Backup API key", self._eleven_key2_edit))
+
+        # Keys 3..N. Each ElevenLabs key carries its own monthly allowance, so
+        # stacking keys is how the monthly ceiling gets raised; two fixed slots
+        # was the real limit we hit. One per line, tried in order after the two
+        # above. Saved on a debounce so typing doesn't hammer settings.json.
+        self._eleven_keys_extra_edit = QTextEdit()
+        self._eleven_keys_extra_edit.setPlainText(
+            "\n".join(self._settings.eleven_api_keys_extra)
+        )
+        self._eleven_keys_extra_edit.setPlaceholderText(
+            "One key per line — tried in order after the primary and backup"
+        )
+        self._eleven_keys_extra_edit.setFixedHeight(64)
+        self._eleven_keys_extra_edit.setAcceptRichText(False)
+        self._extra_keys_save_timer = QTimer(self)
+        self._extra_keys_save_timer.setSingleShot(True)
+        self._extra_keys_save_timer.setInterval(800)
+        self._extra_keys_save_timer.timeout.connect(self._on_eleven_keys_extra_changed)
+        self._eleven_keys_extra_edit.textChanged.connect(
+            self._extra_keys_save_timer.start
+        )
+        stt_box.addLayout(self._form_row("Extra API keys", self._eleven_keys_extra_edit))
+
+        eleven_test_row = QHBoxLayout()
+        eleven_test_row.setSpacing(10)
+        self._eleven_test_btn = QPushButton("Test key")
+        self._eleven_test_btn.clicked.connect(self._on_eleven_test_clicked)
+        eleven_test_row.addWidget(self._eleven_test_btn)
+        self._eleven_test_status = QLabel("")
+        self._eleven_test_status.setObjectName("valueDim")
+        eleven_test_row.addWidget(self._eleven_test_status, stretch=1)
+        stt_box.addLayout(eleven_test_row)
+
+        layout.addLayout(stt_box)
 
         # --- AI post-processing section (v1.7) ---
         llm_box = QVBoxLayout()
@@ -4568,6 +7277,29 @@ class MainPanel(QWidget):
         self._send_enter_cb.setChecked(self._settings.send_after_paste)
         self._send_enter_cb.toggled.connect(self._on_send_enter_toggled)
         intg_box.addWidget(self._send_enter_cb)
+
+        # Terminal-aware paste (v2.3).
+        self._term_paste_cb = QCheckBox(
+            "Terminal-aware paste (CMD / PowerShell / Claude Code consoles)"
+        )
+        self._term_paste_cb.setToolTip(
+            "Classic console windows can't accept a simulated Ctrl+V while a "
+            "TUI app (like Claude Code) is running in them, so Tellur types "
+            "the transcript there instead. A few terminal emulators that "
+            "reserve a different paste chord (mintty, Alacritty, WezTerm) get "
+            "theirs; everything else keeps plain Ctrl+V. "
+            "Turn off to always use plain Ctrl+V."
+        )
+        self._term_paste_cb.setChecked(self._settings.terminal_aware_paste)
+        self._term_paste_cb.toggled.connect(self._on_terminal_paste_toggled)
+        intg_box.addWidget(self._term_paste_cb)
+        intg_box.addWidget(self._section_hint(
+            "In classic console windows the transcript is <i>typed</i>, with line "
+            "breaks flattened to spaces — so dictation can never press Enter in "
+            "your shell. Claude Code works best in Windows Terminal, where normal "
+            "Ctrl+V paste applies.",
+            rich=True,
+        ))
 
         # Markdown daily save.
         self._md_enabled_cb = QCheckBox("Save each transcript to a daily markdown file")
@@ -4864,6 +7596,240 @@ class MainPanel(QWidget):
         self._settings.duck_level_pct = v
         self._settings.save()
 
+    # --- mic passthrough handlers --------------------------------------
+
+    def _make_pt_output_combo(self) -> QComboBox:
+        self._pt_output_combo = _NoWheelComboBox()
+        self._populate_pt_output_combo()
+        self._pt_output_combo.currentIndexChanged.connect(self._on_pt_output_changed)
+        return self._pt_output_combo
+
+    def _populate_pt_output_combo(self) -> None:
+        """(Re)build the passthrough output dropdown, same shape as the
+        microphone picker: 'System default' first, then real output devices."""
+        target = self._settings.passthrough_output_name
+        self._pt_output_combo.blockSignals(True)
+        self._pt_output_combo.clear()
+        self._pt_output_combo.addItem("System default", userData=None)
+        idx_to_select = 0
+        devices = list_output_devices()
+        for i, (d, key) in enumerate(zip(devices, output_device_keys(devices)), start=1):
+            label = d["name"]
+            if d.get("api"):
+                label += f"  [{d['api'].replace('Windows ', '')}]"
+            if d["default"]:
+                label += "  (system default)"
+            self._pt_output_combo.addItem(label, userData=key)
+            if target and key == target:
+                idx_to_select = i
+        self._pt_output_combo.setCurrentIndex(idx_to_select)
+        self._pt_output_combo.blockSignals(False)
+
+    def _on_pt_enabled_toggled(self, checked: bool) -> None:
+        self._settings.passthrough_enabled = bool(checked)
+        self._settings.save()   # emits `changed` -> App._apply_passthrough_settings
+        log_app.info("mic passthrough %s", "enabled" if checked else "disabled")
+
+    def _on_pt_level_changed(self, value: int) -> None:
+        v = max(0, min(100, int(value)))
+        if hasattr(self, "_pt_label"):
+            self._pt_label.setText(f"{v}%")
+        if v == self._settings.passthrough_level_pct:
+            return
+        self._settings.passthrough_level_pct = v
+        # Apply live so the slider is audible while dragging, then debounce the
+        # write — the same shape as the input-gain slider above.
+        if self._passthrough is not None:
+            self._passthrough.set_level_pct(v)
+        if not hasattr(self, "_pt_save_timer"):
+            self._pt_save_timer = QTimer(self)
+            self._pt_save_timer.setSingleShot(True)
+            self._pt_save_timer.timeout.connect(self._settings.save)
+        self._pt_save_timer.start(300)
+
+    def _on_pt_output_changed(self, _idx: int) -> None:
+        name = self._pt_output_combo.currentData()  # str or None
+        if name == self._settings.passthrough_output_name:
+            return
+        self._settings.passthrough_output_name = name
+        self._settings.save()
+        log_app.info("passthrough output -> %s", name if name else "system default")
+
+    def _on_pt_mute_toggled(self, checked: bool) -> None:
+        self._settings.passthrough_mute_while_dictating = bool(checked)
+        self._settings.save()
+
+    # --- transcription engine (ElevenLabs Scribe) handlers -------------
+
+    def _on_stt_backend_changed(self, _idx: int) -> None:
+        backend = self._stt_backend_combo.currentData() or "local"
+        if backend == self._settings.stt_backend:
+            return
+        self._settings.stt_backend = backend
+        self._settings.save()
+        log_app.info("transcription backend -> %s", backend)
+        self._refresh_stt_status()
+
+    def _on_eleven_clean_toggled(self, checked: bool) -> None:
+        self._settings.eleven_clean_transcript = bool(checked)
+        self._settings.save()
+        log_app.info("cloud transcript clean-up %s", "on" if checked else "off")
+
+    def _on_eleven_key_changed(self) -> None:
+        new_key = self._eleven_key_edit.text().strip()
+        if new_key == self._settings.eleven_api_key:
+            return
+        self._settings.eleven_api_key = new_key
+        self._settings.save()
+
+    def _on_eleven_key2_changed(self) -> None:
+        new_key = self._eleven_key2_edit.text().strip()
+        if new_key == self._settings.eleven_api_key_backup:
+            return
+        self._settings.eleven_api_key_backup = new_key
+        self._settings.save()
+        self._refresh_stt_status()
+
+    def _on_eleven_keys_extra_changed(self) -> None:
+        keys = [ln.strip() for ln in
+                self._eleven_keys_extra_edit.toPlainText().splitlines() if ln.strip()]
+        if keys == self._settings.eleven_api_keys_extra:
+            return
+        self._settings.eleven_api_keys_extra = keys
+        self._settings.save()
+        log_app.info("ElevenLabs extra keys -> %d configured (pool size %d)",
+                     len(keys), len(self._settings.eleven_keys()))
+        self._refresh_stt_status()
+
+    def _on_eleven_test_clicked(self) -> None:
+        self._eleven_test_btn.setEnabled(False)
+        self._eleven_test_status.setText("Testing…")
+        self._eleven_test_status.setStyleSheet("")
+        # Read the fields straight from the UI (don't depend on editingFinished /
+        # the debounce timer) and persist them so real dictation uses the same
+        # values. Extras are included, so the button tests the whole pool.
+        primary = self._eleven_key_edit.text().strip()
+        backup = self._eleven_key2_edit.text().strip()
+        extra = [ln.strip() for ln in
+                 self._eleven_keys_extra_edit.toPlainText().splitlines() if ln.strip()]
+        if (primary != self._settings.eleven_api_key
+                or backup != self._settings.eleven_api_key_backup
+                or extra != self._settings.eleven_api_keys_extra):
+            self._settings.eleven_api_key = primary
+            self._settings.eleven_api_key_backup = backup
+            self._settings.eleven_api_keys_extra = extra
+            self._settings.save()
+        model_id = self._settings.eleven_model_id or ELEVEN_DEFAULT_MODEL
+        labels = ["Primary", "Backup"] + ["Key %d" % (i + 3) for i in range(len(extra))]
+        targets = [(lbl, k) for lbl, k in zip(labels, [primary, backup] + extra) if k]
+        if not targets:
+            self._set_eleven_test_result(False, "Enter an API key first")
+            return
+        log_app.info("eleven test: starting (%d key(s), model=%s)", len(targets), model_id)
+
+        # ~1s quiet tone per key — a real round-trip that proves each key + its
+        # Speech-to-Text permission. A key that passes is cleared from the
+        # exhausted list (re-enabled), which is how a refilled key comes back.
+        # Result is delivered via _eleven_test_done (NOT QTimer.singleShot, which
+        # never fires from this event-loop-less worker thread).
+        def worker():
+            n = int(SAMPLE_RATE * 1.0)
+            t = np.arange(n, dtype=np.float32) / SAMPLE_RATE
+            tone = (0.02 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
+            parts: list[str] = []
+            all_ok = True
+            for label, key in targets:
+                try:
+                    ElevenLabsScribeClient(key, model_id=model_id, timeout=20.0).transcribe(tone)
+                    self._settings.clear_eleven_exhausted(key)
+                    parts.append(f"{label} ✓")
+                    log_app.info("eleven test: %s OK", label)
+                except ElevenAuthError as e:
+                    # The client maps 401/402/429 to this (not HTTPError).
+                    all_ok = False
+                    if e.code == 429:
+                        why = "rate-limited"
+                    elif e.status == "quota_exceeded":
+                        why = "out of credits"
+                    else:
+                        why = f"unauthorized ({e.status or e.code})"
+                    parts.append(f"{label} ✗ ({why})")
+                    log_app.warning("eleven test: %s HTTP %s %s", label, e.code, e.status)
+                except urllib.error.HTTPError as e:
+                    all_ok = False
+                    why = ("forbidden" if e.code == 403 else f"HTTP {e.code}")
+                    parts.append(f"{label} ✗ ({why})")
+                    log_app.warning("eleven test: %s HTTP %s %s", label, e.code, e.reason)
+                except urllib.error.URLError as e:
+                    all_ok = False
+                    parts.append(f"{label} ✗ (no connection)")
+                    log_app.warning("eleven test: %s URLError %s", label, e.reason)
+                except Exception:
+                    all_ok = False
+                    parts.append(f"{label} ✗")
+                    log_app.exception("eleven test: %s failed", label)
+            self._eleven_test_done.emit(all_ok, " · ".join(parts))
+
+        threading.Thread(target=worker, daemon=True, name="eleven-test").start()
+
+    def _set_eleven_test_result(self, ok: bool, message: str) -> None:
+        self._eleven_test_btn.setEnabled(True)
+        self._eleven_test_status.setText(message)
+        palette = THEME_PALETTES.get(self._settings.theme) or THEME_PALETTES["dark"]
+        color = palette["success"] if ok else palette["danger"]
+        self._eleven_test_status.setStyleSheet(f"color: {color};")
+        self._refresh_stt_status()
+
+    def _refresh_stt_status(self) -> None:
+        """Repaint the engine-status line: which backend is live, and the state
+        of each ElevenLabs key. Cheap enough to run on a 5 s timer."""
+        if not hasattr(self, "_stt_engine_status"):
+            return
+        s = self._settings
+        engine, reason = s.active_stt_engine()
+        palette = THEME_PALETTES.get(s.theme) or THEME_PALETTES["dark"]
+        if engine == "local":
+            head = "Now using: LOCAL WHISPER — %s" % reason
+            # Cloud selected but serving local = something is wrong (red).
+            # Local deliberately selected, or auto routing = informational.
+            color = (palette["danger"] if s.stt_backend == "elevenlabs"
+                     else palette["text_dim"])
+        else:
+            head = "Now using: %s" % reason
+            color = palette["success"]
+        bits: list[str] = []
+        now = time.time()
+        cooling = s.eleven_exhausted_active()
+        for i, key in enumerate(s.eleven_keys()):
+            label = "Key #%d (…%s)" % (i + 1, key[-4:])
+            known = s.eleven_credits_known(key)
+            if key in cooling:
+                benched = s.eleven_exhausted_at.get(key, 0.0)
+                until = s.eleven_retry_after.get(
+                    key, benched + ELEVEN_EXHAUSTED_RETRY_SEC)
+                left = max(0.0, until - now)
+                if left >= 3600:
+                    when = "retries in %dh %dm" % (left // 3600, (left % 3600) // 60)
+                elif left >= 60:
+                    when = "retries in %dm" % (left // 60)
+                else:
+                    when = "retries in %ds" % int(left)
+                # A short total cooldown means we benched it for back-pressure
+                # (429), not a spent quota — don't mislabel a healthy key.
+                short = (until - benched) <= (ELEVEN_RATELIMIT_RETRY_SEC * 2)
+                detail = ("rate-limited, %s" if short else "out of credits, %s") % when
+                if known is not None:
+                    detail += " · %.0f credits left" % known
+            elif known is not None:
+                detail = "%.0f credits left" % known
+            else:
+                detail = "ready"
+            bits.append("%s: %s" % (label, detail))
+        if not bits:
+            bits.append("No ElevenLabs key configured.")
+        self._stt_engine_status.setText(head + "\n" + "  ·  ".join(bits))
+        self._stt_engine_status.setStyleSheet("color: %s;" % color)
+
     # --- LLM post-processing handlers ----------------------------------
 
     def _on_llm_enabled_toggled(self, checked: bool) -> None:
@@ -4912,6 +7878,8 @@ class MainPanel(QWidget):
         self._llm_test_status.setStyleSheet("")
 
         # Run in a worker thread so the UI doesn't freeze on slow endpoints.
+        # Result is delivered via _llm_test_done (NOT QTimer.singleShot, which
+        # never fires from this event-loop-less worker thread).
         def worker():
             client = LLMClient(
                 base_url=self._settings.llm_base_url,
@@ -4921,21 +7889,18 @@ class MainPanel(QWidget):
             try:
                 ok = client.ping()
                 if not ok:
-                    QTimer.singleShot(0, lambda: self._set_llm_test_result(
-                        False, "Endpoint reachable but returned non-2xx"))
+                    self._llm_test_done.emit(False, "Endpoint reachable but returned non-2xx")
                     return
                 # Also try a tiny chat to surface model-not-found / 401 etc.
                 _ = client.chat(
                     "You are a test responder. Reply with the single word OK.",
                     "ping",
                 )
-                QTimer.singleShot(0, lambda: self._set_llm_test_result(True, "Connected ✓"))
+                self._llm_test_done.emit(True, "Connected ✓")
             except urllib.error.URLError as e:
-                QTimer.singleShot(0, lambda: self._set_llm_test_result(
-                    False, f"Can't reach endpoint: {e.reason}"))
+                self._llm_test_done.emit(False, f"Can't reach endpoint: {e.reason}")
             except Exception as e:
-                QTimer.singleShot(0, lambda: self._set_llm_test_result(
-                    False, f"Failed: {e}"))
+                self._llm_test_done.emit(False, f"Failed: {e}")
 
         threading.Thread(target=worker, daemon=True, name="llm-test").start()
 
@@ -5144,6 +8109,11 @@ class MainPanel(QWidget):
         self._settings.send_after_paste = bool(checked)
         self._settings.save()
         log_app.info("send-after-paste %s", "on" if checked else "off")
+
+    def _on_terminal_paste_toggled(self, checked: bool) -> None:
+        self._settings.terminal_aware_paste = bool(checked)
+        self._settings.save()
+        log_app.info("terminal-aware paste %s", "on" if checked else "off")
 
     def _on_md_enabled_toggled(self, checked: bool) -> None:
         self._settings.markdown_save_enabled = bool(checked)
@@ -5384,8 +8354,8 @@ class MainPanel(QWidget):
         super().showEvent(event)
         # Start the live mic monitor + meter tick when the panel is shown.
         if self._recorder is not None:
-            if self._recorder.start_monitor():
-                self._meter_tick.start()
+            self._recorder.start_monitor()   # deferred if a recording is live
+            self._meter_tick.start()
 
     def hideEvent(self, event) -> None:
         super().hideEvent(event)
@@ -5402,6 +8372,9 @@ class MainPanel(QWidget):
 # ===========================================================================
 class App(QObject):
     ui_state = pyqtSignal(str)
+    # "local" | "elevenlabs" — drives the overlay's engine badge. Emitted from
+    # worker threads, so it must stay a signal rather than a direct call.
+    ui_engine = pyqtSignal(str)
     ui_level = pyqtSignal(float)
     model_switch_state = pyqtSignal(str, str)   # (state, message)
     model_download_progress = pyqtSignal(int)   # 0..100, or -1 to hide bar
@@ -5430,14 +8403,23 @@ class App(QObject):
 
         self.recorder = AudioRecorder()
         self.ducker = AudioDucker()
-        self.engine = WhisperEngine(self.settings.model_name)
+        self.passthrough = PassthroughMonitor()
+        # Crash-safety: if a previous run was killed/hung mid-duck, restore the
+        # apps it left quiet. Background thread so a pycaw hiccup can't delay
+        # startup and won't fight an app the user already turned back up.
+        threading.Thread(
+            target=self.ducker.recover, daemon=True, name="duck-recover",
+        ).start()
+        self.engine = WhisperEngine(self.settings.model_name, settings=self.settings)
         self.overlay = Overlay()
         self.hotkey = HotkeyWatcher(settings=self.settings)
-        self.injector = TextInjector()
+        self.injector = TextInjector(settings=self.settings)
 
         # Apply persisted audio settings to the recorder.
         self._apply_audio_settings()
         self.settings.changed.connect(self._apply_audio_settings)
+        self._apply_passthrough_settings()
+        self.settings.changed.connect(self._apply_passthrough_settings)
 
         # Apply persisted settings to the overlay; react to live changes.
         self.overlay.set_scale(self.settings.sensitivity)
@@ -5446,7 +8428,8 @@ class App(QObject):
         )
 
         # Tray + panel — panel is hidden by default; opened from the tray.
-        self.panel = MainPanel(self.log, self.notes, self.settings, self.updater, self.recorder)
+        self.panel = MainPanel(self.log, self.notes, self.settings, self.updater,
+                               self.recorder, self.passthrough)
         self.tray = TrayIcon(self.updater, self)
         if not QSystemTrayIcon.isSystemTrayAvailable():
             log_app.warning("system tray not available — tray icon will be inactive")
@@ -5456,6 +8439,7 @@ class App(QObject):
         self.tray.install_update.connect(self.updater.install_async)
         self.tray.refresh_ui_requested.connect(self.refresh_ui)
         self.updater.update_found.connect(self.tray.set_update_available)
+        self.updater.quit_requested.connect(self.quit)
 
         # Model-switching: panel asks → App orchestrates → panel renders progress.
         self.panel.model_switch_requested.connect(self.switch_model_async)
@@ -5484,6 +8468,7 @@ class App(QObject):
         # edited a hotkey in the Settings tab).
         self.settings.changed.connect(self.hotkey.apply_settings)
         self.ui_state.connect(self.overlay.set_state)
+        self.ui_engine.connect(self.overlay.set_engine)
         self.ui_level.connect(self.overlay.push_level)
 
         self._level_timer = QTimer(self)
@@ -5500,7 +8485,33 @@ class App(QObject):
         # Cancel flag — set by on_cancel (Esc) during recording to skip transcribe.
         self._cancel_current_recording = False
 
-        threading.Thread(target=self._warm_up, daemon=True, name="model-warmup").start()
+        # Keep the comparatively large local Whisper model lazy when the cloud
+        # backend is configured.  WhisperEngine.transcribe() already calls
+        # load() on the local fallback path, so eagerly warming it here only
+        # reserves several GB of commit for the entire login session even when
+        # every transcription is served by ElevenLabs.
+        # For "auto", warm up only if the GPU is free right now: an idle GPU
+        # means the next clip decodes locally and should not pay the load cost;
+        # a busy GPU at startup (logged in mid-game) means clips go to the
+        # cloud anyway, and warming up would grab VRAM from the busy app.
+        cloud_stt_ready = (
+            self.settings.stt_backend == "elevenlabs"
+            and bool(self.settings.eleven_keys())
+        ) or (
+            self.settings.stt_backend == "auto"
+            and GPU_MONITOR.busy_reason() is not None
+        )
+        if cloud_stt_ready:
+            log_engine.info(
+                "local Whisper warm-up deferred (cloud STT will serve; the "
+                "model loads on the first local decode)"
+            )
+        else:
+            threading.Thread(
+                target=self._warm_up,
+                daemon=True,
+                name="model-warmup",
+            ).start()
 
         # Kick off a one-shot update check ~3s after startup so it doesn't
         # compete with model loading for network/CPU.
@@ -5532,6 +8543,12 @@ class App(QObject):
             self.ducker.restore()
         except Exception:
             log_app.debug("quit: ducker.restore failed", exc_info=True)
+        # Close the passthrough streams explicitly — PortAudio callbacks run on
+        # their own threads and can outlive an abrupt interpreter shutdown.
+        try:
+            self.passthrough.stop()
+        except Exception:
+            log_app.debug("quit: passthrough.stop failed", exc_info=True)
         # Release the global keyboard hooks (Ctrl+Win polls + the
         # Ctrl+Win+Q hotkey). The `keyboard` library spawns a low-level
         # Windows hook thread that can leak across abnormal exits otherwise.
@@ -5545,6 +8562,13 @@ class App(QObject):
             self.tray.hide()
         except Exception:
             pass
+        # Persist anything the async savers still hold (daemon threads die
+        # with the interpreter otherwise — the last entry could be lost).
+        for lg in (self.log, self.notes):
+            try:
+                lg.flush()
+            except Exception:
+                log_app.debug("quit: log flush failed", exc_info=True)
         QApplication.instance().quit()
 
     def refresh_ui(self) -> None:
@@ -5603,6 +8627,10 @@ class App(QObject):
         except Exception:
             pass
         try:
+            self.ui_engine.disconnect(old_overlay.set_engine)
+        except Exception:
+            pass
+        try:
             self.ui_level.disconnect(old_overlay.push_level)
         except Exception:
             pass
@@ -5614,6 +8642,7 @@ class App(QObject):
         self.overlay = Overlay()
         self.overlay.set_scale(self.settings.sensitivity)
         self.ui_state.connect(self.overlay.set_state)
+        self.ui_engine.connect(self.overlay.set_engine)
         self.ui_level.connect(self.overlay.push_level)
         self.overlay.show()
         self.ui_state.emit("idle")
@@ -5685,6 +8714,39 @@ class App(QObject):
                 )
         self.recorder.set_device(idx)
         self.recorder.set_gain(self.settings.input_gain)
+
+    def _apply_passthrough_settings(self) -> None:
+        """Reconcile the passthrough monitor with the latest Settings. Resolves
+        both device NAMES back to PortAudio indexes, for the same reason
+        _apply_audio_settings does: indexes reshuffle between sessions."""
+        in_idx = None
+        if self.settings.input_device_name:
+            for d in list_input_devices():
+                if d["name"] == self.settings.input_device_name:
+                    in_idx = d["index"]
+                    break
+        out_idx = find_output_device(self.settings.passthrough_output_name)
+        if self.settings.passthrough_output_name and out_idx is None:
+            log_audio.warning(
+                "configured passthrough output %r not found — using system default",
+                self.settings.passthrough_output_name,
+            )
+
+        self.passthrough.set_level_pct(self.settings.passthrough_level_pct)
+        self.passthrough.set_devices(in_idx, out_idx)
+
+        if self.settings.passthrough_enabled and not self.passthrough.running:
+            if not self.passthrough.start():
+                # Turning the setting back off keeps the checkbox honest rather
+                # than showing "on" for a monitor that never opened.
+                self.settings.passthrough_enabled = False
+                # This also runs from __init__, before the panel is built, so
+                # the checkbox is only corrected once it actually exists.
+                panel = getattr(self, "panel", None)
+                if panel is not None and hasattr(panel, "_pt_enabled_cb"):
+                    panel._pt_enabled_cb.setChecked(False)
+        elif not self.settings.passthrough_enabled and self.passthrough.running:
+            self.passthrough.stop()
 
     def _duck_if_enabled(self) -> None:
         """Lower other apps' volume if the user has enabled ducking. No-op
@@ -5882,18 +8944,82 @@ class App(QObject):
         self._current_context = get_foreground_process_basename()
         log_hotkey.debug("press (gen=%d, mode=%s, context=%s)",
                          gen, self.settings.hotkey_mode, self._current_context)
+        # Silence the hear-through monitor before opening the recording
+        # stream: hearing yourself while dictating is distracting, and it also
+        # takes the passthrough off the mic if this driver dislikes a second
+        # reader. Muting (rather than stopping) keeps the resume instant.
+        if self.settings.passthrough_mute_while_dictating:
+            self.passthrough.set_muted(True)
         try:
             self.recorder.start()
         except Exception:
             log_audio.exception("mic start failed")
-            self.ui_state.emit("error")
-            return
+            # A driver that refuses a second reader on the same device is the
+            # likeliest cause, so drop the monitor entirely and try once more.
+            if self.passthrough.running:
+                log_audio.info("retrying mic start without the passthrough monitor")
+                self.passthrough.stop()
+                try:
+                    self.recorder.start()
+                except Exception:
+                    log_audio.exception("mic start failed again")
+                    self.passthrough.set_muted(False)
+                    self.ui_state.emit("error")
+                    return
+            else:
+                self.passthrough.set_muted(False)
+                self.ui_state.emit("error")
+                return
         self._duck_if_enabled()
         self.ui_state.emit("recording")
+        # Clear any badge from the previous dictation and make no claim yet.
+        # The badge is confirmatory only: it appears after the transcribe
+        # returns and tells us local Whisper is what actually ran, never as
+        # a prediction that could be wrong if a key turns out to work.
+        self.ui_engine.emit("pending")
         self._level_timer.start()
+        self._preload_local_model()
+
+    def _preload_local_model(self) -> None:
+        """Auto mode: if the local model isn't in memory and the GPU is free,
+        start loading it now, while the user is still talking.
+
+        The model is absent after a VRAM release or a deferred warm-up, and
+        the old code only noticed at key release — so that clip waited out a
+        ~1.7 s load (2.06 s median to paste vs 0.35 s) with the pill stuck on
+        "transcribing". engine.load() is idempotent and serialized on its own
+        build lock, so the decode simply joins a load already in flight."""
+        if self.settings.stt_backend != "auto" or self.engine.model_resident:
+            return
+        t = getattr(self, "_preload_thread", None)
+        if t is not None and t.is_alive():
+            return
+        try:
+            if GPU_MONITOR.busy_reason(need_vram=True) is not None:
+                return      # this clip is headed for the cloud anyway
+        except Exception:
+            return
+
+        def _load() -> None:
+            try:
+                self.engine.load()
+            except Exception:
+                log_engine.exception("local model preload failed")
+
+        log_engine.debug("auto backend: preloading the local model during recording")
+        self._preload_thread = threading.Thread(
+            target=_load, daemon=True, name="model-preload",
+        )
+        self._preload_thread.start()
 
     def on_release(self) -> None:
         self._level_timer.stop()
+        # Unmute first so the room is audible again the instant the key is
+        # released, rather than after the transcription round-trip.
+        self.passthrough.set_muted(False)
+        if self.settings.passthrough_enabled and not self.passthrough.running:
+            # The monitor was torn down to free the mic for this recording.
+            self.passthrough.start()
         # Restore other apps' volume immediately on release — doing it here
         # (rather than after transcription) keeps the perceived ducking
         # window tight to the actual recording window.
@@ -5904,6 +9030,7 @@ class App(QObject):
             log_audio.exception("mic stop failed")
             self.ui_state.emit("error")
             return
+        save_debug_recording(audio, self.settings.keep_recordings)
         if self._cancel_current_recording:
             log_hotkey.info("release: recording cancelled — skipping transcribe")
             self._cancel_current_recording = False
@@ -5918,7 +9045,7 @@ class App(QObject):
                          gen, audio.size / SAMPLE_RATE)
         self.ui_state.emit("transcribing")
         threading.Thread(
-            target=self._process_audio, args=(audio, gen),
+            target=self._process_audio, args=(audio, gen, self._current_context),
             daemon=True, name=f"transcribe-{gen}",
         ).start()
 
@@ -5949,7 +9076,25 @@ class App(QObject):
         if not text:
             return
         log_app.info("repaste-last (%d chars)", len(text))
-        self.injector.paste(text, press_enter=self.settings.send_after_paste)
+        self._cancel_dictation_for_chord("repaste")
+        # Off the GUI thread: paste() waits for the Ctrl+Win(+B) release
+        # before it types, and must not stall the event loop doing so.
+        threading.Thread(
+            target=self.injector.paste, args=(text,),
+            kwargs={"press_enter": self.settings.send_after_paste},
+            daemon=True, name="repaste",
+        ).start()
+
+    def _cancel_dictation_for_chord(self, what: str) -> None:
+        """Ctrl+Win+<key> chords are pressed on top of the push-to-talk
+        modifiers, so the PTT poll has already started a dictation by the
+        time the chord fires. Abandon it — the user wanted the chord, not a
+        0.3 s recording of them reaching for the key (which then decoded to
+        junk and pasted on top of the chord's own paste)."""
+        if self.hotkey.recording:
+            log_hotkey.info("%s: cancelling in-flight dictation", what)
+            self._cancel_current_recording = True
+            self.hotkey.force_release()
 
     def on_llm_apply_last(self) -> None:
         """Ctrl+Win+L: run the configured default LLM prompt on the most
@@ -5971,6 +9116,7 @@ class App(QObject):
         prompt = llm_prompt_by_id(self.settings.llm_default_prompt) \
                  or BUILTIN_LLM_PROMPTS[0]
         log_app.info("llm-apply: prompt=%s on %d chars", prompt["id"], len(text))
+        self._cancel_dictation_for_chord("llm-apply")
         self.ui_state.emit("transcribing")  # reuse the blue pulse for "thinking"
         threading.Thread(
             target=self._llm_apply_worker,
@@ -6001,21 +9147,43 @@ class App(QObject):
         self._note_cancel = False
         self._current_context = get_foreground_process_basename()
         log_hotkey.info("note begin (gen=%d, context=%s)", gen, self._current_context)
+        if self.settings.passthrough_mute_while_dictating:
+            self.passthrough.set_muted(True)
         try:
             self.recorder.start()
         except Exception:
             log_audio.exception("note: mic start failed")
-            self.ui_state.emit("error")
-            return
+            if self.passthrough.running:
+                log_audio.info("retrying note mic start without the passthrough monitor")
+                self.passthrough.stop()
+                try:
+                    self.recorder.start()
+                except Exception:
+                    log_audio.exception("note: mic start failed again")
+                    self.passthrough.set_muted(False)
+                    self.ui_state.emit("error")
+                    return
+            else:
+                self.passthrough.set_muted(False)
+                self.ui_state.emit("error")
+                return
         self._note_recording = True
         self.hotkey.set_note_in_progress(True)
         self._duck_if_enabled()
         self.ui_state.emit("recording")
+        # Clear any badge from the previous dictation and make no claim yet.
+        # The badge is confirmatory only: it appears after the transcribe
+        # returns and tells us local Whisper is what actually ran, never as
+        # a prediction that could be wrong if a key turns out to work.
+        self.ui_engine.emit("pending")
         self._level_timer.start()
 
     def _end_note_recording(self) -> None:
         self._level_timer.stop()
         self.ducker.restore()
+        self.passthrough.set_muted(False)
+        if self.settings.passthrough_enabled and not self.passthrough.running:
+            self.passthrough.start()
         try:
             audio = self.recorder.stop()
         except Exception:
@@ -6024,6 +9192,7 @@ class App(QObject):
             self._note_recording = False
             self.hotkey.set_note_in_progress(False)
             return
+        save_debug_recording(audio, self.settings.keep_recordings)
         self._note_recording = False
         self.hotkey.set_note_in_progress(False)
         if self._note_cancel:
@@ -6053,12 +9222,16 @@ class App(QObject):
         with self._engine_lock:
             try:
                 raw = self.engine.transcribe(audio, initial_prompt=prompt, hotwords=hotwords)
+                # engine.last_backend is authoritative: the pool may have
+                # fallen back to local Whisper after we predicted cloud.
+                self.ui_engine.emit(self.engine.last_backend)
             except Exception:
                 log_engine.exception("note transcribe failed (gen=%d)", gen)
                 if self._is_latest(gen):
                     self.ui_state.emit("error")
                     self._schedule_reset(gen)
                 return
+        raw = strip_audio_event_tags(raw)
         if not raw:
             # Empty transcribe — flash orange so a too-short / silent press is
             # visually distinct from a successful paste landing off-screen.
@@ -6066,12 +9239,7 @@ class App(QObject):
                 self.ui_state.emit("empty")
                 self._schedule_reset(gen)
             return
-        text = self.replacements.apply(raw, context=app)
-        if self.settings.voice_commands:
-            text = self.voice_commands.process(text)
-        text = apply_smart_defaults(text)
-        if text != raw:
-            log_app.info("note rewrite %r -> %r", raw, text)
+        text = self._polish(raw, app)
         # Notes are NEVER pasted (that's the whole point — silent capture).
         # No LLM auto-apply either; notes go in raw-clean so the user can
         # decide later what to do with them.
@@ -6151,16 +9319,46 @@ class App(QObject):
     def _tick_level(self) -> None:
         self.ui_level.emit(self.recorder.level)
 
-    def _process_audio(self, audio: np.ndarray, gen: int) -> None:
+    def _polish(self, raw: str, context: str | None) -> str:
+        """Dictionary → voice commands → smart defaults. Never raises: a bad
+        dictionary entry or a regex edge case must not cost the user the
+        transcript, so any failure logs and returns what we had so far."""
+        text = raw
+        try:
+            text = self.replacements.apply(raw, context=context)
+            if self.settings.voice_commands:
+                before_vc = text
+                text = self.voice_commands.process(text)
+                if text != before_vc:
+                    log_app.info("voice commands: %r -> %r", before_vc, text)
+            # Always-on smart polish: capitalize first letter, ensure
+            # terminal punctuation, strip orphan trailing commas.
+            text = apply_smart_defaults(text)
+        except Exception:
+            log_app.exception("post-processing failed — pasting unpolished text")
+        if text != raw:
+            log_app.info("rewrite %r -> %r", raw, text)
+        return text
+
+    def _process_audio(self, audio: np.ndarray, gen: int,
+                       context: str | None = None) -> None:
         # Bail early if this audio is already stale (user pressed again).
         if not self._is_latest(gen):
             log_app.debug("transcribe(gen=%d) stale before start — skip", gen)
             return
+        # Per-app dictionary context is captured at release time and handed
+        # in, because self._current_context already belongs to the NEXT
+        # recording if the user pressed again before this decode finished.
+        if context is None:
+            context = self._current_context
         prompt = build_initial_prompt(self.log)
         hotwords = ", ".join(self.replacements.vocab) or None
         with self._engine_lock:
             try:
                 raw = self.engine.transcribe(audio, initial_prompt=prompt, hotwords=hotwords)
+                # engine.last_backend is authoritative: the pool may have
+                # fallen back to local Whisper after we predicted cloud.
+                self.ui_engine.emit(self.engine.last_backend)
             except Exception:
                 log_engine.exception("transcribe failed (gen=%d)", gen)
                 if self._is_latest(gen):
@@ -6168,6 +9366,7 @@ class App(QObject):
                     self._schedule_reset(gen)
                 return
 
+        raw = strip_audio_event_tags(raw)
         if not raw:
             # Empty transcribe — flash orange so a too-short / silent press is
             # visually distinct from a successful paste landing off-screen.
@@ -6176,19 +9375,7 @@ class App(QObject):
                 self._schedule_reset(gen)
             return
 
-        text = self.replacements.apply(raw, context=self._current_context)
-        if self.settings.voice_commands:
-            before_vc = text
-            text = self.voice_commands.process(text)
-            if text != before_vc:
-                log_app.info("voice commands: %r -> %r", before_vc, text)
-        # Always-on smart polish: capitalize first letter, ensure terminal
-        # punctuation, strip orphan trailing commas. Whisper handles tonality
-        # and pause-based punctuation in the base transcription; this is just
-        # the cleanup layer.
-        text = apply_smart_defaults(text)
-        if text != raw:
-            log_app.info("rewrite %r -> %r", raw, text)
+        text = self._polish(raw, context)
 
         # Auto-apply LLM post-processing: replaces the transcript before paste
         # and replaces the history entry's text (raw still captures Whisper's
@@ -6261,6 +9448,40 @@ def show_fatal(message: str) -> None:
         pass
 
 
+_SINGLE_INSTANCE_HANDLE = None
+
+
+def _acquire_single_instance() -> bool:
+    """Hold a named mutex for the life of the process; False if another
+    process already holds it. Non-Windows: always True."""
+    global _SINGLE_INSTANCE_HANDLE
+    if not _WIN32:
+        return True
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        name = f"Local\\{APP_NAME}-single-instance"
+        # run.bat terminates the previous instance and launches this one in
+        # the same breath; TerminateProcess is asynchronous, so the old
+        # mutex can still be alive for a moment. Retry briefly before
+        # concluding someone else really owns it.
+        for _attempt in range(8):
+            handle = k32.CreateMutexW(None, False, name)
+            err = ctypes.get_last_error()
+            if not handle:
+                return True      # couldn't create one at all — don't block startup
+            if err != 183:       # 183 = ERROR_ALREADY_EXISTS
+                _SINGLE_INSTANCE_HANDLE = handle   # keep it alive; released at exit
+                return True
+            k32.CloseHandle(handle)
+            time.sleep(0.5)
+        return False
+    except Exception:
+        return True
+
+
 def main() -> int:
     args = parse_args()
 
@@ -6274,6 +9495,29 @@ def main() -> int:
     listener = setup_logging(args.debug)
     startup = logging.getLogger("startup")
     startup.info("%s %s on python %s", APP_NAME, __version__, sys.version.split()[0])
+    # Single instance. Two Tellurs means two pastes per dictation, two
+    # duckers fighting over volumes and two writers on settings/history.
+    # run.bat kills older instances before launching, but a second launch
+    # through any other path (double-clicking tellur.py, an overlapping
+    # updater restart) had nothing stopping it.
+    if not _acquire_single_instance():
+        startup.warning("another %s instance is already running — exiting", APP_NAME)
+        listener.stop()
+        return 0
+    # Elevation is load-bearing: unelevated, UIPI blocks both the hotkey hook
+    # and paste whenever an admin window (elevated terminal) has focus. Log
+    # it so "dictation dead in terminal X" is diagnosable from the log alone.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            _elevated = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            _elevated = False
+        startup.info(
+            "running elevated: %s",
+            "yes" if _elevated
+            else "NO — hotkey and paste won't reach admin windows (UIPI)",
+        )
 
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.*=false")
 
@@ -6293,6 +9537,10 @@ def main() -> int:
         listener.stop()
         return 1
 
+    # After App() — the keyboard listener thread exists by now, so both the
+    # process class and the hook pump thread get bumped.
+    raise_input_priority()
+
     exit_code = qapp.exec()
     startup.info("shutting down (exit=%d)", exit_code)
     listener.stop()
@@ -6301,3 +9549,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

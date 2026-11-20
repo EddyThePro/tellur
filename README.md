@@ -19,6 +19,8 @@ Powered by OpenAI's **Whisper** model running locally on your machine via [`fast
 - 💯 **Free, open source, no limits** — MIT licensed. No subscription, no usage caps, no telemetry.
 - 🪟 **Tiny live mic-meter overlay** at the bottom of your screen so you can see your voice being captured in real time.
 - 📋 **System tray icon** with right-click **Copy last transcription** — perfect when you typed into the wrong window.
+- 💻 **Terminal-aware paste** — dictation lands correctly in CMD/PowerShell windows and Claude Code CLI, which can't accept a simulated Ctrl+V while a console TUI is running.
+- 🔊 **Mic passthrough (hear-through)** — mix your mic into your headphones at a level you set, so you can hear the room without taking closed IEMs out. The level is independent of your Windows mic volume, so turning it down doesn't make you quieter to anyone else.
 - 📜 **Transcript history panel** — every dictation is saved (locally). Re-copy past transcriptions with one click.
 - 🧠 **Personal vocabulary dictionary** — teach Tellur the words and phrases Whisper consistently mishears. Live-reloaded, no restart needed.
 - 🎯 **Zero setup ceremony** — install Python 3.11 once, then double-click `run.bat`. The launcher handles the venv, dependencies, and model download for you.
@@ -49,6 +51,16 @@ Push-to-talk style is configurable in **Settings → Push-to-talk mode** — pic
 Point Tellur at any OpenAI-compatible endpoint (LM Studio, Ollama, llama.cpp server, vLLM) and pick a default prompt from the list — **Clean up filler words**, **Make it a clean paragraph**, **Make it formal**, **Convert to bullet points**, **Convert to email**, **Convert to Slack message**, **Summarize**. Press **Ctrl+Win+L** to apply it to your last transcript, or enable **Auto-apply** to run it on every transcript before paste. Stays 100% local if your endpoint is local. Configure in **Settings → AI post-processing**.
 
 ## What you'll see
+
+The bottom-center overlay also shows a small, persistent **Windows communications microphone** indicator:
+
+- **Small red crossed-out microphone:** the endpoint is actually muted.
+- **Small green microphone:** the endpoint is unmuted (this does not mean Tellur is recording).
+- **Amber microphone:** the endpoint's state could not be read; no mute state is assumed.
+
+The indicator is just the icon, with no text or background.
+
+It reads Windows Core Audio every 0.4 seconds on a background thread, independently of IEM Control's button events. It follows changes to the default communications input and leaves Tellur's recording meter, engine badge, and input-device settings intact. An app using a different input device will not be covered by this indicator. The overlay remains click-through and does not take keyboard focus.
 
 - **A tiny indicator** at the bottom-center of your primary monitor:
   - dim gray dot = idle
@@ -102,6 +114,23 @@ Or just edit `replacements.json` directly with any text editor.
 | **Latency** | ~60 ms on GPU | Network round-trip |
 | **Vocabulary tuning** | Live-editable JSON dictionary | Usually limited or paid |
 | **Source code** | MIT, hackable | Closed |
+
+## Optional cloud engine (ElevenLabs Scribe)
+
+Tellur is local by default and stays that way unless you opt in. **Settings → Transcription engine** offers three modes:
+
+| Mode | What it does |
+|---|---|
+| **Local Whisper** (default) | Everything on your machine. No network. |
+| **ElevenLabs Scribe** | Sends each clip to ElevenLabs' Speech-to-Text API (Scribe v3). Needs an API key and an internet connection; your audio leaves the machine. |
+| **Auto** | Local when the GPU is free, cloud when it is busy (a game, a render, a large LLM), so dictation never competes for the GPU. |
+
+A few things worth knowing if you use the cloud modes:
+
+- **Several keys, automatic failover.** Add a primary, a backup and any number of extra keys; a key that runs out of credits or is rate-limited is benched and retried later, and the status line under the engine picker shows which key is live.
+- **It can't hang.** Each clip gets a time budget scaled to its length. A slow request is raced by a second one, and past the deadline the clip is decoded locally instead.
+- **Clean-up.** *Clean up cloud transcripts* (on by default) leaves out "um", "uh" and restarted words, matching how local Whisper writes. Turn it off for word-for-word transcripts.
+- **You can see which engine ran.** When a clip you expected to go to the cloud was decoded locally, the overlay shows a small amber `WHISPER` badge.
 
 ## System requirements
 
@@ -161,28 +190,66 @@ tellur.py --version
 
 - **Elevated apps can swallow hotkey events.** If the foreground window runs as Administrator (admin terminal, some games), the Ctrl+Win hold may not register. Run `run.bat` as Administrator to match privilege.
 - **Start menu stays away** — holding Ctrl while pressing Win prevents the Start menu from opening on release, so the normal hold→release flow doesn't pop Start.
+- **Heavy games used to kill dictation (fixed in 2.3.4).** A AAA game launch can saturate every core long enough that Windows silently revokes low-level keyboard hooks — push-to-talk would go dead until Tellur restarted. Push-to-talk now polls key state directly (no hook to lose), and a watchdog reinstalls the hook the secondary chords (quit / cancel / re-paste) rely on, logging `keyboard hook dead … installing replacement` when it fires. If you game a lot, also consider raising the hook deadline: set `HKCU\Control Panel\Desktop\LowLevelHooksTimeout` (DWORD) to `1000` and sign out/in once.
+
+## Pasting into terminals (CMD, Claude Code, IDE terminals)
+
+Tellur normally pastes by simulating **Ctrl+V** — which only works if the focused window translates that chord into a paste. Classic console windows often can't: a bare `cmd.exe` / PowerShell window disables its Ctrl+V and Shift+Insert shortcuts entirely while a TUI app like **Claude Code** holds the console in raw mode, and a few terminal emulators reserve a different paste chord altogether.
+
+With **Settings → Integration & automation → Terminal-aware paste** (default on), Tellur picks the right strategy per target:
+
+| Focused window | Strategy |
+|---|---|
+| Classic console window (`cmd.exe`, PowerShell, Claude Code inside one) | Transcript is **typed** as unicode key events; newlines become spaces so dictation can never press Enter in your shell |
+| mintty | Clipboard + **Shift+Insert** |
+| Alacritty / WezTerm | Clipboard + **Ctrl+Shift+V** |
+| Windows Terminal, VS Code-family editors/terminals, and everything else | Clipboard + **Ctrl+V** (unchanged) |
+
+Tip: for Claude Code, **Windows Terminal is the best host** — its Ctrl+V delivers a proper bracketed paste, which is the input form Claude Code is designed for. The typing path exists so plain-CMD-hosted sessions work at all.
+
+## Mic passthrough (hear-through)
+
+**Settings → Mic passthrough.** Mixes your microphone into your headphones so the room stays audible through closed IEMs.
+
+| Control | What it does |
+| --- | --- |
+| **Hear-through** | Turns the monitor on. Two audio streams open; nothing runs when it's off. |
+| **Passthrough level** | `0%` is silent, `100%` is your mic at full level. Squared, so most of the travel sits at the quiet end where it's useful. |
+| **Play into** | Which output the mic is echoed to. Devices are labelled with their host API. |
+| **Mute while dictating** | Silences the monitor while you hold the hotkey, so you aren't hearing yourself as you dictate. On by default. |
+
+### Why not just use Windows' "Listen to this device"?
+
+Windows can already route a mic to a playback device, and it needs no running process at all. But its only volume control is the mic's **capture** level, which is shared with every other app — dropping the passthrough to 20% would also make you 20% quieter to everyone in Discord. Tellur mixes it separately, so the level you hear is independent of the level others hear.
+
+### Latency, EQ, and feedback
+
+- **Pick a WASAPI device if you hear yourself echoing.** MME buffers roughly 80 ms; WASAPI is closer to ~15 ms. The picker shows the host API next to each device for exactly this reason.
+- **Any system EQ on the output applies to the passthrough too.** If Equalizer APO (or similar) is boosting that device, the mic gets boosted with it — start the level low.
+- **On open-back headphones or speakers, a high level can feed back.** Closed IEMs leak very little, which is the case this is built for.
 
 ## Tuning
 
 Constants near the top of `tellur.py`:
 
-- `DEFAULT_MODEL` — `large-v3-turbo` is the sweet spot. Try `distil-large-v3` for faster English-only, or `medium` for lower VRAM use. You can also switch models live from **Settings → Transcription model**.
+- `DEFAULT_MODEL` — `distil-large-v3.5` is the sweet spot for English dictation (best short-form accuracy in the Whisper family, ~1.5× faster than turbo). Try `large-v3-turbo` for multilingual or long clips, or `medium` for lower VRAM use. You can also switch models live from **Settings → Transcription model**.
 - `LANGUAGE` — `"en"` by default; set to `None` for auto-detect across languages.
 - `BAR_LEVEL_SCALE` — default mic-meter sensitivity (also adjustable from Settings).
 - `OVERLAY_WIDTH` / `OVERLAY_HEIGHT` / `OVERLAY_BOTTOM_MARGIN` — overlay size & position.
 - `BEAM_SIZE` / `NO_REPEAT_NGRAM_SIZE` / `REPETITION_PENALTY` — decoder robustness knobs.
+- `PASSTHROUGH_BLOCK` / `PASSTHROUGH_QUEUE_BLOCKS` — hear-through delay. The block size is what you hear yourself at; the queue length caps how far behind the monitor can drift before old audio is dropped. Both are small on purpose: past roughly 20 ms, hearing your own voice delayed actively disrupts speaking.
 
 ## How it works (technical)
 
 Tellur is a single-file Python desktop app built on:
 
-- **[faster-whisper](https://github.com/SYSTRAN/faster-whisper)** running OpenAI's `large-v3-turbo` model through CTranslate2 (fp16 on CUDA, int8 on CPU)
+- **[faster-whisper](https://github.com/SYSTRAN/faster-whisper)** running `distil-large-v3.5` (distilled Whisper large-v3) through CTranslate2 (fp16 on CUDA, int8 on CPU)
 - **PyQt6** for the overlay, system tray icon, and main panel
 - **sounddevice** + numpy for low-latency mic capture
 - **`keyboard`** (Windows low-level hooks) for push-to-talk detection
 - **`pyperclip`** + synthesized Ctrl+V for text injection
 
-All audio capture and Whisper inference happens on the local machine. No network calls during normal use.
+With the default local engine, all audio capture and Whisper inference happens on the local machine: no network calls during normal use (a model already on disk is loaded straight from the cache). The one exception is the update check against GitHub releases at start-up. The optional cloud engine is described above.
 
 ## File layout
 
@@ -192,8 +259,12 @@ tellur/
 ├── replacements.json    custom dictionary
 ├── requirements.txt
 ├── run.bat              launcher (creates venv on first run, then pythonw)
+├── run-hidden.vbs       runs run.bat with no console window (used by the start-on-login task)
 ├── tail-log.bat         live log tail
 ├── teach.bat / teach.py CLI for editing the dictionary
+├── smoke_test.py        offline self-test of settings, history, hotkeys, paste strategy
+├── test_cloud_router.py offline tests for the cloud/local router
+├── CHANGELOG.md
 ├── README.md
 └── LICENSE              MIT
 ```

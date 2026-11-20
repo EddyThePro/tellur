@@ -94,8 +94,29 @@ if not exist "%TELLUR_VENV%\Scripts\pythonw.exe" (
         pause
         exit /b 1
     )
+    copy /y requirements.txt "%TELLUR_VENV%\.requirements-installed.txt" >nul
     echo.
     echo Setup complete. Launching Tellur...
+)
+
+rem --- single instance: stop any Tellur already running before launching, so
+rem     a new launch never stacks a second copy (the cause of double
+rem     transcription / double paste). Effectively "new launch replaces old".
+rem     Covers both manual launches and start-on-login (both run this script).
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { ($_.Name -eq 'pythonw.exe' -or $_.Name -eq 'python.exe') -and $_.CommandLine -like '*tellur.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
+
+rem --- keep the venv in step with requirements.txt. The in-app updater swaps
+rem     the program files but cannot install packages, so an update that adds
+rem     or raises a dependency would otherwise start against a stale venv.
+rem     Runs only when requirements.txt differs from the copy stamped at the
+rem     last successful install; a failed install (offline) does not block the
+rem     launch and is simply retried next time. Must come after the old
+rem     instance is stopped: pip cannot replace DLLs that are in use.
+set "REQ_STAMP=%TELLUR_VENV%\.requirements-installed.txt"
+fc /b requirements.txt "%REQ_STAMP%" >nul 2>&1
+if errorlevel 1 (
+    "%TELLUR_VENV%\Scripts\python.exe" -m pip install -q --disable-pip-version-check -r requirements.txt >nul 2>&1
+    if not errorlevel 1 copy /y requirements.txt "%REQ_STAMP%" >nul
 )
 
 start "" "%TELLUR_VENV%\Scripts\pythonw.exe" tellur.py %*

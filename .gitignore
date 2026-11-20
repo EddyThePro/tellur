@@ -33,3 +33,7 @@ desktop.ini
 build/
 dist/
 *.spec
+
+# Local working copies and generated previews
+backups/
+mic-status-preview.png

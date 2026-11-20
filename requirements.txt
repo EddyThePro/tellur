@@ -1,6 +1,11 @@
-faster-whisper>=1.0.3
+# 1.2.0 is the first release that knows the default model (distil-large-v3.5).
+faster-whisper>=1.2.1
+# NVML bindings for the "auto" STT backend (GPU-load routing). Tiny, official
+# NVIDIA package; harmless on machines without an NVIDIA GPU (init just fails
+# and auto mode prefers the cloud backend).
+nvidia-ml-py>=12.0
 sounddevice>=0.4.7
-numpy>=1.26,<2.3
+numpy>=1.26,<3
 pyperclip>=1.9.0
 keyboard>=0.13.5
 PyQt6>=6.7.0

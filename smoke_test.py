@@ -103,6 +103,8 @@ def test_settings_roundtrip():
     # v1.9
     s.save_history = False
     s.history_retention_days = 30
+    # v2.3
+    s.terminal_aware_paste = False
     s.save()
     assert path.exists(), "settings.json wasn't written"
 
@@ -124,6 +126,7 @@ def test_settings_roundtrip():
     assert s2.webhook_template == '{"foo": "{text}"}'
     assert s2.save_history is False
     assert s2.history_retention_days == 30
+    assert s2.terminal_aware_paste is False
     return f"({len(json.loads(path.read_text())) } fields persisted)"
 
 
@@ -408,6 +411,21 @@ def test_get_foreground_process_basename():
     return f"foreground process basename = {name!r}"
 
 
+def test_foreground_window_info_and_paste_strategy():
+    """v2.3: window info returns (class, proc) and the chosen paste strategy
+    is one keyboard.send understands (or the special "type" mode)."""
+    cls_name, proc = t.get_foreground_window_info()
+    assert cls_name is None or isinstance(cls_name, str), f"got {type(cls_name).__name__}"
+    assert proc is None or isinstance(proc, str), f"got {type(proc).__name__}"
+    strategy = t.pick_paste_strategy()
+    assert strategy == "type" or "+" in strategy, f"odd strategy {strategy!r}"
+    # Chord table sanity: lowercase process basenames mapping to key combos.
+    for proc_name, chord in t.PASTE_CHORD_BY_PROCESS.items():
+        assert proc_name == proc_name.lower(), f"non-lowercase key {proc_name!r}"
+        assert "+" in chord, f"non-combo chord {chord!r}"
+    return f"info=({cls_name!r}, {proc!r}) strategy={strategy!r}"
+
+
 def test_audio_recorder_set_methods():
     """v1.6: AudioRecorder set_device / set_gain don't crash without a mic."""
     rec = t.AudioRecorder()
@@ -445,6 +463,7 @@ if __name__ == "__main__":
     check("theme palettes + build_panel_qss",     test_theme_palettes_and_qss)
     check("Replacements: per-context overlay",    test_replacements_per_context_overlay)
     check("foreground process detection",         test_get_foreground_process_basename)
+    check("window info + paste strategy",         test_foreground_window_info_and_paste_strategy)
 
     # LLM live test — checks reachability first; reports as SKIP otherwise.
     print()
