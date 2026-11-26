@@ -2,6 +2,27 @@
 
 All notable changes to Tellur are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [2.7.5] — 2026-11-25
+
+### Recording starts the instant you press the hotkey
+
+**Symptom:** pressing Ctrl+Win took a noticeable moment to start listening, and dictations lost their first words ("I want you to look into Tellur" arrived as "To look into Teller").
+
+**Cause:** the microphone was opened on every press and closed on every release. On a wired or USB mic that costs ~20 ms. On a Bluetooth headset (measured on a Shokz OpenComm2) Windows first has to switch the headset into its hands-free profile: opening the mic took ~600 ms and the first audio arrived ~1.4 s after the press. Windows switches back after 6-12 s idle, so nearly every press paid that again. The log made it plain: press-to-record had been ~30 ms median for a month and jumped to ~600 ms the moment the default mic became the headset, and a 26.5 s hold captured only 25.0 s of audio.
+
+**Fix: Settings → Audio input → Keep microphone open** (off by default).
+- The capture stream is opened once and kept running. A press now starts recording in ~0.1 ms, and the 0.3 s before the press is kept too, so a word spoken together with the keypress isn't clipped.
+- A short tap is still treated as a tap: the pre-roll is dropped when less than 0.25 s was recorded after the press, so an accidental press never reaches the cloud.
+- A background watchdog keeps the held stream healthy. It reopens the stream when it stops delivering audio (headset switched off, USB unplugged), when you pick another mic, and when the Windows default mic changes. PortAudio only notices a new default after re-initialising, so the watchdog does that too. It never re-initialises mid-dictation, or while mic passthrough is enabled (its streams hold device indexes of their own).
+- If the held stream isn't ready at press time, the press opens the mic itself, as before. So the setting can only make things faster.
+- Trade-offs, also stated in Settings: Windows shows the mic as in use, and a Bluetooth headset stays in call-quality audio while Tellur runs.
+- Without the setting, a slow mic is now logged: `mic took N ms to deliver audio after the press`.
+
+### Smaller fixes
+- Local Whisper transcripts get a capital "I" ("i want" → "I want", "i'm" → "I'm"). Standalone pronoun only: "i.e.", "iPad" and other words are untouched. About one local clip in five had this.
+- Device enumeration and PortAudio re-initialisation are serialised (`PA_LOCK`), so the Settings device list can't race a re-init.
+- New offline test: `test_recorder.py` (fake PortAudio, 32 checks).
+
 ## [2.7.4] — 2026-11-19
 
 A refresh of everything underneath the app: the cloud model, the inference libraries, and how a cached model is loaded.

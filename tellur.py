@@ -9,7 +9,7 @@ See README.md for setup, configuration, and troubleshooting.
 
 from __future__ import annotations
 
-__version__ = "2.7.4"
+__version__ = "2.7.5"
 APP_NAME = "Tellur"
 # Windows Task Scheduler task that launches Tellur elevated (no UAC prompt).
 # Optional: installs that never created the task keep the legacy Run-key path.
@@ -168,6 +168,22 @@ MIN_AUDIO_SECONDS = 0.25
 QUIET_PEAK_SILENCE = 0.003
 QUIET_PEAK_NORMALIZE = 0.30
 QUIET_PEAK_TARGET = 0.70
+# Always-open mic (v2.7.5). Opening a capture stream is ~20 ms on a wired/USB
+# mic but ~0.6 s (and ~1.4 s until the first samples arrive) on a Bluetooth
+# headset, because Windows has to switch the headset into its hands-free
+# profile first — and it switches back after ~6-12 s idle, so every press paid
+# it again and the first words were lost. With Settings.mic_always_open the
+# stream is opened once and kept running; while no recording is live its
+# audio feeds a short pre-roll ring, so the press itself is instant and the
+# syllable spoken *with* the keypress is kept.
+MIC_PREROLL_SECONDS = 0.3
+# Watchdog: a held stream that delivers no callback for this long is treated
+# as dead (Bluetooth headset powered off / USB unplugged) and reopened.
+MIC_STALL_SECONDS = 2.0
+MIC_WATCHDOG_INTERVAL_SEC = 1.0
+# Minimum gap between PortAudio re-initialisations (needed to see a new
+# default mic or a hot-plugged device; PortAudio caches both at init).
+MIC_REINIT_MIN_INTERVAL_SEC = 5.0
 MAX_RECORDING_SECONDS = 300   # 5 minutes — hard cap to prevent unbounded RAM
 
 # Mic passthrough ("hear-through") — a live mic -> speakers monitor so the room
@@ -911,6 +927,11 @@ def strip_audio_event_tags(text: str) -> str:
     return re.sub(r"\s{2,}", " ", out).strip()
 
 
+_LOWER_I_RE = re.compile(
+    r"(?<![\w.'’-])i(?=['’](?:m|d|ll|ve|s)\b|[\s,!?;:)\"”]|\.(?!\w)|$)"
+)
+
+
 def apply_smart_defaults(text: str) -> str:
     """Safe always-on normalization for every transcription, regardless of
     whether voice commands are enabled:
@@ -932,6 +953,10 @@ def apply_smart_defaults(text: str) -> str:
     # Capitalize first alpha character (don't touch numbers/symbols leading).
     if text[0].isalpha():
         text = text[0].upper() + text[1:]
+    # The pronoun "I" (v2.7.5): local distil-Whisper often emits "i want" /
+    # "i'm" in long unpunctuated clips. Standalone only — "i.e.", "iPad" and
+    # words containing an i are untouched.
+    text = _LOWER_I_RE.sub("I", text)
     # Strip trailing weak punctuation & whitespace.
     text = re.sub(r"[,;:\s]+$", "", text)
     # Ensure terminal punctuation — judged on the last character BEFORE any
@@ -1573,6 +1598,11 @@ class Settings(QObject):
         # (DEBUG_RECORDINGS_DIR) so a mis-transcribed clip can be replayed.
         # 0 = off.
         self.keep_recordings: int = 0
+        # Always-open mic (v2.7.5): keep the capture stream running so a press
+        # starts recording instantly (with MIC_PREROLL_SECONDS of pre-roll).
+        # Off by default — it keeps Windows' "mic in use" indicator lit, and a
+        # Bluetooth headset stays in its call-quality hands-free mode.
+        self.mic_always_open: bool = False
         # Customizable hotkeys (v2.2) — secondary hotkeys are user-editable
         # via Settings; stored in the `keyboard` library's combo format
         # (e.g. "ctrl+windows+z"). The primary Ctrl+Win push-to-talk and the
@@ -1871,6 +1901,8 @@ class Settings(QObject):
                     except (TypeError, ValueError):
                         self.keep_recordings = 0
                     self.keep_recordings = max(0, min(500, self.keep_recordings))
+                    self.mic_always_open = bool(
+                        data.get("mic_always_open", self.mic_always_open))
                     # Hotkeys — accept any non-empty string; HotkeyWatcher
                     # validates via keyboard.add_hotkey at register time and
                     # logs (rather than crashes) on bad combos.
@@ -1984,6 +2016,7 @@ class Settings(QObject):
             "passthrough_output_name": self.passthrough_output_name,
             "passthrough_mute_while_dictating": self.passthrough_mute_while_dictating,
             "keep_recordings": self.keep_recordings,
+            "mic_always_open": self.mic_always_open,
             "hotkey_quit": self.hotkey_quit,
             "hotkey_repaste": self.hotkey_repaste,
             "hotkey_llm": self.hotkey_llm,
@@ -2122,10 +2155,32 @@ def humanize_time(ts: float) -> str:
 # ===========================================================================
 # audio capture
 # ===========================================================================
+# Serializes PortAudio re-initialisation (AudioRecorder's watchdog) against
+# device enumeration and stream opens on other threads — Pa_Terminate while
+# another thread is inside Pa_GetDeviceInfo is a use-after-free.
+PA_LOCK = threading.RLock()
+
+
+def default_capture_endpoint_id() -> str | None:
+    """Windows Core Audio id of the default (console-role) capture endpoint,
+    or None if it can't be read. Caller's thread must be COM-initialised."""
+    try:
+        from pycaw.pycaw import AudioUtilities
+        ep = AudioUtilities.GetDeviceEnumerator().GetDefaultAudioEndpoint(1, 0)
+        return str(ep.GetId())
+    except Exception:
+        return None
+
+
 def list_input_devices() -> list[dict]:
     """Return a list of input devices as [{'index': int, 'name': str,
     'default': bool, 'channels': int}]. Falls back to an empty list on
     PortAudio errors (e.g. no audio service)."""
+    with PA_LOCK:
+        return _list_input_devices_locked()
+
+
+def _list_input_devices_locked() -> list[dict]:
     try:
         devices = sd.query_devices()
         try:
@@ -2157,6 +2212,11 @@ def list_output_devices() -> list[dict]:
     in the picker. It is not cosmetic: MME buffers ~80 ms while WASAPI is closer
     to ~15 ms, and for a monitor you hear yourself through that is the
     difference between "present" and "echo"."""
+    with PA_LOCK:
+        return _list_output_devices_locked()
+
+
+def _list_output_devices_locked() -> list[dict]:
     try:
         devices = sd.query_devices()
         try:
@@ -2230,21 +2290,38 @@ class AudioRecorder:
     Supports a selectable input device (index or None for system default) and
     a software gain multiplier applied per-sample. The level reported back to
     the overlay is the post-gain RMS so the meter reflects what's actually
-    being fed into Whisper."""
+    being fed into Whisper.
+
+    Two capture modes:
+    - per-press (default): a stream is opened on start() and closed on stop().
+    - always-open (`set_always_open(True)`, v2.7.5): one stream is opened by a
+      watchdog thread and kept running. While idle its audio fills a
+      MIC_PREROLL_SECONDS ring; start() just flips a flag (instant) and seeds
+      the recording with that pre-roll. The watchdog reopens the stream when
+      it stalls (headset off / unplugged), when the chosen device changes, or
+      when the Windows default mic changes (PortAudio only sees a new default
+      after re-initialising, so it does that too — never mid-recording, and
+      never while the passthrough monitor owns streams with cached indexes).
+      If the held stream is unhealthy at press time, start() falls back to
+      the per-press path, so always-open can only ever be faster."""
 
     def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
         self._frames: list[np.ndarray] = []
         self._sample_count = 0
+        self._live_samples = 0      # samples captured after the press
+        self._preroll_used = 0      # samples of pre-roll seeded into _frames
         self._max_samples = int(MAX_RECORDING_SECONDS * sample_rate)
-        self._stream: sd.InputStream | None = None
+        self._stream: sd.InputStream | None = None   # per-press stream
         self._level = 0.0
         # device: PortAudio device index, or None to follow system default.
         # gain: linear multiplier applied per-sample (1.0 == off).
         self._device: int | None = None
+        self._device_name: str | None = None   # re-resolved after PA re-init
         self._gain: float = 1.0
         # Separate stream used by the Settings tab for the live meter; runs
-        # only while Settings is visible and never feeds the recorder.
+        # only while Settings is visible and never feeds the recorder. In
+        # always-open mode the held stream doubles as the meter instead.
         self._monitor_stream: sd.InputStream | None = None
         self._monitor_level: float = 0.0
         self._monitor_wanted: bool = False
@@ -2252,16 +2329,49 @@ class AudioRecorder:
         # overflow = the driver dropped samples because our callback was
         # late). Counted in the callback, reported once at stop().
         self._overflows = 0
+        # Recording state shared with the PortAudio callback threads.
+        # `_rec_source` says which stream feeds the live recording ("held" or
+        # "cold"), so a held stream that recovers mid-way through a cold
+        # recording can't double the audio.
+        self._lock = threading.Lock()
+        self._recording = False
+        self._rec_source: str | None = None
+        self._preroll: deque = deque()
+        self._preroll_samples = 0
+        self._preroll_max = int(MIC_PREROLL_SECONDS * sample_rate)
+        # Cold-open diagnostics: how long after start() the first samples
+        # actually arrived (Bluetooth hands-free: ~1.4 s).
+        self._cold_t0 = 0.0
+        self._first_audio_ms: float | None = None
+        # Always-open machinery.
+        self._always_open = False
+        self._held: sd.InputStream | None = None
+        self._held_device: int | None = None
+        self._held_default_id: str | None = None
+        self._held_opened_at = 0.0
+        self._last_held_cb = 0.0
+        self._held_fail_logged = False
+        self._want_reinit = False
+        self._last_reinit = 0.0
+        self._watch_gen = 0
+        self._watchdog: threading.Thread | None = None
+        self._watchdog_wake = threading.Event()
+        # App injects a predicate; PortAudio re-init invalidates every device
+        # index, so it is skipped while something else (passthrough) holds
+        # indexes of its own.
+        self.reinit_allowed = lambda: True
 
-    def set_device(self, idx: int | None) -> None:
+    def set_device(self, idx: int | None, name: str | None = None) -> None:
+        self._device_name = name if idx is not None else None
         if idx == self._device:
             return
         self._device = idx
         log_audio.info("input device -> %s", idx if idx is not None else "system default")
         # If a live monitor is running, restart it on the new device.
         if self._monitor_stream is not None:
-            self.stop_monitor()
-            self.start_monitor()
+            self.stop_monitor(_internal=True)
+            self.start_monitor(_internal=True)
+        self._watchdog_wake.set()   # held stream moves to the new device
 
     def set_gain(self, gain: float) -> None:
         g = max(0.1, min(10.0, float(gain)))
@@ -2270,47 +2380,106 @@ class AudioRecorder:
         self._gain = g
         log_audio.info("input gain -> %.2fx", g)
 
-    def _callback(self, indata, _frames, _time_info, status) -> None:
-        if status:
-            self._overflows += 1
+    # --- callbacks ------------------------------------------------------------
+
+    def _ingest(self, indata, status, source: str) -> None:
         chunk = indata.copy().reshape(-1).astype(np.float32)
         if self._gain != 1.0:
             np.multiply(chunk, self._gain, out=chunk)
             np.clip(chunk, -1.0, 1.0, out=chunk)
-        # Hard cap to prevent unbounded RAM growth on a stuck-down hotkey.
-        if self._sample_count + chunk.size > self._max_samples:
-            return  # silently drop further audio
-        self._frames.append(chunk)
-        self._sample_count += chunk.size
-        self._level = float(np.sqrt(np.mean(chunk * chunk)))
+        level = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
+        with self._lock:
+            if self._recording and self._rec_source == source:
+                self._level = level
+                if status:
+                    self._overflows += 1
+                if self._first_audio_ms is None and source == "cold":
+                    self._first_audio_ms = (time.perf_counter() - self._cold_t0) * 1000.0
+                # Hard cap to prevent unbounded RAM growth on a stuck-down hotkey.
+                if self._sample_count + chunk.size > self._max_samples:
+                    return  # silently drop further audio
+                self._frames.append(chunk)
+                self._sample_count += chunk.size
+                self._live_samples += chunk.size
+            elif source == "held":
+                self._level = level
+                self._preroll.append(chunk)
+                self._preroll_samples += chunk.size
+                # Keep at least _preroll_max samples, dropping whole chunks.
+                while (self._preroll
+                       and self._preroll_samples - self._preroll[0].size >= self._preroll_max):
+                    self._preroll_samples -= self._preroll.popleft().size
+
+    def _callback(self, indata, _frames, _time_info, status) -> None:
+        self._ingest(indata, status, "cold")
+
+    def _held_callback(self, indata, _frames, _time_info, status) -> None:
+        self._last_held_cb = time.monotonic()
+        self._ingest(indata, status, "held")
+
+    # --- recording ------------------------------------------------------------
+
+    def _held_healthy(self) -> bool:
+        return (self._held is not None
+                and time.monotonic() - self._last_held_cb < MIC_STALL_SECONDS)
 
     def start(self) -> None:
-        self._frames = []
-        self._sample_count = 0
-        self._level = 0.0
-        self._overflows = 0
+        with self._lock:
+            self._frames = []
+            self._sample_count = 0
+            self._live_samples = 0
+            self._preroll_used = 0
+            self._level = 0.0
+            self._overflows = 0
+            self._first_audio_ms = None
+        if self._always_open and self._held_healthy():
+            with self._lock:
+                if self._preroll_samples:
+                    pre = np.concatenate(list(self._preroll))[-self._preroll_max:]
+                    self._frames = [pre]
+                    self._sample_count = self._preroll_used = int(pre.size)
+                self._preroll.clear()
+                self._preroll_samples = 0
+                self._rec_source = "held"
+                self._recording = True
+            log_audio.debug(
+                "recording started (held stream, device=%s gain=%.2f, pre-roll %d ms)",
+                self._held_device, self._gain,
+                self._preroll_used * 1000 // self.sample_rate,
+            )
+            return
+        if self._always_open:
+            log_audio.info("held mic stream not ready — opening the mic for this press")
         # Tear down the monitor stream so the device is exclusively available
         # for the recording — important for drivers that don't support shared
         # mode. `_monitor_wanted` (set by the panel's start/stop_monitor)
         # tells stop() whether to bring it back.
         if self._monitor_stream is not None:
             self.stop_monitor(_internal=True)
+        with self._lock:
+            self._rec_source = "cold"
+            self._recording = True
+        self._cold_t0 = time.perf_counter()
         stream = None
         try:
-            stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype="float32",
-                callback=self._callback,
-                blocksize=0,
-                device=self._device,
-            )
-            stream.start()
+            with PA_LOCK:
+                stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype="float32",
+                    callback=self._callback,
+                    blocksize=0,
+                    device=self._device,
+                )
+                stream.start()
         except Exception:
             # Never leave a half-opened PortAudio stream behind, and give the
             # Settings meter its stream back — the old code left the meter
             # dead after one failed start (unplugged mic) until the panel was
             # hidden and re-shown.
+            with self._lock:
+                self._recording = False
+                self._rec_source = None
             if stream is not None:
                 try:
                     stream.close()
@@ -2321,32 +2490,55 @@ class AudioRecorder:
                 self.start_monitor(_internal=True)
             raise
         self._stream = stream
-        log_audio.debug("recording started (device=%s gain=%.2f)",
-                        self._device, self._gain)
+        log_audio.debug("recording started (device=%s gain=%.2f, opened in %d ms)",
+                        self._device, self._gain,
+                        (time.perf_counter() - self._cold_t0) * 1000)
 
     def stop(self) -> np.ndarray:
-        if self._stream is None:
+        if not self._recording:
             # Nothing recording — but the panel may have asked for its meter
             # while we were busy; honour that now.
-            if self._monitor_wanted and self._monitor_stream is None:
+            if self._monitor_wanted and self._monitor_stream is None and not self._always_open:
                 self.start_monitor(_internal=True)
             return np.zeros(0, dtype=np.float32)
-        try:
-            self._stream.stop()
-            self._stream.close()
-        finally:
-            self._stream = None
+        source = self._rec_source
+        if source == "cold" and self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            finally:
+                self._stream = None
+        with self._lock:
+            self._recording = False
+            self._rec_source = None
+            frames, self._frames = self._frames, []
+            live = self._live_samples
+            pre = self._preroll_used
+            first_ms = self._first_audio_ms
         # Bring the monitor back if the panel still wants it.
-        if self._monitor_wanted:
+        if self._monitor_wanted and not self._always_open:
             self.start_monitor(_internal=True)
-        if not self._frames:
+        if source == "cold" and first_ms is not None and first_ms > 300:
+            log_audio.info(
+                "mic took %d ms to deliver audio after the press — words spoken "
+                "before that were not captured (Bluetooth headsets do this; "
+                "Settings → Keep microphone open avoids it)", first_ms,
+            )
+        if not frames:
             log_audio.debug("recording stopped — no frames captured")
             return np.zeros(0, dtype=np.float32)
-        audio = np.concatenate(self._frames).astype(np.float32)
+        audio = np.concatenate(frames).astype(np.float32)
+        # A tap (accidental press) must still look like a tap to the
+        # too-short gate downstream — don't let the pre-roll pad it past it.
+        if pre and live < int(MIN_AUDIO_SECONDS * self.sample_rate):
+            audio = audio[pre:]
+            pre = 0
         rms  = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
         peak = float(np.max(np.abs(audio))) if audio.size else 0.0
-        log_audio.info("recording stopped — %d samples (%.2fs) RMS=%.5f peak=%.5f",
-                       audio.size, audio.size / self.sample_rate, rms, peak)
+        log_audio.info("recording stopped — %d samples (%.2fs%s) RMS=%.5f peak=%.5f",
+                       audio.size, audio.size / self.sample_rate,
+                       f", incl. {pre * 1000 // self.sample_rate} ms pre-roll" if pre else "",
+                       rms, peak)
         if self._overflows:
             log_audio.warning(
                 "audio driver reported %d dropped/late buffer(s) during this "
@@ -2357,6 +2549,206 @@ class AudioRecorder:
     @property
     def level(self) -> float:
         return self._level
+
+    # --- always-open (held) stream -------------------------------------------
+
+    @property
+    def always_open(self) -> bool:
+        return self._always_open
+
+    def set_always_open(self, on: bool) -> None:
+        on = bool(on)
+        if on == self._always_open:
+            return
+        self._always_open = on
+        if on:
+            log_audio.info("microphone mode: kept open (%d ms pre-roll)",
+                           int(MIC_PREROLL_SECONDS * 1000))
+            # The held stream replaces the Settings meter's own stream.
+            if self._monitor_stream is not None:
+                self.stop_monitor(_internal=True)
+            self._watch_gen += 1
+            gen = self._watch_gen
+            self._watchdog_wake.clear()
+            self._watchdog = threading.Thread(
+                target=self._watchdog_loop, args=(gen,),
+                daemon=True, name="mic-holder",
+            )
+            self._watchdog.start()
+        else:
+            log_audio.info("microphone mode: opened per dictation")
+            self._watchdog_wake.set()   # the loop exits and closes the stream
+            if self._monitor_wanted and not self._recording:
+                self.start_monitor(_internal=True)
+
+    def close(self) -> None:
+        """Release every stream (app quit)."""
+        self._always_open = False
+        self._watch_gen += 1
+        self._watchdog_wake.set()
+        t = self._watchdog
+        if t is not None and t.is_alive():
+            t.join(timeout=3.0)
+        self._close_held()
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        self.stop_monitor(_internal=True)
+
+    def _watchdog_loop(self, gen: int) -> None:
+        com = None
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+            com = comtypes
+        except Exception:
+            pass
+        try:
+            while self._always_open and gen == self._watch_gen:
+                try:
+                    self._watchdog_tick()
+                except Exception:
+                    log_audio.exception("mic holder: tick failed")
+                self._watchdog_wake.wait(MIC_WATCHDOG_INTERVAL_SEC)
+                self._watchdog_wake.clear()
+            # Only the newest holder thread owns the stream; an older one that
+            # was superseded by an off→on flip must not close it.
+            if not self._always_open:
+                self._wait_idle_then_close()
+        finally:
+            if com is not None:
+                try:
+                    com.CoUninitialize()
+                except Exception:
+                    pass
+
+    def _wait_idle_then_close(self) -> None:
+        # Never cut a dictation that is riding on the held stream.
+        deadline = time.monotonic() + MAX_RECORDING_SECONDS
+        while self._recording and self._rec_source == "held" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self._close_held()
+
+    def _watchdog_tick(self) -> None:
+        if self._recording:
+            return      # never touch streams mid-dictation
+        now = time.monotonic()
+        reinit = self._want_reinit
+        if self._device is None and self._held is not None:
+            cur = default_capture_endpoint_id()
+            if cur is not None and self._held_default_id and cur != self._held_default_id:
+                log_audio.info("Windows default microphone changed — moving the held stream")
+                reinit = True
+        held = self._held
+        if held is not None and not reinit:
+            grace = now - self._held_opened_at > MIC_STALL_SECONDS + 2.0
+            stalled = grace and now - self._last_held_cb > MIC_STALL_SECONDS
+            moved = self._held_device != self._device
+            try:
+                active = bool(held.active)
+            except Exception:
+                active = False
+            if not (stalled or moved or not active):
+                return
+            if stalled or not active:
+                log_audio.warning(
+                    "held mic stream %s — reopening",
+                    "stopped delivering audio" if stalled else "is no longer active",
+                )
+                reinit = True   # the device most likely went away
+        self._close_held()
+        if reinit:
+            self._reinit_portaudio()
+        self._open_held()
+
+    def _reinit_portaudio(self) -> bool:
+        now = time.monotonic()
+        if now - self._last_reinit < MIC_REINIT_MIN_INTERVAL_SEC:
+            return False
+        if self._stream is not None or self._monitor_stream is not None:
+            return False
+        try:
+            allowed = bool(self.reinit_allowed())
+        except Exception:
+            allowed = False
+        if not allowed:
+            return False
+        self._last_reinit = now
+        with PA_LOCK:
+            try:
+                sd._terminate()
+            except Exception:
+                log_audio.debug("PortAudio terminate failed", exc_info=True)
+            try:
+                sd._initialize()
+            except Exception:
+                log_audio.exception("PortAudio re-initialise failed")
+                return False
+            # Indexes may have shifted — re-resolve the configured mic by name.
+            if self._device_name:
+                idx = None
+                for d in _list_input_devices_locked():
+                    if d["name"] == self._device_name:
+                        idx = d["index"]
+                        break
+                self._device = idx
+        self._want_reinit = False
+        log_audio.info("PortAudio re-initialised (device list refreshed)")
+        return True
+
+    def _open_held(self) -> None:
+        default_id = default_capture_endpoint_id() if self._device is None else None
+        t0 = time.perf_counter()
+        try:
+            with PA_LOCK:
+                s = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype="float32",
+                    callback=self._held_callback,
+                    blocksize=0,
+                    device=self._device,
+                )
+                s.start()
+        except Exception as e:
+            if not self._held_fail_logged:
+                log_audio.warning(
+                    "could not hold the microphone open (%s) — retrying; each "
+                    "press opens the mic itself until then", e,
+                )
+                self._held_fail_logged = True
+            self._want_reinit = True
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._preroll.clear()
+            self._preroll_samples = 0
+        self._held_opened_at = now
+        self._last_held_cb = now
+        self._held_device = self._device
+        self._held_default_id = default_id
+        self._held = s
+        self._held_fail_logged = False
+        log_audio.info("microphone held open (device=%s) in %d ms",
+                       self._device if self._device is not None else "system default",
+                       (time.perf_counter() - t0) * 1000)
+
+    def _close_held(self) -> None:
+        s, self._held = self._held, None
+        if s is None:
+            return
+        try:
+            s.stop()
+            s.close()
+        except Exception:
+            log_audio.debug("held stream close failed", exc_info=True)
+        with self._lock:
+            self._preroll.clear()
+            self._preroll_samples = 0
 
     # --- monitor stream (used by Settings tab live meter) ----------------
 
@@ -2373,23 +2765,27 @@ class AudioRecorder:
         recorder is currently active or the device is unavailable). A call
         made while recording is remembered: the stream comes up when the
         recording stops. `_internal` marks the recorder's own start/stop
-        juggling, which must not change what the panel asked for."""
+        juggling, which must not change what the panel asked for. In
+        always-open mode the held stream already provides the level."""
         if not _internal:
             self._monitor_wanted = True
-        if self._stream is not None:
+        if self._always_open:
+            return True
+        if self._recording:
             return False
         if self._monitor_stream is not None:
             return True
         try:
-            self._monitor_stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype="float32",
-                callback=self._monitor_callback,
-                blocksize=0,
-                device=self._device,
-            )
-            self._monitor_stream.start()
+            with PA_LOCK:
+                self._monitor_stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype="float32",
+                    callback=self._monitor_callback,
+                    blocksize=0,
+                    device=self._device,
+                )
+                self._monitor_stream.start()
             return True
         except Exception:
             log_audio.exception("monitor stream failed to start")
@@ -2412,6 +2808,8 @@ class AudioRecorder:
 
     @property
     def monitor_level(self) -> float:
+        if self._always_open and self._held_healthy():
+            return self._level
         return self._monitor_level
 
 
@@ -7006,6 +7404,17 @@ class MainPanel(QWidget):
             "Boost quiet mics with gain. If Whisper struggles on soft speech, push gain up. "
             "If your audio clips or distorts on loud bursts, push it down."
         ))
+
+        self._mic_open_cb = QCheckBox("Keep microphone open")
+        self._mic_open_cb.setChecked(bool(self._settings.mic_always_open))
+        self._mic_open_cb.toggled.connect(self._on_mic_always_open_toggled)
+        audio_box.addLayout(self._form_row("Instant start", self._mic_open_cb))
+        audio_box.addWidget(self._section_hint(
+            "Records the instant you press the hotkey, and keeps the 0.3 s before it. "
+            "Without this, a Bluetooth headset takes ~1.4 s to start sending audio and "
+            "your first words are lost. Trade-off: Windows shows the mic as in use, and "
+            "a Bluetooth headset stays in call-quality audio while Tellur runs."
+        ))
         layout.addLayout(audio_box)
 
         # --- mic passthrough section (v2.7) ---
@@ -7581,6 +7990,11 @@ class MainPanel(QWidget):
             return
         edit.setKeySequence(combo_to_keyseq(default))
         self._on_hotkey_changed(slot, edit)
+
+    def _on_mic_always_open_toggled(self, checked: bool) -> None:
+        self._settings.mic_always_open = bool(checked)
+        self._settings.save()  # emits `changed` → App._apply_audio_settings
+        log_app.info("keep microphone open %s", "enabled" if checked else "disabled")
 
     def _on_duck_enabled_toggled(self, checked: bool) -> None:
         self._settings.duck_enabled = bool(checked)
@@ -8404,6 +8818,9 @@ class App(QObject):
         self.recorder = AudioRecorder()
         self.ducker = AudioDucker()
         self.passthrough = PassthroughMonitor()
+        # PortAudio re-init (to follow a new default mic) would invalidate the
+        # passthrough monitor's cached device indexes.
+        self.recorder.reinit_allowed = lambda: not self.settings.passthrough_enabled
         # Crash-safety: if a previous run was killed/hung mid-duck, restore the
         # apps it left quiet. Background thread so a pycaw hiccup can't delay
         # startup and won't fight an app the user already turned back up.
@@ -8549,6 +8966,10 @@ class App(QObject):
             self.passthrough.stop()
         except Exception:
             log_app.debug("quit: passthrough.stop failed", exc_info=True)
+        try:
+            self.recorder.close()
+        except Exception:
+            log_app.debug("quit: recorder.close failed", exc_info=True)
         # Release the global keyboard hooks (Ctrl+Win polls + the
         # Ctrl+Win+Q hotkey). The `keyboard` library spawns a low-level
         # Windows hook thread that can leak across abnormal exits otherwise.
@@ -8712,8 +9133,9 @@ class App(QObject):
                     "configured input device %r not found — using system default",
                     target_name,
                 )
-        self.recorder.set_device(idx)
+        self.recorder.set_device(idx, name=target_name)
         self.recorder.set_gain(self.settings.input_gain)
+        self.recorder.set_always_open(self.settings.mic_always_open)
 
     def _apply_passthrough_settings(self) -> None:
         """Reconcile the passthrough monitor with the latest Settings. Resolves

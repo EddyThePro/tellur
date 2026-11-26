@@ -377,6 +377,7 @@ if sys.platform == "win32":
 
 # --- recorder: dropped-buffer accounting -----------------------------------
 rec = t.AudioRecorder()
+rec._recording, rec._rec_source = True, "cold"   # as start() leaves it
 rec._callback(np.zeros((160, 1), dtype=np.float32), 160, None, None)
 rec._callback(np.zeros((160, 1), dtype=np.float32), 160, None, 2)
 check("overflow counted", rec._overflows == 1 and rec._sample_count == 320)
